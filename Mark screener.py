@@ -39,7 +39,10 @@ def process_file(file):
             
             # Read the file into a DataFrame with header row
             filepath = data_dir / file
+            # Optimization: Read only last 500 rows for faster processing
+            # This is sufficient for: EMA_200 (200 days) + shift(30) + 52-week (252 days)
             df = pd.read_csv(filepath, header=0)
+            df = df.tail(500)  # Keep only last 500 rows
             
             # Add symbol column
             df['symbol'] = symbol
@@ -109,6 +112,8 @@ def plot_save_chart(row):
 
         # Load the stock data from the CSV file
         stock_data = pd.read_csv(stock_file, header=0)
+        # Optimization: Use only last 500 rows for performance
+        stock_data = stock_data.tail(500)
         stock_data['Date'] = pd.to_datetime(stock_data['Date'])
         stock_data.set_index('Date', inplace=True)
 
