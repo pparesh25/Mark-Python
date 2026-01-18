@@ -132,55 +132,65 @@ def plot_save_chart(row):
         if stock_data.empty:
             return
 
-        # Create the plots
-        ema_50 = mpf.make_addplot(stock_data['EMA_50'], color='blue')
-        ema_150 = mpf.make_addplot(stock_data['EMA_150'], color='orange')
-        ema_200 = mpf.make_addplot(stock_data['EMA_200'], color='red')
-
-        # Plot the OHLC chart with optimized layout (16:9 aspect ratio)
-        fig, axes = mpf.plot(stock_data, type='candle', volume=True, style='charles', figsize=(16, 9),
-                             ylabel_lower='Volume', panel_ratios=(3, 1), title=stock, ylabel='Price',
-                             addplot=[ema_50, ema_150, ema_200], returnfig=True, tight_layout=True)
-
-        plt.grid(True, linestyle=':', linewidth=0.3, color='gray')
-
-        # Convert dates to corresponding index values
-        # Need to handle if Mark date is not exactly in index (e.g. non-trading day? though it comes from file)
+        # Create custom figure with GridSpec for separate fundamental panel
+        # Layout: Top panel for fundamentals, middle for price + EMAs, bottom for volume
+        from matplotlib.gridspec import GridSpec
+        
+        fig = plt.figure(figsize=(16, 10))
+        gs = GridSpec(3, 1, figure=fig, height_ratios=[0.4, 2.5, 0.8], hspace=0.05)
+        
+        # Top panel for fundamental data
+        ax_info = fig.add_subplot(gs[0])
+        ax_info.axis('off')  # Hide axes
+        
+        # Prepare essential fundamental data only
+        stock_fundamentals = row
+        info_text = (
+            f"Company: {stock_fundamentals['Name']}  |  "
+            f"Industry: {stock_fundamentals['Industry']}  |  "
+            f"₹{stock_fundamentals['Current Price']}  |  "
+            f"MCap: ₹{stock_fundamentals['Market Capitalization']} Cr\n"
+            f"Sales 5Y: {stock_fundamentals['Sales growth 5Years']}%  |  "
+            f"Profit 5Y: {stock_fundamentals['Profit growth 5Years']}%  |  "
+            f"52w High: -{stock_fundamentals.get('Down from 52w high_y', 0)}%  |  "
+            f"52w Low: +{stock_fundamentals.get('Up from 52w low', 0)}%"
+        )
+        
+        # Add text to info panel (normal weight, not bold)
+        ax_info.text(0.5, 0.5, info_text, transform=ax_info.transAxes,
+                    fontsize=11, verticalalignment='center', horizontalalignment='center',
+                    bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3),
+                    family='monospace')
+        
+        # Middle and bottom panels for price chart + volume using mplfinance
+        ax_price = fig.add_subplot(gs[1])
+        ax_volume = fig.add_subplot(gs[2], sharex=ax_price)
+        
+        # Create the EMA plots
+        ema_50 = mpf.make_addplot(stock_data['EMA_50'], ax=ax_price, color='blue', width=1.5)
+        ema_150 = mpf.make_addplot(stock_data['EMA_150'], ax=ax_price, color='orange', width=1.5)
+        ema_200 = mpf.make_addplot(stock_data['EMA_200'], ax=ax_price, color='red', width=1.5)
+        
+        # Plot candlestick chart
+        mpf.plot(stock_data, type='candle', style='charles', ax=ax_price, volume=ax_volume,
+                addplot=[ema_50, ema_150, ema_200], ylabel='Price', ylabel_lower='Volume')
+        
+        # Add grid
+        ax_price.grid(True, linestyle=':', linewidth=0.3, color='gray', alpha=0.5)
+        ax_volume.grid(True, linestyle=':', linewidth=0.3, color='gray', alpha=0.5)
+        
+        # Set title
+        ax_price.set_title(stock, fontsize=14, fontweight='bold', pad=10)
+        
+        # Mark the trend start date
         try:
             start_index = stock_data.index.get_loc(row['Mark'])
-            axes[0].axvline(x=start_index, color='blue', linestyle=':')
+            ax_price.axvline(x=start_index, color='blue', linestyle=':', linewidth=2, alpha=0.7)
         except KeyError:
-            pass # Mark date might be outside plot range or not exact match
-
-        # Overlay fundamental data
-        stock_fundamentals = row
-
-        # Prepare the text to display
-        text_str = f"""
-        Compny Name: {stock_fundamentals['Name']}
-        Industry: {stock_fundamentals['Industry']}
-        Current Market Price: {stock_fundamentals['Current Price']}
-        Market Capitalization: {stock_fundamentals['Market Capitalization']}
-        FII Holding: {stock_fundamentals['FII holding']}
-        DII Holding: {stock_fundamentals['DII holding']}
-        Sales growth 5Years: {stock_fundamentals['Sales growth 5Years']}
-        Profit growth 5Years: {stock_fundamentals['Profit growth 5Years']}
-        Down from 52w high: {stock_fundamentals.get('Down from 52w high_y', 0)}%
-        Up from 52w low: {stock_fundamentals.get('Up from 52w low', 0)}%
-        """
-        # Note: Merge might create _x and _y for 'Down from 52w high' if both have it. 
-        # Query results has 'Down from 52w high'. EOD scan has it too. 
-        # We will check column names after merge.
-
-        # Define font properties (smaller for better proportions)
-        font_properties = {
-            'family': 'monospace',
-            'weight': 'bold',
-            'size': 12
-        }
-
-        # Add the text with adjusted position (reduced left margin)
-        plt.figtext(0.12, 0.62, text_str, fontdict=font_properties, color='blue', ha='left', bbox=dict(facecolor='pink', alpha=0.2))
+            pass
+        
+        # Fix date labels: rotate to 0 (horizontal) instead of diagonal
+        plt.setp(ax_volume.xaxis.get_majorticklabels(), rotation=0, ha='center')
 
         # Save the chart as an image in the corresponding folder
         image_name = f"{idx_val}_{stock}.png"
