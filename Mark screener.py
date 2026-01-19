@@ -138,9 +138,9 @@ def plot_save_chart(row):
         
         fig = plt.figure(figsize=(16, 10))
         # Add overall figure title at the very top with stock symbol
-        fig.suptitle(stock, fontsize=18, fontweight='bold', y=0.98)
+        fig.suptitle(stock, fontsize=18, fontweight='bold', y=0.995)
         
-        gs = GridSpec(3, 1, figure=fig, height_ratios=[0.5, 2.5, 0.8], hspace=0.02)
+        gs = GridSpec(3, 1, figure=fig, height_ratios=[0.5, 2.5, 0.8], hspace=0.02, top=0.96)
         
         # Top panel for comprehensive fundamental data
         ax_info = fig.add_subplot(gs[0])
@@ -190,14 +190,20 @@ def plot_save_chart(row):
         ax_price = fig.add_subplot(gs[1])
         ax_volume = fig.add_subplot(gs[2], sharex=ax_price)
         
-        # Create the EMA plots
-        ema_50 = mpf.make_addplot(stock_data['EMA_50'], ax=ax_price, color='blue', width=1.5)
-        ema_150 = mpf.make_addplot(stock_data['EMA_150'], ax=ax_price, color='orange', width=1.5)
-        ema_200 = mpf.make_addplot(stock_data['EMA_200'], ax=ax_price, color='red', width=1.5)
+        # Create the EMA plots (thinner lines for cleaner look)
+        ema_50 = mpf.make_addplot(stock_data['EMA_50'], ax=ax_price, color='blue', width=1.0)
+        ema_150 = mpf.make_addplot(stock_data['EMA_150'], ax=ax_price, color='orange', width=1.0)
+        ema_200 = mpf.make_addplot(stock_data['EMA_200'], ax=ax_price, color='red', width=1.0)
         
-        # Plot candlestick chart
-        mpf.plot(stock_data, type='candle', style='charles', ax=ax_price, volume=ax_volume,
-                addplot=[ema_50, ema_150, ema_200], ylabel='Price', ylabel_lower='Volume')
+        # Plot candlestick chart with custom volume bar width
+        # Use update_width_config to make volume bars thinner (75% of default)
+        mpf_style = mpf.make_mpf_style(base_mpf_style='charles', 
+                                       mavcolors=['blue', 'orange', 'red'])
+        
+        mpf.plot(stock_data, type='candle', style=mpf_style, ax=ax_price, volume=ax_volume,
+                addplot=[ema_50, ema_150, ema_200], ylabel='Price', ylabel_lower='Volume',
+                update_width_config=dict(candle_linewidth=0.8, candle_width=0.75, 
+                                        volume_linewidth=0.7, volume_width=0.6))
         
         # Move volume axis to right side
         ax_volume.yaxis.tick_right()
