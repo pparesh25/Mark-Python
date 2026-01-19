@@ -2,7 +2,7 @@ import os
 import pandas as pd
 import talib as ta
 import time
-from multiprocess import Pool, freeze_support, cpu_count, set_start_method
+from concurrent.futures import ProcessPoolExecutor
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend to prevent plots from opening
 import matplotlib.pyplot as plt
@@ -233,21 +233,12 @@ def plot_save_chart(row):
 
 
 if __name__ == '__main__':
-    try:
-        set_start_method('spawn')
-    except RuntimeError:
-        pass
-    freeze_support()
-
-    # Create a pool of worker processes
-    pool = Pool()  # Defaults to cpu_count()
-
-    print("Scanning files...")
-    # Process each file using parallel execution
-    results_list = pool.map(process_file, files)
+    import os
     
-    pool.close()
-    pool.join()
+    print("Scanning files...")
+    # Process each file using parallel execution with Apple Silicon optimized ProcessPoolExecutor
+    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+        results_list = list(executor.map(process_file, files))
 
     # Filter out None results
     results_list = [r for r in results_list if r is not None]
@@ -352,10 +343,9 @@ if __name__ == '__main__':
 
     print("Generating charts...")
     
-    # Use multiprocessing pool to process charts
-    # We need a new pool because previous one was closed
-    with Pool(cpu_count()) as pool:
-        pool.map(plot_save_chart, [row for _, row in df_sorted.iterrows()])
+    # Use ProcessPoolExecutor for Apple Silicon optimized parallel chart generation
+    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+        list(executor.map(plot_save_chart, [row for _, row in df_sorted.iterrows()]))
 
     print(f"Images exported to {output_chart_dir}")
 
