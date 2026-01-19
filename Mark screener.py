@@ -133,34 +133,58 @@ def plot_save_chart(row):
             return
 
         # Create custom figure with GridSpec for separate fundamental panel
-        # Layout: Top panel for fundamentals, middle for price + EMAs, bottom for volume
+        # Layout: Title at top, then fundamental panel, price chart, and volume
         from matplotlib.gridspec import GridSpec
         
         fig = plt.figure(figsize=(16, 10))
-        gs = GridSpec(3, 1, figure=fig, height_ratios=[0.4, 2.5, 0.8], hspace=0.05)
+        # Add overall figure title at the very top with stock symbol
+        fig.suptitle(stock, fontsize=18, fontweight='bold', y=0.98)
         
-        # Top panel for fundamental data
+        gs = GridSpec(3, 1, figure=fig, height_ratios=[0.5, 2.5, 0.8], hspace=0.08)
+        
+        # Top panel for comprehensive fundamental data
         ax_info = fig.add_subplot(gs[0])
         ax_info.axis('off')  # Hide axes
         
-        # Prepare essential fundamental data only
+        # Prepare comprehensive fundamental data for financial health assessment
         stock_fundamentals = row
-        info_text = (
-            f"Company: {stock_fundamentals['Name']}  |  "
+        
+        # Row 1: Basic Info
+        info_line1 = (
+            f"{stock_fundamentals['Name']}  |  "
             f"Industry: {stock_fundamentals['Industry']}  |  "
-            f"₹{stock_fundamentals['Current Price']}  |  "
-            f"MCap: ₹{stock_fundamentals['Market Capitalization']} Cr\n"
+            f"Price: ₹{stock_fundamentals['Current Price']}  |  "
+            f"MCap: ₹{stock_fundamentals['Market Capitalization']} Cr  |  "
+            f"PE: {stock_fundamentals.get('Price to Earning', 'N/A')}"
+        )
+        
+        # Row 2: Profitability & Valuation
+        info_line2 = (
+            f"ROE: {stock_fundamentals.get('Return on equity', 'N/A')}%  |  "
+            f"ROCE: {stock_fundamentals.get('Return on capital employed', 'N/A')}%  |  "
+            f"OPM: {stock_fundamentals.get('OPM', 'N/A')}%  |  "
+            f"P/B: {stock_fundamentals.get('Price to book value', 'N/A')}  |  "
+            f"Debt/Eq: {stock_fundamentals.get('Debt to equity', 'N/A')}"
+        )
+        
+        # Row 3: Growth & Holdings
+        info_line3 = (
             f"Sales 5Y: {stock_fundamentals['Sales growth 5Years']}%  |  "
             f"Profit 5Y: {stock_fundamentals['Profit growth 5Years']}%  |  "
-            f"52w High: -{stock_fundamentals.get('Down from 52w high_y', 0)}%  |  "
-            f"52w Low: +{stock_fundamentals.get('Up from 52w low', 0)}%"
+            f"Promoter: {stock_fundamentals.get('Promoter holding', 'N/A')}%  |  "
+            f"FII: {stock_fundamentals.get('FII holding', 'N/A')}%  |  "
+            f"DII: {stock_fundamentals.get('DII holding', 'N/A')}%  |  "
+            f"52w: -{stock_fundamentals.get('Down from 52w high_y', 0)}% / +{stock_fundamentals.get('Up from 52w low', 0)}%"
         )
+        
+        # Combine all lines
+        info_text = f"{info_line1}\\n{info_line2}\\n{info_line3}"
         
         # Add text to info panel (normal weight, not bold)
         ax_info.text(0.5, 0.5, info_text, transform=ax_info.transAxes,
-                    fontsize=11, verticalalignment='center', horizontalalignment='center',
+                    fontsize=10, verticalalignment='center', horizontalalignment='center',
                     bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3),
-                    family='monospace')
+                    family='monospace', linespacing=1.8)
         
         # Middle and bottom panels for price chart + volume using mplfinance
         ax_price = fig.add_subplot(gs[1])
@@ -175,12 +199,13 @@ def plot_save_chart(row):
         mpf.plot(stock_data, type='candle', style='charles', ax=ax_price, volume=ax_volume,
                 addplot=[ema_50, ema_150, ema_200], ylabel='Price', ylabel_lower='Volume')
         
+        # Move volume axis to right side
+        ax_volume.yaxis.tick_right()
+        ax_volume.yaxis.set_label_position("right")
+        
         # Add grid
         ax_price.grid(True, linestyle=':', linewidth=0.3, color='gray', alpha=0.5)
         ax_volume.grid(True, linestyle=':', linewidth=0.3, color='gray', alpha=0.5)
-        
-        # Set title
-        ax_price.set_title(stock, fontsize=14, fontweight='bold', pad=10)
         
         # Mark the trend start date
         try:
