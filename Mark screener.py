@@ -178,7 +178,7 @@ def plot_save_chart(row):
         )
         
         # Combine all lines
-        info_text = f"{info_line1}\\n{info_line2}\\n{info_line3}"
+        info_text = f"{info_line1}\n{info_line2}\n{info_line3}"
         
         # Add text to info panel (normal weight, not bold)
         ax_info.text(0.5, 0.5, info_text, transform=ax_info.transAxes,
