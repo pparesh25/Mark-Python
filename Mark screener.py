@@ -323,10 +323,10 @@ if __name__ == '__main__':
     
     csv_columns.extend(fundamental_cols)
     
-    # Create CSV with selected columns and date-based filename
+    # Create CSV with selected columns and date-based filename in script directory
     csv_export = df_sorted[csv_columns].copy()
     csv_filename = f"{current_date}_qualified_stocks.csv"
-    csv_filepath = Path(csv_filename)
+    csv_filepath = Path(__file__).parent / csv_filename  # Save in script directory
     csv_export.to_csv(csv_filepath, index=False)
     print(f"CSV exported: {csv_filename} ({len(csv_export)} stocks)")
     
