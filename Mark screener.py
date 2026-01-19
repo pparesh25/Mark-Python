@@ -140,7 +140,7 @@ def plot_save_chart(row):
         # Add overall figure title at the very top with stock symbol
         fig.suptitle(stock, fontsize=18, fontweight='bold', y=0.98)
         
-        gs = GridSpec(3, 1, figure=fig, height_ratios=[0.5, 2.5, 0.8], hspace=0.08)
+        gs = GridSpec(3, 1, figure=fig, height_ratios=[0.5, 2.5, 0.8], hspace=0.02)
         
         # Top panel for comprehensive fundamental data
         ax_info = fig.add_subplot(gs[0])
@@ -210,17 +210,17 @@ def plot_save_chart(row):
         # Mark the trend start date
         try:
             start_index = stock_data.index.get_loc(row['Mark'])
-            ax_price.axvline(x=start_index, color='blue', linestyle=':', linewidth=2, alpha=0.7)
+            ax_price.axvline(x=start_index, color='blue', linestyle=':', linewidth=0.8, alpha=0.7)
         except KeyError:
             pass
         
         # Fix date labels: rotate to 0 (horizontal) instead of diagonal
         plt.setp(ax_volume.xaxis.get_majorticklabels(), rotation=0, ha='center')
 
-        # Save the chart as an image in the corresponding folder
+        # Save the chart as an image in the corresponding folder with high DPI for sharpness
         image_name = f"{idx_val}_{stock}.png"
         image_path = output_chart_dir / image_name
-        plt.savefig(image_path, bbox_inches='tight', pad_inches=0.1)
+        plt.savefig(image_path, bbox_inches='tight', pad_inches=0.1, dpi=150)
 
         plt.close()
     except Exception as e:
