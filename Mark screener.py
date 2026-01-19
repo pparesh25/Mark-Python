@@ -136,7 +136,7 @@ def plot_save_chart(row):
         # Layout: Title at top, then fundamental panel, price chart, and volume
         from matplotlib.gridspec import GridSpec
         
-        fig = plt.figure(figsize=(16, 10))
+        fig = plt.figure(figsize=(19.2, 10))
         # Add overall figure title at the very top with stock symbol
         fig.suptitle(stock, fontsize=18, fontweight='bold', y=0.995)
         
