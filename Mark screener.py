@@ -195,15 +195,14 @@ def plot_save_chart(row):
         ema_150 = mpf.make_addplot(stock_data['EMA_150'], ax=ax_price, color='orange', width=1.0)
         ema_200 = mpf.make_addplot(stock_data['EMA_200'], ax=ax_price, color='red', width=1.0)
         
-        # Plot candlestick chart with custom volume bar width
-        # Use update_width_config to make volume bars thinner (75% of default)
+        # Plot candlestick chart with default candle spacing
+        # Adjust only volume bar width (75% of candle) without borders
         mpf_style = mpf.make_mpf_style(base_mpf_style='charles', 
                                        mavcolors=['blue', 'orange', 'red'])
         
         mpf.plot(stock_data, type='candle', style=mpf_style, ax=ax_price, volume=ax_volume,
                 addplot=[ema_50, ema_150, ema_200], ylabel='Price', ylabel_lower='Volume',
-                update_width_config=dict(candle_linewidth=0.8, candle_width=0.75, 
-                                        volume_linewidth=0.7, volume_width=0.6))
+                update_width_config=dict(volume_linewidth=0, volume_width=0.75))
         
         # Move volume axis to right side
         ax_volume.yaxis.tick_right()
