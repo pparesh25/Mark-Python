@@ -53,17 +53,31 @@ def process_file(file):
             # Convert 'date' column to datetime
             df['date'] = pd.to_datetime(df['date'])
 
-            # Calculate the moving averages
+            # OPTIMIZATION: Check 52-week position FIRST (quick MAX/MIN operations)
+            # This filters out stocks early before expensive EMA calculations
+            df['52 week high'] = ta.MAX(df['high'], timeperiod=252)
+            df['52 week low'] = ta.MIN(df['low'], timeperiod=252)
+            
+            # Get latest values for quick filter
+            last_close = df['close'].iloc[-1]
+            last_52w_high = df['52 week high'].iloc[-1]
+            last_52w_low = df['52 week low'].iloc[-1]
+            
+            # Early exit if 52w position doesn't meet criteria
+            # Down from 52w high must be < 20%, Up from 52w low must be > 50%
+            down_from_52w = (((last_52w_high - last_close) / last_52w_high) * 100)
+            up_from_52w = (((last_close - last_52w_low) / last_52w_low) * 100)
+            
+            if down_from_52w >= 20 or up_from_52w <= 50:
+                return None  # Early exit - saves EMA calculation time!
+
+            # Calculate the moving averages (only for stocks that passed 52w filter)
             df['EMA_50'] = ta.EMA(df['close'], timeperiod=50).round(2)
             df['EMA_150'] = ta.EMA(df['close'], timeperiod=150).round(2)
             df['EMA_200'] = ta.EMA(df['close'], timeperiod=200).round(2)
 
             # Obtain the 200-day EMA before 30 days
             df['EMA_200_30'] = df['EMA_200'].shift(30)
-
-            # Calculate the 52-week high and low based on close values
-            df['52 week high'] = ta.MAX(df['high'], timeperiod=252)
-            df['52 week low'] = ta.MIN(df['low'], timeperiod=252)
 
             # This calc is from original script, but we will filter using CSV data later too.
             df['Down from 52w high'] = (((df['52 week high'] - df['close']) / df['52 week high']) * 100).round(2)
