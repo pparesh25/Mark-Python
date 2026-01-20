@@ -28,7 +28,7 @@ def download_screener_csv():
         os.remove(OUTPUT_FILE)
         print(f"Removed existing file: {OUTPUT_FILE}")
     
-    # Setup Chrome options
+    # Setup Chrome options for background-like execution
     chrome_options = Options()
     chrome_options.add_experimental_option("prefs", {
         "download.default_directory": str(DOWNLOAD_DIR),
@@ -36,10 +36,14 @@ def download_screener_csv():
         "download.directory_upgrade": True,
         "safebrowsing.enabled": True
     })
-    # chrome_options.add_argument("--headless")  # Uncomment for headless mode
     
-    print("Starting browser...")
+    # Run minimized and off-screen for unobtrusive operation
+    chrome_options.add_argument("--window-position=-2400,-2400")  # Off-screen
+    chrome_options.add_argument("--window-size=800,600")  # Small window
+    
+    print("Starting browser (minimized)...")
     driver = webdriver.Chrome(options=chrome_options)
+    driver.minimize_window()  # Minimize to dock
     wait = WebDriverWait(driver, 15)
     
     try:
