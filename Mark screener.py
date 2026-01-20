@@ -16,7 +16,7 @@ start_time = time.time()
 # Path to the data directory (Universal paths using pathlib)
 data_dir = Path('/Users/paresh/Desktop/eod2-main/src/eod2_data/daily')
 output_chart_dir = Path('/Users/paresh/Desktop/Mark Python/python_output_charts')
-fundamental_file = Path('/Users/paresh/Desktop/Mark Python/stock_project_file/all-company.csv')
+fundamental_file = Path('/Users/paresh/Downloads/all-company.csv')
 amibroker_watchlist_dir = Path('/Users/paresh/.wine/drive_c/Program Files (x86)/AmiBroker/Data/WatchLists')
 
 # Current date for file naming (YYYYMMDD format)
