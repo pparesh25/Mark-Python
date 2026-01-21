@@ -188,16 +188,32 @@ class BalanceSheetExporter:
         # Wait for login to complete (wait for URL change)
         wait.until(lambda d: d.current_url != self.LOGIN_URL)
         print("Login successful!")
-        
-        # Navigate to a base company page to ensure search box is available
-        print("Navigating to base page...")
-        driver.get("https://www.screener.in/company/ASHOKLEY/consolidated/")
-        wait.until(lambda d: d.execute_script('return document.readyState') == 'complete')
-        time.sleep(1)  # Small delay to ensure page is fully rendered
+        # Note: Search box is available on any company page, no need to navigate to specific page
     
     def search_and_export(self, driver, wait, symbol):
         """Search for symbol and export balance sheet"""
         try:
+            # Check if we're on a company page (where search box is available)
+            # If not, navigate to any company page first
+            current_url = driver.current_url
+            if '/company/' not in current_url:
+                # Not on a company page, navigate to one
+                driver.get(f"https://www.screener.in/company/{symbol}/consolidated/")
+                wait.until(lambda d: d.execute_script('return document.readyState') == 'complete')
+                time.sleep(2)
+                # Already on the target page, just click export
+                export_button = wait.until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[aria-label="Export to Excel"]'))
+                )
+                driver.execute_script("arguments[0].click();", export_button)
+                
+                if self.wait_for_download(symbol, timeout=45):
+                    self.stats['successful'] += 1
+                    return True
+                else:
+                    raise Exception("Download timeout")
+            
+            # Already on a company page, use search box
             # Use JavaScript to interact with the search box (since it may be hidden visually)
             search_script = f"""
             var searchBox = document.querySelector('input[aria-label="Search for a company"]');
@@ -270,7 +286,8 @@ class BalanceSheetExporter:
             "download.default_directory": str(self.DOWNLOAD_DIR),
             "download.prompt_for_download": False,
             "download.directory_upgrade": True,
-            "safebrowsing.enabled": True
+            "safebrowsing.enabled": True,
+            "profile.default_content_setting_values.automatic_downloads": 1  # Allow multiple downloads
         })
         
         print("Starting browser...")
