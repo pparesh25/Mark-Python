@@ -191,71 +191,68 @@ class BalanceSheetExporter:
         # Note: Search box is available on any company page, no need to navigate to specific page
     
     def search_and_export(self, driver, wait, symbol):
-        """Search for symbol and export balance sheet"""
+        """Search for symbol and export balance sheet with proper step confirmation"""
         try:
-            # Check if we're on a company page (where search box is available)
-            # If not, navigate to any company page first
+            print(f" Navigating...", end='', flush=True)
+            
             current_url = driver.current_url
+            
+            # Step 1: Navigate to symbol page
             if '/company/' not in current_url:
-                # Not on a company page, navigate to one
+                # First symbol: Navigate directly
                 driver.get(f"https://www.screener.in/company/{symbol}/consolidated/")
-                wait.until(lambda d: d.execute_script('return document.readyState') == 'complete')
-                time.sleep(2)
-                # Already on the target page, just click export
-                export_button = wait.until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[aria-label="Export to Excel"]'))
-                )
-                driver.execute_script("arguments[0].click();", export_button)
+            else:
+                # Subsequent symbols: Use search box
+                search_script = f"""
+                var searchBox = document.querySelector('input[aria-label="Search for a company"]');
+                if (searchBox) {{
+                    searchBox.value = '{symbol}';
+                    searchBox.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    searchBox.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    
+                    var event = new KeyboardEvent('keydown', {{
+                        key: 'Enter',
+                        code: 'Enter',
+                        keyCode: 13,
+                        which: 13,
+                        bubbles: true
+                    }});
+                    searchBox.dispatchEvent(event);
+                    return true;
+                }}
+                return false;
+                """
                 
-                if self.wait_for_download(symbol, timeout=45):
-                    self.stats['successful'] += 1
-                    return True
-                else:
-                    raise Exception("Download timeout")
+                result = driver.execute_script(search_script)
+                if not result:
+                    raise Exception("Search box not found")
             
-            # Already on a company page, use search box
-            # Use JavaScript to interact with the search box (since it may be hidden visually)
-            search_script = f"""
-            var searchBox = document.querySelector('input[aria-label="Search for a company"]');
-            if (searchBox) {{
-                searchBox.value = '{symbol}';
-                searchBox.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                searchBox.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                
-                // Simulate Enter keypress
-                var event = new KeyboardEvent('keydown', {{
-                    key: 'Enter',
-                    code: 'Enter',
-                    keyCode: 13,
-                    which: 13,
-                    bubbles: true
-                }});
-                searchBox.dispatchEvent(event);
-                return true;
-            }}
-            return false;
-            """
-            
-            result = driver.execute_script(search_script)
-            if not result:
-                raise Exception("Search box not found via JavaScript")
-            
-            time.sleep(0.5)  # Small delay after triggering search
-            
-            # Wait for company page to load
+            # Step 2: Wait for URL change to confirm navigation
+            print(".", end='', flush=True)
             wait.until(lambda d: '/company/' in d.current_url)
+            
+            # Step 3: Wait for page to fully load
+            print(".", end='', flush=True)
             wait.until(lambda d: d.execute_script('return document.readyState') == 'complete')
             
-            # Wait for search dropdown to close and page to fully render
-            time.sleep(3)  # Increased from 2 to 3 seconds
+            # Step 4: Extra wait for dynamic content (dropdown to close, etc.)
+            time.sleep(3)
             
-            # Click Export to Excel button
-            export_button = wait.until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[aria-label="Export to Excel"]'))
-            )
+            # Step 5: Confirm export button is available
+            print(" Export...", end='', flush=True)
+            try:
+                export_button = wait.until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Export to Excel"]'))
+                )
+                # Double-check it's clickable
+                wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[aria-label="Export to Excel"]')))
+            except Exception as e:
+                raise Exception(f"Export button not found: {e}")
+            
+            # Step 6: Click export button ONCE
             driver.execute_script("arguments[0].click();", export_button)
             
-            # Wait for download to complete
+            # Step 7: Wait for download with confirmation
             if self.wait_for_download(symbol, timeout=45):
                 self.stats['successful'] += 1
                 return True
