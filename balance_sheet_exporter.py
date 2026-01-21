@@ -74,58 +74,98 @@ class BalanceSheetExporter:
             f.write(f"[{timestamp}] {symbol}: {error}\n")
         self.stats['failed'] += 1
     
-    def wait_for_download(self, symbol, timeout=30):
-        """Wait for Excel file to be downloaded"""
+    def wait_for_download(self, symbol, timeout=45):
+        """Wait for Excel file to be downloaded and handle duplicates"""
         start_time = time.time()
-        found_file = None
+        
+        print(f" Downloading...", end='', flush=True)
+        
+        # Wait for file to appear
+        downloaded_files = []
         
         while time.time() - start_time < timeout:
-            # Look for any .xlsx or .xls files in download directory
-            xlsx_files = list(self.DOWNLOAD_DIR.glob("*.xlsx"))
-            xls_files = list(self.DOWNLOAD_DIR.glob("*.xls"))
-            all_files = xlsx_files + xls_files
+            # Get all Excel files
+            all_files = list(self.DOWNLOAD_DIR.glob("*.xlsx")) + list(self.DOWNLOAD_DIR.glob("*.xls"))
             
-            # Filter out files we've already processed (those with our naming pattern)
-            new_files = [
-                f for f in all_files
-                if not f.name.startswith(f"{symbol}_balance_sheet")
-                and f.stat().st_size > 0
-                and f.stat().st_mtime > start_time
-            ]
-            
-            if new_files and not found_file:
-                # Take the first file found
-                found_file = new_files[0]
-                
-                # Generate new filename
-                new_name = self.DOWNLOAD_DIR / f"{symbol}_balance_sheet{found_file.suffix}"
-                
-                # If file already exists, add timestamp
-                if new_name.exists():
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    new_name = self.DOWNLOAD_DIR / f"{symbol}_balance_sheet_{timestamp}{found_file.suffix}"
-                
-                # Rename the first file
-                try:
-                    found_file.rename(new_name)
-                except:
-                    time.sleep(0.5)
+            # Find files created/modified after start_time
+            for file_path in all_files:
+                # Skip if already in our list
+                if file_path in downloaded_files:
                     continue
                 
-                # Delete any additional duplicate files
-                time.sleep(1)  # Wait a bit to catch duplicates
-                for extra_file in new_files[1:]:
-                    try:
-                        if extra_file.exists() and extra_file != found_file:
-                            extra_file.unlink()  # Delete duplicate
-                    except:
-                        pass
+                # Skip if it's already renamed with our pattern
+                if file_path.name.startswith(f"{symbol}_balance_sheet"):
+                    continue
                 
-                return True
+                # Check if file is new and has content
+                if file_path.stat().st_size > 0 and file_path.stat().st_mtime > start_time:
+                    downloaded_files.append(file_path)
+                    print(".", end='', flush=True)
             
+            # If we found files, wait a bit more to catch duplicates, then break
+            if downloaded_files:
+                time.sleep(2)  # Wait to catch potential duplicates
+                # Do one more check for duplicates
+                all_files = list(self.DOWNLOAD_DIR.glob("*.xlsx")) + list(self.DOWNLOAD_DIR.glob("*.xls"))
+                for file_path in all_files:
+                    if file_path not in downloaded_files and not file_path.name.startswith(f"{symbol}_balance_sheet"):
+                        if file_path.stat().st_size > 0 and file_path.stat().st_mtime > start_time:
+                            downloaded_files.append(file_path)
+                break
+                
             time.sleep(0.5)
         
-        return False
+        if not downloaded_files:
+            print(" ✗")
+            return False
+        
+        # Sort by modification time (earliest first)
+        downloaded_files.sort(key=lambda f: f.stat().st_mtime)
+        
+        # Keep the first file, delete all others
+        primary_file = downloaded_files[0]
+        
+        # Generate new filename
+        new_name = self.DOWNLOAD_DIR / f"{symbol}_balance_sheet{primary_file.suffix}"
+        
+        # If target name already exists, add timestamp
+        if new_name.exists():
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            new_name = self.DOWNLOAD_DIR / f"{symbol}_balance_sheet_{timestamp}{primary_file.suffix}"
+        
+        # Rename primary file
+        try:
+            primary_file.rename(new_name)
+            print(f" ✓")
+        except Exception as e:
+            print(f" ✗ Rename failed: {e}")
+            return False
+        
+        # Delete all duplicate files
+        if len(downloaded_files) > 1:
+            for dup_file in downloaded_files[1:]:
+                try:
+                    if dup_file.exists():
+                        dup_file.unlink()
+                except:
+                    pass
+        
+        # Cleanup Chrome-numbered duplicates: "filename (1).xlsx", "filename (2).xlsx"
+        import re
+        for pattern in ["*.xlsx", "*.xls"]:
+            for file_path in self.DOWNLOAD_DIR.glob(pattern):
+                # Skip our renamed files
+                if file_path.name.startswith(f"{symbol}_balance_sheet"):
+                    continue
+                # Check for Chrome duplicate pattern
+                if re.search(r'\s+\(\d+\)\.(xlsx|xls)$', file_path.name):
+                    if file_path.stat().st_mtime > start_time:
+                        try:
+                            file_path.unlink()
+                        except:
+                            pass
+        
+        return True
     
     def login(self, driver, wait):
         """Login to screener.in"""
@@ -191,7 +231,7 @@ class BalanceSheetExporter:
             wait.until(lambda d: d.execute_script('return document.readyState') == 'complete')
             
             # Wait for search dropdown to close and page to fully render
-            time.sleep(2)
+            time.sleep(3)  # Increased from 2 to 3 seconds
             
             # Click Export to Excel button
             export_button = wait.until(
@@ -200,7 +240,7 @@ class BalanceSheetExporter:
             driver.execute_script("arguments[0].click();", export_button)
             
             # Wait for download to complete
-            if self.wait_for_download(symbol, timeout=30):
+            if self.wait_for_download(symbol, timeout=45):
                 self.stats['successful'] += 1
                 return True
             else:
@@ -276,9 +316,6 @@ class BalanceSheetExporter:
                     self.log_error(symbol, str(e))
                     # Continue with next symbol
                     continue
-                
-                # Small delay between requests
-                time.sleep(1)
             
             # Final statistics
             elapsed = time.time() - start_time
