@@ -37,3 +37,8 @@ Thumbs.db
 /logs/
 /fundamental_files/
 /Screener login/
+/chart_images/
+/qualified_stocks/
+
+# Shell scripts
+/run_pipeline.sh
