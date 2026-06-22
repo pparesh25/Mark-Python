@@ -41,4 +41,8 @@ Thumbs.db
 /qualified_stocks/
 
 # Shell scripts
-/run_pipeline.sh
+/Mark_Python.sh
+
+# EOD Data Folder
+/NSE_EOD/
+/BennyThadikaran_eod2_data.txt

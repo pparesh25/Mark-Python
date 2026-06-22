@@ -31,7 +31,7 @@ from pathlib import Path
 
 import config
 from config import (
-    BASE_DIR, EOD2_SCRIPT, FUNDAMENTAL_FILE, OUT_DIR,
+    BASE_DIR, FUNDAMENTAL_FILE, OUT_DIR,
     BREAKOUT_WINDOW, CURRENT_TIMESTAMP,
 )
 
@@ -189,7 +189,22 @@ def main():
     logger.info(color('═' * width, 'CYAN'))
 
     # --- Step 1: eod2 database update -------------------------------------
-    run_step("Step 1/3: EOD Data Update (eod2)", ["bash", str(EOD2_SCRIPT)], logger)
+    logger.info(color("▶ Step 1/3: EOD Data Update (eod2)", 'BOLD'))
+    logger.info(color("  Starting NSE EOD download and adjustment in Python...", 'CYAN'))
+    t0 = time.time()
+    try:
+        import eod_downloader
+        success = eod_downloader.sync_database(config.DATA_DIR, logger)
+    except Exception as e:
+        logger.error(color(f"  ✗ Failed to execute EOD update in Python: {e}", 'RED'))
+        sys.exit(1)
+        
+    elapsed = time.time() - t0
+    if not success:
+        logger.error(color(f"  ✗ EOD update FAILED after {elapsed:.1f}s", 'RED'))
+        sys.exit(1)
+        
+    logger.info(color(f"  ✓ EOD update completed in {elapsed:.1f}s", 'GREEN'))
 
     # --- Step 2: fundamentals download ------------------------------------
     logger.info(color("▶ Step 2/3: Fundamental Data Download (screener.in)", 'BOLD'))

@@ -50,7 +50,7 @@ start_time = time.time()
 config.ensure_dirs()
 
 # List all the CSV files in the data directory
-files = [f.name for f in DATA_DIR.glob('*.csv')]
+files = [f.name for f in DATA_DIR.glob('*.csv') if f.name != 'isin.csv']
 
 
 # ===========================================================================

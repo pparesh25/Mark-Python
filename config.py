@@ -30,7 +30,7 @@ else:
 # Roots
 # ---------------------------------------------------------------------------
 BASE_DIR = Path('/Users/paresh/Desktop/Mark Python')          # live git repo
-DATA_DIR = Path('/Users/paresh/Desktop/eod2-main/src/eod2_data/daily')
+DATA_DIR = BASE_DIR / 'NSE_EOD'
 
 # Fundamentals (all-company.csv) are downloaded fresh into the project's own
 # fundamental_files/ folder, timestamped per run.
@@ -60,7 +60,6 @@ LOG_DIR = BASE_DIR / 'logs'
 # ---------------------------------------------------------------------------
 # External tools / dependencies
 # ---------------------------------------------------------------------------
-EOD2_SCRIPT = Path('/Users/paresh/Desktop/eod2-main/run_eod2.sh')
 AMIBROKER_WATCHLIST_DIR = Path(
     '/Users/paresh/.wine/drive_c/Program Files (x86)/AmiBroker/Data/WatchLists'
 )
