@@ -375,6 +375,15 @@ def main():
     df_mark = process_results(results_all, query_df, "mark", MARK_OUT_DIR,
                               MARK_CHART_DIR, "Mark_Date")
 
+    if df_mark is not None and not df_mark.empty:
+        # Save mark watchlist
+        mark_watchlist_filename = f"{CURRENT_TIMESTAMP}_mark.txt"
+        mark_watchlist_filepath = AMIBROKER_WATCHLIST_DIR / mark_watchlist_filename
+        with open(mark_watchlist_filepath, 'w') as f:
+            for symbol in df_mark['symbol']:
+                f.write(f"{symbol.upper()}\n")
+        logging.info(f"Watchlist created: {mark_watchlist_filepath}")
+
     if df_mark is not None:
         # Stage 2: Mark Tight Screening
         logging.info("Stage 2: Running Mark Tight Screening (5-day breakout window)...")
@@ -390,13 +399,13 @@ def main():
             process_results(results_stage2, query_df, "mark_tight", MARK_TIGHT_OUT_DIR,
                             MARK_TIGHT_CHART_DIR, "Mark_Tight_Date")
 
-            # AmiBroker watchlist for Mark Tight
-            amibroker_filename = f"{CURRENT_DATE} Mark_Tight_qualified.tls"
-            amibroker_filepath = AMIBROKER_WATCHLIST_DIR / amibroker_filename
-            with open(amibroker_filepath, 'w') as f:
+            # Save mark_tight watchlist
+            tight_watchlist_filename = f"{CURRENT_TIMESTAMP}_mark_tight.txt"
+            tight_watchlist_filepath = AMIBROKER_WATCHLIST_DIR / tight_watchlist_filename
+            with open(tight_watchlist_filepath, 'w') as f:
                 for symbol in results_stage2['symbol']:
-                    f.write(f"{symbol}\n")
-            logging.info(f"AmiBroker watchlist created: {amibroker_filepath}")
+                    f.write(f"{symbol.upper()}\n")
+            logging.info(f"Watchlist created: {tight_watchlist_filepath}")
         else:
             logging.info("No stocks matched the Mark Tight criteria.")
 
