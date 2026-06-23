@@ -57,6 +57,12 @@ MARK_TIGHT_CHART_DIR = CHART_DIR / 'mark_tight'
 # Per-run logs go here (not loose at the project root).
 LOG_DIR = BASE_DIR / 'logs'
 
+# Consolidated daily bhavcopy text files go here.
+DAILY_BHAVCOPY_DIR = BASE_DIR / 'Daily Bhavcopy NSE'
+
+# EOD downloader metadata (meta.json and isin.csv) goes here.
+EOD_METADATA_DIR = BASE_DIR / 'metadata'
+
 # ---------------------------------------------------------------------------
 # External tools / dependencies
 # ---------------------------------------------------------------------------
@@ -87,7 +93,8 @@ def ensure_dirs():
     """
     for d in (OUT_DIR, MARK_OUT_DIR, MARK_TIGHT_OUT_DIR,
               CHART_DIR, MARK_CHART_DIR, MARK_TIGHT_CHART_DIR,
-              LOG_DIR, AMIBROKER_WATCHLIST_DIR, FUNDAMENTAL_DIR):
+              LOG_DIR, AMIBROKER_WATCHLIST_DIR, FUNDAMENTAL_DIR,
+              DAILY_BHAVCOPY_DIR, EOD_METADATA_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

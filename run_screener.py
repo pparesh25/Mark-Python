@@ -194,7 +194,12 @@ def main():
     t0 = time.time()
     try:
         import eod_downloader
-        success = eod_downloader.sync_database(config.DATA_DIR, logger)
+        success = eod_downloader.sync_database(
+            config.DATA_DIR,
+            logger,
+            metadata_dir=config.EOD_METADATA_DIR,
+            daily_bhavcopy_dir=config.DAILY_BHAVCOPY_DIR
+        )
     except Exception as e:
         logger.error(color(f"  ✗ Failed to execute EOD update in Python: {e}", 'RED'))
         sys.exit(1)

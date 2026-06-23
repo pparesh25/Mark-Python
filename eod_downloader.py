@@ -517,10 +517,10 @@ def _update_pending_delivery_data(nse: NSE, date_str: str, data_dir: Path, logge
         return False
 
 
-def _update_nse_eod(bhavFile: Path, deliveryFile: Optional[Path], data_dir: Path, isin: pd.DataFrame, dates: Dates, logger: logging.Logger):
+def _update_nse_eod(bhavFile: Path, deliveryFile: Optional[Path], data_dir: Path, metadata_dir: Path, isin: pd.DataFrame, dates: Dates, logger: logging.Logger, bhavcopy_rows: Optional[List[str]] = None):
     logger.info("Starting Capital Market Data Sync")
     daily_folder = data_dir
-    isin_file = data_dir / "isin.csv"
+    isin_file = metadata_dir / "isin.csv"
 
     isinUpdated = False
 
@@ -611,6 +611,12 @@ def _update_nse_eod(bhavFile: Path, deliveryFile: Optional[Path], data_dir: Path
             dates,
         )
 
+        if bhavcopy_rows is not None:
+            symbol = f"{t.TckrSymb.lower()}{prefix}"
+            avgTrdCnt = "" if trdCnt == "" or pd.isna(trdCnt) else round(t.TtlTradgVol / trdCnt, 2)
+            row_str = f"{symbol},{dates.pandasDt},{t.OpnPric},{t.HghPric},{t.LwPric},{t.ClsPric},{t.TtlTradgVol},{t.SctySrs},{trdCnt},{avgTrdCnt},{dq}\n"
+            bhavcopy_rows.append(row_str)
+
     if isinUpdated:
         isin.to_csv(isin_file)
 
@@ -627,6 +633,18 @@ def _update_nse_symbol(symFile: Path, series, open_p, high_p, low_p, close_p, vo
             sme_file.rename(symFile)
         else:
             text += headerText
+    else:
+        # Prevent duplicates
+        with symFile.open("rb") as f:
+            try:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 200))
+                last_bytes = f.read()
+                if bytes(dates.pandasDt, encoding="utf-8") in last_bytes:
+                    return
+            except Exception:
+                pass
 
     avgTrdCnt = "" if trdCnt == "" or pd.isna(trdCnt) else round(volume / trdCnt, 2)
 
@@ -639,7 +657,7 @@ def _update_nse_symbol(symFile: Path, series, open_p, high_p, low_p, close_p, vo
         f.write(text)
 
 
-def _update_index_eod(file: Path, data_dir: Path, dates: Dates, logger: logging.Logger):
+def _update_index_eod(file: Path, data_dir: Path, dates: Dates, logger: logging.Logger, bhavcopy_rows: Optional[List[str]] = None):
     folder = data_dir / "nseIndices" / str(dates.dt.year)
     folder.mkdir(parents=True, exist_ok=True)
     daily_folder = data_dir
@@ -662,6 +680,10 @@ def _update_index_eod(file: Path, data_dir: Path, dates: Dates, logger: logging.
     for sym in df.index:
         open_p, high_p, low_p, close_p, volume, pe = df.loc[sym, cols]
         _update_indice(sym, open_p, high_p, low_p, close_p, volume, pe, daily_folder, dates)
+        if bhavcopy_rows is not None:
+            clean_sym = sym.replace("/", "-").replace(":", "-").lower() if ("/" in sym or ":" in sym) else sym.lower()
+            row_str = f"{clean_sym},{dates.pandasDt},{open_p},{high_p},{low_p},{close_p},{volume},{pe},,,\n"
+            bhavcopy_rows.append(row_str)
 
     logger.info("Index sync complete.")
 
@@ -676,6 +698,18 @@ def _update_indice(sym, open_p, high_p, low_p, close_p, volume, pe, daily_folder
 
     if not file.is_file():
         text += indexHeaderText
+    else:
+        # Prevent duplicates
+        with file.open("rb") as f:
+            try:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 200))
+                last_bytes = f.read()
+                if bytes(dates.pandasDt, encoding="utf-8") in last_bytes:
+                    return
+            except Exception:
+                pass
 
     text += bytes(
         f"{dates.pandasDt},{open_p},{high_p},{low_p},{close_p},{volume},{pe},,,,\n",
@@ -686,15 +720,15 @@ def _update_indice(sym, open_p, high_p, low_p, close_p, volume, pe, daily_folder
         f.write(text)
 
 
-def sync_database(data_dir: Path, logger: logging.Logger) -> bool:
+def sync_database(data_dir: Path, logger: logging.Logger, metadata_dir: Path, daily_bhavcopy_dir: Optional[Path] = None) -> bool:
     """Sync the local EOD database using NSE India reports."""
     if not NSE_AVAILABLE:
         logger.error("nse package is not installed; database cannot be synced.")
         return False
 
-    meta_file = data_dir / "meta.json"
+    meta_file = metadata_dir / "meta.json"
     if not meta_file.exists():
-        logger.error(f"meta.json not found in {data_dir}. Bootstrap first.")
+        logger.error(f"meta.json not found in {metadata_dir}. Bootstrap first.")
         return False
 
     with sync_lock:
@@ -775,13 +809,25 @@ def sync_database(data_dir: Path, logger: logging.Logger) -> bool:
                     meta["DLV_PENDING_DATES"].append(dates.dt.isoformat())
 
                 try:
-                    isin_file = data_dir / "isin.csv"
+                    isin_file = metadata_dir / "isin.csv"
                     isin = pd.read_csv(isin_file, index_col="ISIN")
 
-                    _update_nse_eod(bhav_file, delivery_file, data_dir, isin, dates, logger)
-                    _update_index_eod(index_file, data_dir, dates, logger)
+                    bhavcopy_rows = []
+                    _update_nse_eod(bhav_file, delivery_file, data_dir, metadata_dir, isin, dates, logger, bhavcopy_rows)
+                    _update_index_eod(index_file, data_dir, dates, logger, bhavcopy_rows)
 
                     _adjust_nse_stocks(meta, data_dir, dates, logger)
+
+                    # Save the daily consolidated bhavcopy
+                    if daily_bhavcopy_dir and bhavcopy_rows:
+                        daily_bhavcopy_dir.mkdir(parents=True, exist_ok=True)
+                        bhavcopy_filename = f"{dates.dt.strftime('%Y%m%d')}_BENNY_NSE_EOD.txt"
+                        bhavcopy_filepath = daily_bhavcopy_dir / bhavcopy_filename
+                        header = "Symbol,Date,Open,High,Low,Close,Volume,Series,TOTAL_TRADES,QTY_PER_TRADE,DLV_QTY\n"
+                        with bhavcopy_filepath.open("w", encoding="utf-8") as bf:
+                            bf.write(header)
+                            bf.writelines(bhavcopy_rows)
+                        logger.info(f"Saved daily bhavcopy to {bhavcopy_filepath.name}")
 
                     for f in (bhav_file, delivery_file, index_file):
                         if f and f.exists():
