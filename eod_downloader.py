@@ -612,7 +612,7 @@ def _update_nse_eod(bhavFile: Path, deliveryFile: Optional[Path], data_dir: Path
         )
 
         if bhavcopy_rows is not None:
-            symbol = f"{t.TckrSymb.lower()}{prefix}"
+            symbol = f"{t.TckrSymb.upper()}{prefix.upper()}"
             avgTrdCnt = "" if trdCnt == "" or pd.isna(trdCnt) else round(t.TtlTradgVol / trdCnt, 2)
             row_str = f"{symbol},{dates.pandasDt},{t.OpnPric},{t.HghPric},{t.LwPric},{t.ClsPric},{t.TtlTradgVol},{t.SctySrs},{trdCnt},{avgTrdCnt},{dq}\n"
             bhavcopy_rows.append(row_str)
@@ -681,7 +681,7 @@ def _update_index_eod(file: Path, data_dir: Path, dates: Dates, logger: logging.
         open_p, high_p, low_p, close_p, volume, pe = df.loc[sym, cols]
         _update_indice(sym, open_p, high_p, low_p, close_p, volume, pe, daily_folder, dates)
         if bhavcopy_rows is not None:
-            clean_sym = sym.replace("/", "-").replace(":", "-").lower() if ("/" in sym or ":" in sym) else sym.lower()
+            clean_sym = sym.replace("/", "-").replace(":", "-").upper() if ("/" in sym or ":" in sym) else sym.upper()
             row_str = f"{clean_sym},{dates.pandasDt},{open_p},{high_p},{low_p},{close_p},{volume},{pe},,,\n"
             bhavcopy_rows.append(row_str)
 
