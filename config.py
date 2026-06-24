@@ -67,7 +67,7 @@ EOD_METADATA_DIR = BASE_DIR / 'metadata'
 # External tools / dependencies
 # ---------------------------------------------------------------------------
 AMIBROKER_WATCHLIST_DIR = Path(
-    '/Users/paresh/.opentrader-pro/databases/NSE_EOD/watchlists'
+    '/Users/paresh/.opentrader-pro/databases/\x08NSE_EOD/watchlists'
 )
 SCREENER_CREDS = BASE_DIR / 'Screener login' / 'screener.txt'
 SCREENER_SCREEN_ID = '3427564'
