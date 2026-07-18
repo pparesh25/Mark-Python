@@ -26,15 +26,19 @@ import config
 def download_screener_csv(output_dir, headless=False):
     # Configuration
     LOGIN_URL = "https://www.screener.in/login/"
-    SCREEN_URL = "https://www.screener.in/screens/3427564/all-company/"
+    SCREEN_URL = f"https://www.screener.in/screens/{config.SCREENER_SCREEN_ID}/all-company/"
     DOWNLOAD_DIR = Path(output_dir)
     OUTPUT_FILE = DOWNLOAD_DIR / "all-company.csv"
-    
+
     # Read credentials from external file (security improvement)
     credentials_file = config.SCREENER_CREDS
     try:
         with open(credentials_file, 'r') as f:
             lines = f.readlines()
+            if len(lines) < 2:
+                logging.error(f"❌ Credentials file incomplete: {credentials_file}")
+                logging.error("   File must have email on line 1 and password on line 2")
+                return False
             EMAIL = lines[0].strip()
             PASSWORD = lines[1].strip()
     except FileNotFoundError:
@@ -130,17 +134,22 @@ def download_screener_csv(output_dir, headless=False):
         
         while time.time() - start_time < timeout:
             elapsed = int(time.time() - start_time)
-            if OUTPUT_FILE.exists() and OUTPUT_FILE.stat().st_size > 0:
+            # Chrome writes a .crdownload temp file while the download is in
+            # progress; only treat the file as complete when that temp file is
+            # gone AND the final file is non-empty.
+            crdownload_files = list(DOWNLOAD_DIR.glob('*.crdownload'))
+            if (OUTPUT_FILE.exists() and OUTPUT_FILE.stat().st_size > 0
+                    and not crdownload_files):
                 logging.info(f"✅ Download complete: {OUTPUT_FILE}")
                 logging.info(f"   ⏱️ Time taken: {elapsed}s")
                 logging.info(f"   📦 File size: {OUTPUT_FILE.stat().st_size:,} bytes")
-                
+
                 # Verify it's CSV
                 with open(OUTPUT_FILE, 'r') as f:
                     first_line = f.readline()
                     logging.info(f"   📋 First line: {first_line[:80]}...")
                 return True
-            
+
             # Progress indicator
             if elapsed % 10 == 0 and elapsed > 0:
                 logging.info(f"   Waiting... {elapsed}s elapsed")
@@ -157,8 +166,8 @@ def download_screener_csv(output_dir, headless=False):
             screenshot_path = DOWNLOAD_DIR / "error_screenshot.png"
             driver.save_screenshot(str(screenshot_path))
             logging.info(f"📸 Error screenshot saved to: {screenshot_path}")
-        except:
-            pass
+        except Exception as ss_err:
+            logging.error(f"   (also failed to save screenshot: {ss_err})")
         return False
     
     finally:
@@ -172,8 +181,8 @@ def main():
     )
     parser.add_argument(
         '--output',
-        default='/Users/paresh/Downloads',
-        help='Output directory for download (default: /Users/paresh/Downloads)'
+        default=str(config.FUNDAMENTAL_DIR),
+        help=f'Output directory for download (default: {config.FUNDAMENTAL_DIR})'
     )
     parser.add_argument(
         '--headless',

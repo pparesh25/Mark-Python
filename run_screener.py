@@ -145,10 +145,17 @@ def validate_fundamentals(logger):
 
     with open(FUNDAMENTAL_FILE, 'r', encoding='utf-8', errors='replace') as f:
         header = f.readline().strip()
-    expected_col = 'NSE Code'
-    if expected_col not in header:
-        logger.error(color(f"  ✗ header missing '{expected_col}' — unexpected file "
-                           "format.", 'RED'))
+    # Columns the priority-score helper depends on (see add_priority_score).
+    expected_cols = [
+        'NSE Code', 'Current Price', 'Debt to equity', 'Volume 1month average',
+        'Return over 1year', 'Return over 3months', 'Return on capital employed',
+        'Return on equity', 'Piotroski score', 'Altman Z Score',
+        'YOY Quarterly sales growth', 'YOY Quarterly profit growth',
+        'Change in FII holding', 'Change in DII holding', 'Pledged percentage',
+    ]
+    missing = [c for c in expected_cols if c not in header]
+    if missing:
+        logger.error(color(f"  ✗ header missing expected columns: {missing}", 'RED'))
         logger.error(f"    first line: {header[:120]}")
         sys.exit(1)
 
@@ -240,7 +247,9 @@ def main():
     temp_file = config.FUNDAMENTAL_DIR / "all-company.csv"
     if temp_file.exists():
         try:
-            temp_file.rename(config.FUNDAMENTAL_FILE)
+            # Path.replace() atomically overwrites an existing target across
+            # platforms (unlike rename, which can fail on some OSes).
+            temp_file.replace(config.FUNDAMENTAL_FILE)
             logger.info(color(f"  ✓ Renamed downloaded file to {config.FUNDAMENTAL_FILE.name}", 'GREEN'))
         except Exception as e:
             logger.error(color(f"  ✗ Failed to rename downloaded file to timestamped name: {e}", 'RED'))

@@ -63,9 +63,10 @@ def add_priority_score(df):
     rich columns from all-company.csv are available. Applied to BOTH outputs.
     """
     def pr(s):
-        # percentile rank 0-100, NaN -> median
+        # percentile rank 0-100, NaN -> median (fallback to 0 if all NaN)
         s = pd.to_numeric(s, errors='coerce')
-        s = s.fillna(s.median())
+        med = s.median()
+        s = s.fillna(med if pd.notna(med) else 0)
         return s.rank(pct=True) * 100
 
     price = pd.to_numeric(df['Current Price'], errors='coerce')
@@ -337,6 +338,13 @@ def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date
 
     # Generate charts
     logging.info(f"Generating charts for {suffix} in {chart_dir}...")
+    # Safety check: only rmtree if chart_dir is inside BASE_DIR to avoid
+    # accidentally wiping an unrelated directory.
+    try:
+        chart_dir.relative_to(config.BASE_DIR)
+    except ValueError:
+        logging.error(f"Refusing to rmtree {chart_dir} — not under BASE_DIR")
+        return None
     if chart_dir.exists():
         shutil.rmtree(chart_dir)
     chart_dir.mkdir(parents=True, exist_ok=True)
@@ -390,7 +398,7 @@ def main():
         # §3.4 — filter uses Tight_Breakout flag instead of today's Donchian.
         results_stage2 = results_all[
             (results_all['close'] >= results_all['52 week high'] * 0.85) &
-            (results_all['Tight_Breakout'] == True) &          # noqa: E712
+            (results_all['Tight_Breakout']) &
             (~results_all['Mark_Tight_Date'].isna())
         ].copy()
 
