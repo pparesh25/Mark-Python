@@ -347,13 +347,25 @@ def sync_database(
 
         logger.info(f"Downloading BSE Bhavcopy for {dates.pandasDt}...")
         r_bhav = requests.get(bhavcopy_url, headers=headers, timeout=15)
-        if r_bhav.status_code != 200:
+        if r_bhav.status_code == 404:
+            logger.warning(f"BSE Bhavcopy not found for {dates.pandasDt}. Skipping day (likely a market holiday).")
+            meta["lastUpdate"] = dates.dt.isoformat()
+            with open(meta_file, "w") as f:
+                json.dump(meta, f, indent=4)
+            continue
+        elif r_bhav.status_code != 200:
             logger.error(f"Failed to download BSE Bhavcopy for {dates.pandasDt} (HTTP {r_bhav.status_code})")
             return False
 
         logger.info(f"Downloading BSE Deliverables for {dates.pandasDt}...")
         r_delv = requests.get(deliverables_url, headers=headers, timeout=15)
-        if r_delv.status_code != 200:
+        if r_delv.status_code == 404:
+            logger.warning(f"BSE Deliverables not found for {dates.pandasDt}. Skipping day (likely a market holiday).")
+            meta["lastUpdate"] = dates.dt.isoformat()
+            with open(meta_file, "w") as f:
+                json.dump(meta, f, indent=4)
+            continue
+        elif r_delv.status_code != 200:
             logger.error(f"Failed to download BSE Deliverables for {dates.pandasDt} (HTTP {r_delv.status_code})")
             return False
 
