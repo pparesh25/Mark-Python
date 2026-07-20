@@ -31,6 +31,7 @@ else:
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent                    # live git repo (dynamic)
 DATA_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'NSE_EOD'
+BSE_DATA_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'BSE_EOD'
 
 # Fundamentals (all-company.csv) are downloaded fresh into the project's own
 # fundamental_files/ folder, timestamped per run.
@@ -63,6 +64,7 @@ LOG_DIR = Path.home() / 'Mark EMA and HTF' / 'logs'
 
 # Consolidated daily bhavcopy text files go here.
 DAILY_BHAVCOPY_DIR = Path.home() / 'Mark EMA and HTF' / 'Daily Bhavcopy NSE'
+BSE_DAILY_BHAVCOPY_DIR = Path.home() / 'Mark EMA and HTF' / 'Daily Bhavcopy BSE'
 
 # EOD downloader metadata (meta.json and isin.csv) goes here.
 EOD_METADATA_DIR = BASE_DIR / 'metadata'
@@ -100,7 +102,8 @@ def ensure_dirs():
               CHART_DIR, MARK_CHART_DIR, MARK_TIGHT_CHART_DIR,
               FLAG_CHART_DIR, TIGHT_FLAG_CHART_DIR,
               LOG_DIR, AMIBROKER_WATCHLIST_DIR, FUNDAMENTAL_DIR,
-              DAILY_BHAVCOPY_DIR, EOD_METADATA_DIR):
+              DAILY_BHAVCOPY_DIR, BSE_DAILY_BHAVCOPY_DIR, EOD_METADATA_DIR,
+              BSE_DATA_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
