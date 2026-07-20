@@ -38,7 +38,7 @@ DATA_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'NSE_EOD'
 # whatever name the server returns), then the orchestrator renames it to
 # all-company_{timestamp}.csv.
 FUNDAMENTAL_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'fundamental_files'
-FUNDAMENTAL_FILE = FUNDAMENTAL_DIR / f"all-company_{CURRENT_TIMESTAMP}.csv"
+FUNDAMENTAL_FILE = FUNDAMENTAL_DIR / f"all-company_{CURRENT_DATE}.csv"
 
 # ---------------------------------------------------------------------------
 # Outputs (relative to USER HOME / Mark EMA and HTF)

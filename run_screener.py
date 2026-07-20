@@ -249,43 +249,47 @@ def main():
 
     # --- Step 2: fundamentals download ------------------------------------
     logger.info(color("▶ Step 2/4: Fundamental Data Download (screener.in)", 'BOLD'))
-    logger.info(color("  Starting Selenium browser automation directly from Python...", 'CYAN'))
-    t0 = time.time()
-    
-    try:
-        import fundamental_downloader
-        # Ensure output directories exist before download
-        config.ensure_dirs()
-        
-        success = fundamental_downloader.download_screener_csv(
-            output_dir=config.FUNDAMENTAL_DIR,
-            headless=True
-        )
-    except Exception as e:
-        logger.error(color(f"  ✗ Failed to execute fundamental download in Python: {e}", 'RED'))
-        sys.exit(1)
-        
-    elapsed = time.time() - t0
-    if not success:
-        logger.error(color(f"  ✗ Fundamental download FAILED after {elapsed:.1f}s", 'RED'))
-        sys.exit(1)
-        
-    logger.info(color(f"  ✓ download completed in {elapsed:.1f}s", 'GREEN'))
-
-    # Rename downloaded all-company.csv to timestamped format
-    temp_file = config.FUNDAMENTAL_DIR / "all-company.csv"
-    if temp_file.exists():
-        try:
-            # Path.replace() atomically overwrites an existing target across
-            # platforms (unlike rename, which can fail on some OSes).
-            temp_file.replace(config.FUNDAMENTAL_FILE)
-            logger.info(color(f"  ✓ Renamed downloaded file to {config.FUNDAMENTAL_FILE.name}", 'GREEN'))
-        except Exception as e:
-            logger.error(color(f"  ✗ Failed to rename downloaded file to timestamped name: {e}", 'RED'))
-            sys.exit(1)
+    if FUNDAMENTAL_FILE.exists():
+        logger.info(color(f"  ✓ Fundamentals file for today already exists: {FUNDAMENTAL_FILE.name}", 'GREEN'))
+        logger.info(color("  Skipping browser download process.", 'CYAN'))
     else:
-        logger.error(color(f"  ✗ Downloaded file not found at {temp_file}", 'RED'))
-        sys.exit(1)
+        logger.info(color("  Starting Selenium browser automation directly from Python...", 'CYAN'))
+        t0 = time.time()
+        
+        try:
+            import fundamental_downloader
+            # Ensure output directories exist before download
+            config.ensure_dirs()
+            
+            success = fundamental_downloader.download_screener_csv(
+                output_dir=config.FUNDAMENTAL_DIR,
+                headless=True
+            )
+        except Exception as e:
+            logger.error(color(f"  ✗ Failed to execute fundamental download in Python: {e}", 'RED'))
+            sys.exit(1)
+            
+        elapsed = time.time() - t0
+        if not success:
+            logger.error(color(f"  ✗ Fundamental download FAILED after {elapsed:.1f}s", 'RED'))
+            sys.exit(1)
+            
+        logger.info(color(f"  ✓ download completed in {elapsed:.1f}s", 'GREEN'))
+
+        # Rename downloaded all-company.csv to date-based format
+        temp_file = config.FUNDAMENTAL_DIR / "all-company.csv"
+        if temp_file.exists():
+            try:
+                # Path.replace() atomically overwrites an existing target across
+                # platforms (unlike rename, which can fail on some OSes).
+                temp_file.replace(FUNDAMENTAL_FILE)
+                logger.info(color(f"  ✓ Renamed downloaded file to {FUNDAMENTAL_FILE.name}", 'GREEN'))
+            except Exception as e:
+                logger.error(color(f"  ✗ Failed to rename downloaded file to date-based name: {e}", 'RED'))
+                sys.exit(1)
+        else:
+            logger.error(color(f"  ✗ Downloaded file not found at {temp_file}", 'RED'))
+            sys.exit(1)
 
     validate_fundamentals(logger)
 
