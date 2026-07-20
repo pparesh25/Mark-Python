@@ -58,7 +58,7 @@ class Dates:
             return False
 
         # If it's today, only download after 6:00 PM (18:00) when BSE files are ready
-        if self.dt.day == curTime.day and curTime.hour < 18:
+        if self.dt.date() == curTime.date() and curTime.hour < 18:
             local_time = curTime.replace(hour=18, minute=0).astimezone(tz_local)
             t_str = local_time.strftime("%I:%M%p")
             logging.info(
