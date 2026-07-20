@@ -49,10 +49,14 @@ FUNDAMENTAL_FILE = FUNDAMENTAL_DIR / f"all-company_{CURRENT_TIMESTAMP}.csv"
 OUT_DIR = Path.home() / 'Mark EMA and HTF' / 'qualified_stocks'
 MARK_OUT_DIR = OUT_DIR / 'mark'
 MARK_TIGHT_OUT_DIR = OUT_DIR / 'mark_tight'
+FLAG_OUT_DIR = OUT_DIR / 'Flag'
+TIGHT_FLAG_OUT_DIR = OUT_DIR / 'Tight Flag'
 
 CHART_DIR = Path.home() / 'Mark EMA and HTF' / 'chart_images'
 MARK_CHART_DIR = CHART_DIR / 'mark'
 MARK_TIGHT_CHART_DIR = CHART_DIR / 'mark_tight'
+FLAG_CHART_DIR = CHART_DIR / 'Flag'
+TIGHT_FLAG_CHART_DIR = CHART_DIR / 'Tight Flag'
 
 # Per-run logs go here (not loose at the project root).
 LOG_DIR = Path.home() / 'Mark EMA and HTF' / 'logs'
@@ -92,7 +96,9 @@ def ensure_dirs():
     centralised so the orchestrator can call it once before screening.
     """
     for d in (OUT_DIR, MARK_OUT_DIR, MARK_TIGHT_OUT_DIR,
+              FLAG_OUT_DIR, TIGHT_FLAG_OUT_DIR,
               CHART_DIR, MARK_CHART_DIR, MARK_TIGHT_CHART_DIR,
+              FLAG_CHART_DIR, TIGHT_FLAG_CHART_DIR,
               LOG_DIR, AMIBROKER_WATCHLIST_DIR, FUNDAMENTAL_DIR,
               DAILY_BHAVCOPY_DIR, EOD_METADATA_DIR):
         d.mkdir(parents=True, exist_ok=True)

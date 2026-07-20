@@ -15,7 +15,7 @@ from .charts import plot_save_chart
 from .scoring import add_priority_score
 
 
-def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date_col, data_dir):
+def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date_col, data_dir, plot_days=500):
     merged_df = pd.merge(df_results, fundamental_df, left_on="symbol", right_on="NSE Code", how="left")
     merged_df = merged_df.dropna(subset=["NSE Code"])
     if merged_df.empty:
@@ -25,7 +25,7 @@ def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date
     merged_df = add_priority_score(merged_df)
     merged_df = merged_df[~merged_df[date_col].isna()]
     df_sorted = merged_df.sort_values(by="Priority_Score", ascending=False)
-    df_sorted["Plot Start"] = pd.to_datetime(df_sorted[date_col]) - pd.to_timedelta(500, unit="D")
+    df_sorted["Plot Start"] = pd.to_datetime(df_sorted[date_col]) - pd.to_timedelta(plot_days, unit="D")
     df_sorted["Plot End"] = pd.to_datetime(date.today())
     df_sorted["Days_In_Trend"] = (pd.to_datetime(df_sorted["date"]) - pd.to_datetime(df_sorted[date_col])).dt.days
     df_sorted["Trend_Strength"] = ((df_sorted["EMA_50"] - df_sorted["EMA_200"]) / df_sorted["EMA_200"] * 100).round(2)

@@ -188,8 +188,10 @@ def validate_fundamentals(logger):
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — run the screener in-process (shares the conda env + libs)
+# Step 3 & 4 — run screeners as subprocesses
 # ---------------------------------------------------------------------------
+FLAG_SCREENER_MODULE = BASE_DIR / 'flag_screener.py'
+
 def run_screening(logger):
     """Execute Mark screener_5dbreakout.py as a subprocess.
 
@@ -197,7 +199,13 @@ def run_screening(logger):
     and ensures stdout/stderr are captured line-by-line in our unified logs.
     """
     cmd = [sys.executable, "-u", str(SCREENER_MODULE)]
-    return run_step("Step 3/3: Stock Screening", cmd, logger)
+    return run_step("Step 3/4: Stock Screening", cmd, logger)
+
+
+def run_flag_screening(logger):
+    """Execute flag_screener.py as a subprocess."""
+    cmd = [sys.executable, "-u", str(FLAG_SCREENER_MODULE)]
+    return run_step("Step 4/4: Flag & Tight Flag Screening", cmd, logger)
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +225,7 @@ def main():
     logger.info(color('═' * width, 'CYAN'))
 
     # --- Step 1: eod2 database update -------------------------------------
-    logger.info(color("▶ Step 1/3: EOD Data Update (eod2)", 'BOLD'))
+    logger.info(color("▶ Step 1/4: EOD Data Update (eod2)", 'BOLD'))
     logger.info(color("  Starting NSE EOD download and adjustment in Python...", 'CYAN'))
     t0 = time.time()
     try:
@@ -240,7 +248,7 @@ def main():
     logger.info(color(f"  ✓ EOD update completed in {elapsed:.1f}s", 'GREEN'))
 
     # --- Step 2: fundamentals download ------------------------------------
-    logger.info(color("▶ Step 2/3: Fundamental Data Download (screener.in)", 'BOLD'))
+    logger.info(color("▶ Step 2/4: Fundamental Data Download (screener.in)", 'BOLD'))
     logger.info(color("  Starting Selenium browser automation directly from Python...", 'CYAN'))
     t0 = time.time()
     
@@ -283,6 +291,9 @@ def main():
 
     # --- Step 3: screening ------------------------------------------------
     run_screening(logger)
+
+    # --- Step 4: flag screening -------------------------------------------
+    run_flag_screening(logger)
 
     # --- Summary ----------------------------------------------------------
     total = time.time() - workflow_start
