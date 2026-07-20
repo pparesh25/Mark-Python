@@ -50,6 +50,17 @@ def download_screener_csv(output_dir, headless=False):
     if OUTPUT_FILE.exists():
         os.remove(OUTPUT_FILE)
         logging.info(f"🗑️ Removed existing file: {OUTPUT_FILE}")
+
+    # Clean up any stale .crdownload temp files from previous failed runs.
+    # These leftover files break the download-complete check below (which
+    # waits for ALL .crdownload files to disappear), causing false timeouts.
+    stale_crdownload = list(DOWNLOAD_DIR.glob('*.crdownload'))
+    for f in stale_crdownload:
+        try:
+            os.remove(f)
+            logging.info(f"🗑️ Removed stale temp file: {f.name}")
+        except OSError:
+            pass
     
     # Setup Chrome options
     chrome_options = Options()

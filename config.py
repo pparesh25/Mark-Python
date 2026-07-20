@@ -30,35 +30,35 @@ else:
 # Roots
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent                    # live git repo (dynamic)
-DATA_DIR = BASE_DIR / 'NSE_EOD'
+DATA_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'NSE_EOD'
 
 # Fundamentals (all-company.csv) are downloaded fresh into the project's own
 # fundamental_files/ folder, timestamped per run.
 # The downloader first writes a fixed-name all-company.csv there (Chrome saves
 # whatever name the server returns), then the orchestrator renames it to
 # all-company_{timestamp}.csv.
-FUNDAMENTAL_DIR = BASE_DIR / 'fundamental_files'
+FUNDAMENTAL_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'fundamental_files'
 FUNDAMENTAL_FILE = FUNDAMENTAL_DIR / f"all-company_{CURRENT_TIMESTAMP}.csv"
 
 # ---------------------------------------------------------------------------
-# Outputs (relative to BASE_DIR)
+# Outputs (relative to USER HOME / Mark EMA and HTF)
 # ---------------------------------------------------------------------------
 # CSV outputs are split into per-suffix subfolders (mirrors chart_images),
 # and filenames carry a timestamp so a same-day morning run is not clobbered
 # by an evening run.
-OUT_DIR = BASE_DIR / 'qualified_stocks'
+OUT_DIR = Path.home() / 'Mark EMA and HTF' / 'qualified_stocks'
 MARK_OUT_DIR = OUT_DIR / 'mark'
 MARK_TIGHT_OUT_DIR = OUT_DIR / 'mark_tight'
 
-CHART_DIR = BASE_DIR / 'chart_images'
+CHART_DIR = Path.home() / 'Mark EMA and HTF' / 'chart_images'
 MARK_CHART_DIR = CHART_DIR / 'mark'
 MARK_TIGHT_CHART_DIR = CHART_DIR / 'mark_tight'
 
 # Per-run logs go here (not loose at the project root).
-LOG_DIR = BASE_DIR / 'logs'
+LOG_DIR = Path.home() / 'Mark EMA and HTF' / 'logs'
 
 # Consolidated daily bhavcopy text files go here.
-DAILY_BHAVCOPY_DIR = BASE_DIR / 'Daily Bhavcopy NSE'
+DAILY_BHAVCOPY_DIR = Path.home() / 'Mark EMA and HTF' / 'Daily Bhavcopy NSE'
 
 # EOD downloader metadata (meta.json and isin.csv) goes here.
 EOD_METADATA_DIR = BASE_DIR / 'metadata'

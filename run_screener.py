@@ -22,6 +22,7 @@ Usage (conda env required — TA-Lib / selenium / pandas live there):
 
 import importlib.util
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import subprocess
 import sys
@@ -50,9 +51,15 @@ _C = {
 # Logging setup
 # ---------------------------------------------------------------------------
 def setup_logging():
-    """Configure root logger: INFO+ to console, DEBUG+ to the timestamped file."""
+    """Configure concise application logging for both console and file.
+
+    The previous DEBUG root logger also captured low-level HTTP/HPACK and
+    Selenium transport traces, making an ordinary run produce thousands of
+    mostly useless lines.  Keep operational messages at INFO and suppress
+    dependency internals unless a dependency reports a warning or error.
+    """
     logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     logger.handlers.clear()  # idempotent if re-imported
 
     fmt = logging.Formatter('%(asctime)s  %(levelname)-7s  %(message)s',
@@ -63,10 +70,24 @@ def setup_logging():
     ch.setFormatter(fmt)
     logger.addHandler(ch)
 
-    fh = logging.FileHandler(config.LOG_FILE, encoding='utf-8')
-    fh.setLevel(logging.DEBUG)
+    # Guard against an unexpected dependency becoming verbose again.  A run
+    # normally stays far below this limit; rotated files remain available for
+    # post-mortem debugging without allowing one run to fill the disk.
+    fh = RotatingFileHandler(
+        config.LOG_FILE,
+        maxBytes=2 * 1024 * 1024,
+        backupCount=2,
+        encoding='utf-8',
+    )
+    fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
+
+    for noisy_logger in (
+        'httpx', 'httpcore', 'hpack', 'selenium', 'urllib3',
+        'webdriver_manager', 'websocket', 'websockets',
+    ):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
     return logger
 
@@ -200,7 +221,7 @@ def main():
     logger.info(color("  Starting NSE EOD download and adjustment in Python...", 'CYAN'))
     t0 = time.time()
     try:
-        import eod_downloader
+        from nse_eod_downloader import eod_downloader
         success = eod_downloader.sync_database(
             config.DATA_DIR,
             logger,

@@ -20,20 +20,13 @@ import logging
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor
-from datetime import date
 from pathlib import Path
-import shutil
 
-import numpy as np
 import pandas as pd
 import talib as ta
 
-import matplotlib
-matplotlib.use('Agg')  # non-interactive backend
-import matplotlib.pyplot as plt
-import mplfinance as mpf
-
 import config
+from mark_screener.results import process_results
 from config import (
     DATA_DIR, MARK_CHART_DIR, MARK_TIGHT_CHART_DIR,
     MARK_OUT_DIR, MARK_TIGHT_OUT_DIR,
@@ -51,46 +44,6 @@ config.ensure_dirs()
 
 # List all the CSV files in the data directory
 files = [f.name for f in DATA_DIR.glob('*.csv') if f.name != 'isin.csv']
-
-
-# ===========================================================================
-# §4.1 — Priority score helper
-# ===========================================================================
-def add_priority_score(df):
-    """Winner-centric score + hard Tradeable flag, ranked WITHIN this set.
-
-    Computed inside ``process_results()`` AFTER the fundamentals merge, so the
-    rich columns from all-company.csv are available. Applied to BOTH outputs.
-    """
-    def pr(s):
-        # percentile rank 0-100, NaN -> median (fallback to 0 if all NaN)
-        s = pd.to_numeric(s, errors='coerce')
-        med = s.median()
-        s = s.fillna(med if pd.notna(med) else 0)
-        return s.rank(pct=True) * 100
-
-    price = pd.to_numeric(df['Current Price'], errors='coerce')
-    de = pd.to_numeric(df['Debt to equity'], errors='coerce')
-    # ₹ cr/day turnover
-    turn = (pd.to_numeric(df['Volume 1month average'], errors='coerce') * price) / 1e7
-
-    mom = (pr(df['Return over 1year']) + pr(df['Return over 3months'])) / 2
-    qual = (pr(df['Return on capital employed']) + pr(df['Return on equity'])
-            + pr(-de) + pr(df['Piotroski score']) + pr(df['Altman Z Score'])) / 5
-    fuel = (pr(df['YOY Quarterly sales growth']) + pr(df['YOY Quarterly profit growth'])) / 2
-    spons = (pr(df['Change in FII holding']) + pr(df['Change in DII holding'])) / 2
-    liq = pr(np.log1p(turn.clip(lower=0)))
-
-    df['Priority_Score'] = (0.30 * mom + 0.28 * qual + 0.22 * fuel
-                            + 0.12 * spons + 0.08 * liq).round(1)
-    df['Turnover_cr'] = turn.round(1)
-    pledge = pd.to_numeric(df['Pledged percentage'], errors='coerce').fillna(0)
-    altman = pd.to_numeric(df['Altman Z Score'], errors='coerce')
-    df['Tradeable'] = np.where(
-        (turn >= 2.0) & (de <= 1.0) & (pledge <= 15) & (altman >= 1.8),
-        'Y', 'N'
-    )
-    return df
 
 
 # ===========================================================================
@@ -176,186 +129,6 @@ def process_file(file):
         logging.error(f"Error processing {file}: {e}")
         return None
 
-
-# ===========================================================================
-# Chart rendering (unchanged from original)
-# ===========================================================================
-def plot_save_chart(args):
-    row, target_dir, date_col = args
-    try:
-        stock = row['symbol']
-        idx_val = str(row['Index']) if 'Index' in row else "0"
-        mark_date = row[date_col]
-
-        stock_file = DATA_DIR / f"{stock.lower()}.csv"
-        if not stock_file.exists():
-            return
-
-        stock_data = pd.read_csv(stock_file, header=0)
-        stock_data = stock_data.tail(500)
-        stock_data['Date'] = pd.to_datetime(stock_data['Date'])
-        stock_data.set_index('Date', inplace=True)
-
-        stock_data['EMA_50'] = ta.EMA(stock_data['Close'], timeperiod=50)
-        stock_data['EMA_150'] = ta.EMA(stock_data['Close'], timeperiod=150)
-        stock_data['EMA_200'] = ta.EMA(stock_data['Close'], timeperiod=200)
-
-        stock_start_date = row['Plot Start']
-        stock_end_date = row['Plot End']
-        stock_data = stock_data.loc[stock_start_date:stock_end_date]
-
-        if stock_data.empty:
-            return
-
-        from matplotlib.gridspec import GridSpec
-
-        fig = plt.figure(figsize=(19.2, 10))
-        fig.suptitle(stock, fontsize=18, fontweight='bold', y=0.995)
-
-        gs = GridSpec(3, 1, figure=fig, height_ratios=[0.5, 2.5, 0.8],
-                      hspace=0.02, top=0.96)
-
-        ax_info = fig.add_subplot(gs[0])
-        ax_info.axis('off')
-
-        sf = row
-        info_line1 = (
-            f"{sf['Name']}  |  "
-            f"Industry: {sf['Industry']}  |  "
-            f"Price: ₹{sf['Current Price']}  |  "
-            f"MCap: ₹{sf['Market Capitalization']} Cr  |  "
-            f"PE: {sf.get('Price to Earning', 'N/A')}"
-        )
-        info_line2 = (
-            f"ROE: {sf.get('Return on equity', 'N/A')}%  |  "
-            f"ROCE: {sf.get('Return on capital employed', 'N/A')}%  |  "
-            f"OPM: {sf.get('OPM', 'N/A')}%  |  "
-            f"P/B: {sf.get('Price to book value', 'N/A')}  |  "
-            f"Debt/Eq: {sf.get('Debt to equity', 'N/A')}"
-        )
-        info_line3 = (
-            f"Sales 5Y: {sf['Sales growth 5Years']}%  |  "
-            f"Profit 5Y: {sf['Profit growth 5Years']}%  |  "
-            f"Promoter: {sf.get('Promoter holding', 'N/A')}%  |  "
-            f"FII: {sf.get('FII holding', 'N/A')}%  |  "
-            f"DII: {sf.get('DII holding', 'N/A')}%  |  "
-            f"52w: -{sf.get('Down from 52w high_y', 0)}% / +{sf.get('Up from 52w low', 0)}%"
-        )
-        info_text = f"{info_line1}\n{info_line2}\n{info_line3}"
-
-        ax_info.text(0.5, 0.5, info_text, transform=ax_info.transAxes,
-                     fontsize=10, verticalalignment='center', horizontalalignment='center',
-                     bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3),
-                     family='monospace', linespacing=1.8)
-
-        ax_price = fig.add_subplot(gs[1])
-        ax_volume = fig.add_subplot(gs[2], sharex=ax_price)
-
-        ema_50 = mpf.make_addplot(stock_data['EMA_50'], ax=ax_price, color='blue', width=1.0)
-        ema_150 = mpf.make_addplot(stock_data['EMA_150'], ax=ax_price, color='orange', width=1.0)
-        ema_200 = mpf.make_addplot(stock_data['EMA_200'], ax=ax_price, color='red', width=1.0)
-
-        mpf_style = mpf.make_mpf_style(base_mpf_style='charles',
-                                       mavcolors=['blue', 'orange', 'red'])
-
-        mpf.plot(stock_data, type='candle', style=mpf_style, ax=ax_price, volume=ax_volume,
-                 addplot=[ema_50, ema_150, ema_200], ylabel='Price', ylabel_lower='Volume',
-                 update_width_config=dict(volume_linewidth=0, volume_width=0.75))
-
-        ax_volume.yaxis.tick_right()
-        ax_volume.yaxis.set_label_position("right")
-
-        ax_price.grid(True, linestyle=':', linewidth=0.3, color='gray', alpha=0.5)
-        ax_volume.grid(True, linestyle=':', linewidth=0.3, color='gray', alpha=0.5)
-
-        try:
-            start_index = stock_data.index.get_loc(mark_date)
-            ax_price.axvline(x=start_index, color='blue', linestyle=':', linewidth=0.8, alpha=0.7)
-        except (KeyError, ValueError):
-            pass
-
-        plt.setp(ax_volume.xaxis.get_majorticklabels(), rotation=0, ha='center')
-
-        image_name = f"{idx_val}_{stock}.png"
-        image_path = target_dir / image_name
-        plt.savefig(image_path, bbox_inches='tight', pad_inches=0.1, dpi=150)
-        plt.close()
-    except Exception as e:
-        logging.error(f"Error plotting {row.get('symbol', 'unknown')}: {e}")
-
-
-# ===========================================================================
-# Results processing — with §4 priority score embedded
-# ===========================================================================
-def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date_col):
-    # Merge with fundamental data
-    merged_df = pd.merge(df_results, fundamental_df, left_on='symbol',
-                         right_on='NSE Code', how='left')
-    merged_df = merged_df.dropna(subset=['NSE Code'])
-
-    if merged_df.empty:
-        logging.info(f"No stocks matched for {suffix}.")
-        return None
-
-    # §4.2 — compute priority score within this qualified set
-    merged_df = add_priority_score(merged_df)
-
-    merged_df = merged_df[~merged_df[date_col].isna()]
-    # §4.3 — sort by Priority_Score descending (winner-centric ranking)
-    df_sorted = merged_df.sort_values(by='Priority_Score', ascending=False)
-
-    df_sorted['Plot Start'] = pd.to_datetime(df_sorted[date_col]) - pd.to_timedelta(500, unit='D')
-    df_sorted['Plot End'] = pd.to_datetime(date.today())
-    df_sorted['Days_In_Trend'] = (pd.to_datetime(df_sorted['date'])
-                                  - pd.to_datetime(df_sorted[date_col])).dt.days
-    df_sorted['Trend_Strength'] = (((df_sorted['EMA_50'] - df_sorted['EMA_200'])
-                                    / df_sorted['EMA_200'] * 100).round(2))
-
-    df_sorted = df_sorted.reset_index(drop=True)
-    df_sorted['Index'] = df_sorted.index
-
-    # §4.3 — new priority columns surfaced right after Trend_Strength.
-    # They're listed explicitly AND excluded from fundamental_cols to avoid
-    # duplication.
-    csv_columns = ['Index', 'symbol', 'Priority_Score', 'Tradeable', 'Turnover_cr',
-                   'Days_In_Trend', 'Trend_Strength']
-    fundamental_cols = [col for col in df_sorted.columns if col not in [
-        'Index', 'symbol', 'date', 'close', 'EMA_50', 'EMA_150', 'EMA_200',
-        '52 week high', '52 week low', 'Mark_Date', 'Mark_Tight_Date',
-        'Down from 52w high_x', 'Donchian_60_High', 'Donchian_60_Base',
-        'Tight_Breakout',
-        'Plot Start', 'Plot End', 'Days_In_Trend', 'Trend_Strength',
-        'Priority_Score', 'Tradeable', 'Turnover_cr',
-    ]]
-    csv_columns.extend(fundamental_cols)
-
-    # Filename carries a timestamp so a same-day evening run does not
-    # overwrite the morning run's CSV (e.g. pre-open vs post-close screens).
-    csv_filename = f"{CURRENT_TIMESTAMP}_{suffix}_qualified.csv"
-    csv_filepath = out_dir / csv_filename
-    df_sorted[csv_columns].to_csv(csv_filepath, index=False)
-    logging.info(f"CSV exported: {csv_filepath} ({len(df_sorted)} stocks)")
-
-    # Generate charts
-    logging.info(f"Generating charts for {suffix} in {chart_dir}...")
-    # Safety check: only rmtree if chart_dir is inside BASE_DIR to avoid
-    # accidentally wiping an unrelated directory.
-    try:
-        chart_dir.relative_to(config.BASE_DIR)
-    except ValueError:
-        logging.error(f"Refusing to rmtree {chart_dir} — not under BASE_DIR")
-        return None
-    if chart_dir.exists():
-        shutil.rmtree(chart_dir)
-    chart_dir.mkdir(parents=True, exist_ok=True)
-
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-        list(executor.map(plot_save_chart,
-                          [(row, chart_dir, date_col) for _, row in df_sorted.iterrows()]))
-
-    return df_sorted
-
-
 # ===========================================================================
 # Main
 # ===========================================================================
@@ -381,7 +154,7 @@ def main():
     # Process Stage 1 (Mark)
     logging.info("Processing Stage 1 results...")
     df_mark = process_results(results_all, query_df, "mark", MARK_OUT_DIR,
-                              MARK_CHART_DIR, "Mark_Date")
+                              MARK_CHART_DIR, "Mark_Date", DATA_DIR)
 
     if df_mark is not None and not df_mark.empty:
         # Save mark watchlist
@@ -405,7 +178,7 @@ def main():
         if not results_stage2.empty:
             logging.info(f"Found {len(results_stage2)} stocks matching Mark Tight criteria.")
             process_results(results_stage2, query_df, "mark_tight", MARK_TIGHT_OUT_DIR,
-                            MARK_TIGHT_CHART_DIR, "Mark_Tight_Date")
+                            MARK_TIGHT_CHART_DIR, "Mark_Tight_Date", DATA_DIR)
 
             # Save mark_tight watchlist
             tight_watchlist_filename = f"{CURRENT_TIMESTAMP}_mark_tight.txt"

@@ -4,7 +4,7 @@ import config
 
 
 def clean_csv_files():
-    source_dir = str(config.BASE_DIR / 'NSE_EOD')
+    source_dir = str(config.DATA_DIR)
     dest_dir = str(config.BASE_DIR / 'NSE_EOD_Cleaned')
 
     # Create destination directory if it doesn't exist
