@@ -15,20 +15,27 @@ import duckdb
 import config
 from mark_screener.results import process_results
 from config import (
-    MARK_CHART_DIR, MARK_TIGHT_CHART_DIR,
-    MARK_OUT_DIR, MARK_TIGHT_OUT_DIR,
     FUNDAMENTAL_FILE, AMIBROKER_WATCHLIST_DIR,
     BREAKOUT_WINDOW, CURRENT_TIMESTAMP,
 )
 
 start_time = time.time()
-config.ensure_dirs()
 
 # Parse arguments
 parser = argparse.ArgumentParser()
 parser.add_argument('--exchange', type=str, default='NSE', choices=['NSE', 'BSE'])
 args = parser.parse_args()
 exchange = args.exchange.upper()
+
+dirs = config.get_output_dirs(exchange)
+MARK_OUT_DIR = dirs['mark_out']
+MARK_TIGHT_OUT_DIR = dirs['mark_tight_out']
+MARK_CHART_DIR = dirs['mark_chart']
+MARK_TIGHT_CHART_DIR = dirs['mark_tight_chart']
+
+config.ensure_dirs()
+
+
 
 
 def process_symbol_data(args_tuple):

@@ -19,7 +19,7 @@ def plot_save_chart(args):
         stock = row["symbol"]
         idx_val = str(row["Index"]) if "Index" in row else "0"
         mark_date = row[date_col]
-        exchange = row.get("Exchange", "NSE")
+        exchange = row.get("Exchange", row.get("exchange", "NSE"))
         import duckdb
         conn = duckdb.connect(str(config.DUCKDB_FILE), read_only=True)
         try:

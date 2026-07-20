@@ -14,20 +14,25 @@ import duckdb
 import config
 from mark_screener.results import process_results
 from config import (
-    FLAG_CHART_DIR, TIGHT_FLAG_CHART_DIR,
-    FLAG_OUT_DIR, TIGHT_FLAG_OUT_DIR,
     FUNDAMENTAL_FILE, AMIBROKER_WATCHLIST_DIR,
     CURRENT_TIMESTAMP,
 )
 
 start_time = time.time()
-config.ensure_dirs()
 
 # Parse arguments
 parser = argparse.ArgumentParser()
 parser.add_argument('--exchange', type=str, default='NSE', choices=['NSE', 'BSE'])
 args = parser.parse_args()
 exchange = args.exchange.upper()
+
+dirs = config.get_output_dirs(exchange)
+FLAG_OUT_DIR = dirs['flag_out']
+TIGHT_FLAG_OUT_DIR = dirs['tight_flag_out']
+FLAG_CHART_DIR = dirs['flag_chart']
+TIGHT_FLAG_CHART_DIR = dirs['tight_flag_chart']
+
+config.ensure_dirs()
 
 
 def check_flag_patterns(df):

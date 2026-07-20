@@ -50,16 +50,7 @@ FUNDAMENTAL_FILE = FUNDAMENTAL_DIR / f"all-company_{CURRENT_DATE}.csv"
 # and filenames carry a timestamp so a same-day morning run is not clobbered
 # by an evening run.
 OUT_DIR = Path.home() / 'Mark EMA and HTF' / 'qualified_stocks'
-MARK_OUT_DIR = OUT_DIR / 'mark'
-MARK_TIGHT_OUT_DIR = OUT_DIR / 'mark_tight'
-FLAG_OUT_DIR = OUT_DIR / 'Flag'
-TIGHT_FLAG_OUT_DIR = OUT_DIR / 'Tight Flag'
-
 CHART_DIR = Path.home() / 'Mark EMA and HTF' / 'chart_images'
-MARK_CHART_DIR = CHART_DIR / 'mark'
-MARK_TIGHT_CHART_DIR = CHART_DIR / 'mark_tight'
-FLAG_CHART_DIR = CHART_DIR / 'Flag'
-TIGHT_FLAG_CHART_DIR = CHART_DIR / 'Tight Flag'
 
 # Per-run logs go here (not loose at the project root).
 LOG_DIR = Path.home() / 'Mark EMA and HTF' / 'logs'
@@ -70,6 +61,26 @@ BSE_DAILY_BHAVCOPY_DIR = Path.home() / 'Mark EMA and HTF' / 'Daily Bhavcopy BSE'
 
 # EOD downloader metadata (meta.json and isin.csv) goes here.
 EOD_METADATA_DIR = BASE_DIR / 'metadata'
+
+
+def get_output_dirs(exchange: str):
+    """Get the output and chart directories for a specific exchange (NSE or BSE)."""
+    ex_upper = exchange.upper()
+    out_base = OUT_DIR / ex_upper
+    chart_base = CHART_DIR / ex_upper
+    
+    return {
+        'mark_out': out_base / 'mark',
+        'mark_tight_out': out_base / 'mark_tight',
+        'flag_out': out_base / 'Flag',
+        'tight_flag_out': out_base / 'Tight Flag',
+        
+        'mark_chart': chart_base / 'mark',
+        'mark_tight_chart': chart_base / 'mark_tight',
+        'flag_chart': chart_base / 'Flag',
+        'tight_flag_chart': chart_base / 'Tight Flag',
+    }
+
 
 # ---------------------------------------------------------------------------
 # External tools / dependencies
@@ -94,16 +105,13 @@ LOG_FILE = LOG_DIR / f"screening_log_{CURRENT_TIMESTAMP}.txt"
 
 
 def ensure_dirs():
-    """Create all output directories if they don't exist.
-
-    Mirrors the original module-level mkdir calls (Mark screener.py:32-35) but
-    centralised so the orchestrator can call it once before screening.
-    """
-    for d in (OUT_DIR, MARK_OUT_DIR, MARK_TIGHT_OUT_DIR,
-              FLAG_OUT_DIR, TIGHT_FLAG_OUT_DIR,
-              CHART_DIR, MARK_CHART_DIR, MARK_TIGHT_CHART_DIR,
-              FLAG_CHART_DIR, TIGHT_FLAG_CHART_DIR,
-              LOG_DIR, AMIBROKER_WATCHLIST_DIR, FUNDAMENTAL_DIR,
+    """Create all output directories if they don't exist."""
+    for ex in ('NSE', 'BSE'):
+        dirs = get_output_dirs(ex)
+        for d in dirs.values():
+            d.mkdir(parents=True, exist_ok=True)
+            
+    for d in (OUT_DIR, CHART_DIR, LOG_DIR, AMIBROKER_WATCHLIST_DIR, FUNDAMENTAL_DIR,
               DAILY_BHAVCOPY_DIR, BSE_DAILY_BHAVCOPY_DIR, EOD_METADATA_DIR,
               BSE_DATA_DIR):
         d.mkdir(parents=True, exist_ok=True)
