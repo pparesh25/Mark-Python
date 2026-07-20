@@ -1,4 +1,4 @@
-"""BSE stock EOD CSV file maintenance helpers."""
+"""BSE stock EOD database maintenance helpers using DuckDB."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ import logging
 from pathlib import Path
 from typing import Any
 import pandas as pd
-
-HEADER = b"Date,Open,High,Low,Close,Volume,Series,TOTAL_TRADES,QTY_PER_TRADE,DLV_QTY\n"
+import duckdb
+import config
 
 
 def update_bse_eod(
@@ -17,7 +17,7 @@ def update_bse_eod(
     metadata_dir: Path,
     dates: Any,
 ) -> None:
-    """Process the merged daily BSE DataFrame and append data to individual stock CSVs."""
+    """Process the merged daily BSE DataFrame and insert data into DuckDB database."""
     isin_file = metadata_dir / "bse_isin.csv"
     if isin_file.is_file():
         isin = pd.read_csv(isin_file, index_col="ISIN")
@@ -39,7 +39,7 @@ def update_bse_eod(
 
         # BSE SME groups are M and MT
         prefix = "_sme" if series in ("M", "MT") else ""
-        symbol_file = data_dir / f"{symbol.lower()}{prefix}.csv"
+        symbol_name = f"{symbol.upper()}{prefix.upper()}"
 
         if pd.isna(isin_code):
             logger.warning(f"BSE Symbol {symbol} missing ISIN.")
@@ -52,17 +52,20 @@ def update_bse_eod(
 
         if symbol != isin.at[isin_code, "SYMBOL"]:
             isin_updated = True
-            old = isin.at[isin_code, "SYMBOL"].lower()
-            new = symbol.lower()
+            old = isin.at[isin_code, "SYMBOL"].upper()
+            new = symbol.upper()
             isin.at[isin_code, "SYMBOL"] = symbol
             
-            symbol_file = data_dir / f"{new}{prefix}.csv"
-            old_file = data_dir / f"{old}{prefix}.csv"
+            # Execute rename query in DuckDB
+            conn = duckdb.connect(str(config.DUCKDB_FILE))
             try:
-                old_file.rename(symbol_file)
-                logger.warning(f"BSE Name Changed: Renamed {old}{prefix}.csv to {new}{prefix}.csv")
-            except FileNotFoundError:
-                logger.warning(f"BSE Name Changed: {old} to {new}. No historical CSV file to rename.")
+                conn.execute(
+                    "UPDATE eod_data SET Symbol = ? WHERE ISIN = ? AND Exchange = 'BSE'",
+                    (f"{new}{prefix.upper()}", isin_code)
+                )
+            finally:
+                conn.close()
+            logger.warning(f"BSE Name Changed in DuckDB: {old}{prefix.upper()} to {new}{prefix.upper()}")
 
         # Prepare parameters to append
         trades = row.get("TOTAL_TRADES", "")
@@ -78,7 +81,8 @@ def update_bse_eod(
             delivered = int(delivered)
 
         update_bse_symbol(
-            symbol_file,
+            symbol_name,
+            isin_code,
             series,
             row.OpnPric,
             row.HghPric,
@@ -87,7 +91,6 @@ def update_bse_eod(
             row.TtlTradgVol,
             trades,
             delivered,
-            data_dir,
             dates,
         )
 
@@ -97,8 +100,9 @@ def update_bse_eod(
 
 
 def update_bse_symbol(
-    symbol_file: Path,
-    series: Any,
+    symbol: str,
+    isin_code: str,
+    series: str,
     open_price: Any,
     high_price: Any,
     low_price: Any,
@@ -106,42 +110,30 @@ def update_bse_symbol(
     volume: Any,
     trades: Any,
     delivered: Any,
-    data_dir: Path,
     dates: Any,
 ) -> None:
-    """Append one daily record to a stock's CSV file, avoiding duplicate dates."""
-    text = b""
-    if not symbol_file.exists():
-        text += HEADER
-    else:
-        with symbol_file.open("rb") as handle:
-            try:
-                handle.seek(0, 2)
-                handle.seek(max(0, handle.tell() - 200))
-                if dates.pandasDt.encode() in handle.read():
-                    return  # Already updated for this date
-            except Exception:
-                pass
-
-    # Round price fields to 2 decimals
-    open_p = f"{float(open_price):.2f}" if not pd.isna(open_price) else ""
-    high_p = f"{float(high_price):.2f}" if not pd.isna(high_price) else ""
-    low_p = f"{float(low_price):.2f}" if not pd.isna(low_price) else ""
-    close_p = f"{float(close_price):.2f}" if not pd.isna(close_price) else ""
-    vol = f"{int(volume)}" if not pd.isna(volume) else "0"
-
-    total_trades = f"{int(trades)}" if trades != "" else ""
+    """Insert one stock row into DuckDB database, avoiding duplicate dates."""
+    conn = duckdb.connect(str(config.DUCKDB_FILE))
     
-    # Calculate QTY_PER_TRADE
-    if trades != "" and int(trades) > 0:
-        qty_per_trade = f"{(int(volume) / int(trades)):.2f}"
-    else:
-        qty_per_trade = ""
-
-    dlv_qty = f"{int(delivered)}" if delivered != "" else ""
-
-    row_text = f"{dates.pandasDt},{open_p},{high_p},{low_p},{close_p},{vol},{series},{total_trades},{qty_per_trade},{dlv_qty}\n"
-    text += row_text.encode()
-
-    with symbol_file.open("ab") as handle:
-        handle.write(text)
+    try:
+        date_val = pd.to_datetime(dates.pandasDt).date()
+        
+        open_p = float(open_price) if not pd.isna(open_price) and open_price != "" else None
+        high_p = float(high_price) if not pd.isna(high_price) and high_price != "" else None
+        low_p = float(low_price) if not pd.isna(low_price) and low_price != "" else None
+        close_p = float(close_price) if not pd.isna(close_price) and close_price != "" else None
+        vol = int(volume) if not pd.isna(volume) and volume != "" else 0
+        
+        total_trades = int(trades) if not pd.isna(trades) and trades != "" else None
+        qty_per_trade = round(vol / total_trades, 2) if total_trades and total_trades > 0 else None
+        dlv_qty = int(delivered) if not pd.isna(delivered) and delivered != "" else None
+        
+        conn.execute("""
+            INSERT OR IGNORE INTO eod_data 
+            (Date, Symbol, Exchange, ISIN, Open, High, Low, Close, Volume, Series, Total_Trades, Qty_Per_Trade, Dlv_Qty)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            date_val, symbol, 'BSE', isin_code, open_p, high_p, low_p, close_p, vol, series, total_trades, qty_per_trade, dlv_qty
+        ))
+    finally:
+        conn.close()

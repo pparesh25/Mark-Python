@@ -16,8 +16,11 @@ from .scoring import add_priority_score
 
 
 def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date_col, data_dir, plot_days=500):
-    merged_df = pd.merge(df_results, fundamental_df, left_on="symbol", right_on="NSE Code", how="left")
-    merged_df = merged_df.dropna(subset=["NSE Code"])
+    df_results['isin'] = df_results['isin'].astype(str).str.strip().str.upper()
+    fundamental_df['ISIN Code'] = fundamental_df['ISIN Code'].astype(str).str.strip().str.upper()
+    
+    merged_df = pd.merge(df_results, fundamental_df, left_on="isin", right_on="ISIN Code", how="left")
+    merged_df = merged_df.dropna(subset=["ISIN Code"])
     if merged_df.empty:
         logging.info(f"No stocks matched for {suffix}.")
         return None

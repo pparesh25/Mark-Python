@@ -1,4 +1,4 @@
-"""Capital-market daily-file and ISIN/symbol maintenance."""
+"""Capital-market daily-file and ISIN/symbol maintenance using DuckDB."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
-
+import duckdb
+import config
 
 STOCK_SERIES = ("EQ", "BE", "BZ", "SM", "ST")
-HEADER = b"Date,Open,High,Low,Close,Volume,Series,TOTAL_TRADES,QTY_PER_TRADE,DLV_QTY\n"
 
 
 def update_nse_eod(
@@ -23,9 +23,9 @@ def update_nse_eod(
     logger: Any,
     bhavcopy_rows: Optional[list[str]] = None,
 ) -> None:
-    """Persist one NSE equity bhavcopy and update daily stock files."""
+    """Persist one NSE equity bhavcopy and update DuckDB database."""
 
-    logger.info("Starting Capital Market Data Sync")
+    logger.info("Starting Capital Market Data Sync (DuckDB)")
     isin_file = metadata_dir / "isin.csv"
     isin_updated = False
 
@@ -58,7 +58,7 @@ def update_nse_eod(
             trades = delivered = ""
 
         prefix = "_sme" if row.SctySrs in ("SM", "ST") else ""
-        symbol_file = data_dir / f"{row.TckrSymb.lower()}{prefix}.csv"
+        symbol = f"{row.TckrSymb.upper()}{prefix.upper()}"
 
         if pd.isna(row.Index):
             raise ValueError(f"{row.TckrSymb} missing ISIN number.")
@@ -69,19 +69,24 @@ def update_nse_eod(
 
         if row.TckrSymb != isin.at[row.Index, "SYMBOL"]:
             isin_updated = True
-            old = isin.at[row.Index, "SYMBOL"].lower()
-            new = row.TckrSymb.lower()
+            old = isin.at[row.Index, "SYMBOL"].upper()
+            new = row.TckrSymb.upper()
             isin.at[row.Index, "SYMBOL"] = row.TckrSymb
-            symbol_file = data_dir / f"{new}{prefix}.csv"
-            old_file = data_dir / f"{old}{prefix}.csv"
+            
+            # Execute rename query in DuckDB
+            conn = duckdb.connect(str(config.DUCKDB_FILE))
             try:
-                old_file.rename(symbol_file)
-            except FileNotFoundError:
-                logger.warning(f"Renaming daily/{old}.csv to {new}.csv. No such file.")
-            logger.warning(f"Name Changed: {old} to {new}")
+                conn.execute(
+                    "UPDATE eod_data SET Symbol = ? WHERE ISIN = ? AND Exchange = 'NSE'",
+                    (new, row.Index)
+                )
+            finally:
+                conn.close()
+            logger.warning(f"Name Changed in DuckDB: {old} to {new}")
 
         update_nse_symbol(
-            symbol_file,
+            symbol,
+            row.Index, # ISIN
             row.SctySrs,
             row.OpnPric,
             row.HghPric,
@@ -90,12 +95,10 @@ def update_nse_eod(
             row.TtlTradgVol,
             trades,
             delivered,
-            data_dir,
             dates,
         )
 
         if bhavcopy_rows is not None:
-            symbol = f"{row.TckrSymb.upper()}{prefix.upper()}"
             avg_trades = "" if trades == "" or pd.isna(trades) else round(row.TtlTradgVol / trades, 2)
             bhavcopy_rows.append(
                 f"{symbol},{dates.pandasDt},{row.OpnPric},{row.HghPric},{row.LwPric},{row.ClsPric},{row.TtlTradgVol},{row.SctySrs},{trades},{avg_trades},{delivered}\n"
@@ -107,8 +110,9 @@ def update_nse_eod(
 
 
 def update_nse_symbol(
-    symbol_file: Path,
-    series: Any,
+    symbol: str,
+    isin_code: str,
+    series: str,
     open_price: Any,
     high_price: Any,
     low_price: Any,
@@ -116,33 +120,30 @@ def update_nse_symbol(
     volume: Any,
     trades: Any,
     delivered: Any,
-    daily_folder: Path,
     dates: Any,
 ) -> None:
-    """Append one stock row, avoiding duplicate dates."""
-
-    text = b""
-    if not symbol_file.exists():
-        sme_file = daily_folder / f"{symbol_file.stem}_sme.csv"
-        if "_sme" not in symbol_file.name and sme_file.exists():
-            sme_file.rename(symbol_file)
-        else:
-            text += HEADER
-    else:
-        with symbol_file.open("rb") as handle:
-            try:
-                handle.seek(0, 2)
-                handle.seek(max(0, handle.tell() - 200))
-                if dates.pandasDt.encode() in handle.read():
-                    return
-            except Exception:
-                pass
-
-    avg_trades = "" if trades == "" or pd.isna(trades) else round(volume / trades, 2)
-    text += bytes(
-        f"{dates.pandasDt},{open_price},{high_price},{low_price},{close_price},{volume},{series},{trades},{avg_trades},{delivered}\n",
-        encoding="utf-8",
-    )
-    with symbol_file.open("ab") as handle:
-        handle.write(text)
-
+    """Insert one stock row into DuckDB database, avoiding duplicate dates."""
+    conn = duckdb.connect(str(config.DUCKDB_FILE))
+    
+    try:
+        date_val = pd.to_datetime(dates.pandasDt).date()
+        
+        open_p = float(open_price) if not pd.isna(open_price) and open_price != "" else None
+        high_p = float(high_price) if not pd.isna(high_price) and high_price != "" else None
+        low_p = float(low_price) if not pd.isna(low_price) and low_price != "" else None
+        close_p = float(close_price) if not pd.isna(close_price) and close_price != "" else None
+        vol = int(volume) if not pd.isna(volume) and volume != "" else 0
+        
+        total_trades = int(trades) if not pd.isna(trades) and trades != "" else None
+        qty_per_trade = round(vol / total_trades, 2) if total_trades and total_trades > 0 else None
+        dlv_qty = int(delivered) if not pd.isna(delivered) and delivered != "" else None
+        
+        conn.execute("""
+            INSERT OR IGNORE INTO eod_data 
+            (Date, Symbol, Exchange, ISIN, Open, High, Low, Close, Volume, Series, Total_Trades, Qty_Per_Trade, Dlv_Qty)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            date_val, symbol, 'NSE', isin_code, open_p, high_p, low_p, close_p, vol, series, total_trades, qty_per_trade, dlv_qty
+        ))
+    finally:
+        conn.close()

@@ -193,19 +193,17 @@ def validate_fundamentals(logger):
 FLAG_SCREENER_MODULE = BASE_DIR / 'flag_screener.py'
 
 def run_screening(logger):
-    """Execute Mark screener_5dbreakout.py as a subprocess.
-
-    Executing as a subprocess avoids PicklingErrors in ProcessPoolExecutor on macOS
-    and ensures stdout/stderr are captured line-by-line in our unified logs.
-    """
-    cmd = [sys.executable, "-u", str(SCREENER_MODULE)]
-    return run_step("Step 3/4: Stock Screening", cmd, logger)
+    """Execute Mark screener_5dbreakout.py as a subprocess for NSE and BSE."""
+    success_nse = run_step("Step 3/4: NSE Stock Screening", [sys.executable, "-u", str(SCREENER_MODULE), "--exchange", "NSE"], logger)
+    success_bse = run_step("Step 3/4: BSE Stock Screening", [sys.executable, "-u", str(SCREENER_MODULE), "--exchange", "BSE"], logger)
+    return success_nse and success_bse
 
 
 def run_flag_screening(logger):
-    """Execute flag_screener.py as a subprocess."""
-    cmd = [sys.executable, "-u", str(FLAG_SCREENER_MODULE)]
-    return run_step("Step 4/4: Flag & Tight Flag Screening", cmd, logger)
+    """Execute flag_screener.py as a subprocess for NSE and BSE."""
+    success_nse = run_step("Step 4/4: NSE Flag & Tight Flag Screening", [sys.executable, "-u", str(FLAG_SCREENER_MODULE), "--exchange", "NSE"], logger)
+    success_bse = run_step("Step 4/4: BSE Flag & Tight Flag Screening", [sys.executable, "-u", str(FLAG_SCREENER_MODULE), "--exchange", "BSE"], logger)
+    return success_nse and success_bse
 
 
 # ---------------------------------------------------------------------------
@@ -230,21 +228,39 @@ def main():
     t0 = time.time()
     try:
         from nse_eod_downloader import eod_downloader
-        success = eod_downloader.sync_database(
+        success_nse = eod_downloader.sync_database(
             config.DATA_DIR,
             logger,
             metadata_dir=config.EOD_METADATA_DIR,
             daily_bhavcopy_dir=config.DAILY_BHAVCOPY_DIR
         )
     except Exception as e:
-        logger.error(color(f"  ✗ Failed to execute EOD update in Python: {e}", 'RED'))
+        logger.error(color(f"  ✗ Failed to execute NSE EOD update in Python: {e}", 'RED'))
+        sys.exit(1)
+        
+    if not success_nse:
+        logger.error(color(f"  ✗ NSE EOD update FAILED after {time.time() - t0:.1f}s", 'RED'))
+        sys.exit(1)
+        
+    logger.info(color("  Starting BSE EOD download and adjustment in Python...", 'CYAN'))
+    t0_bse = time.time()
+    try:
+        from bse_eod_downloader import eod_downloader as bse_eod_downloader
+        success_bse = bse_eod_downloader.sync_database(
+            config.BSE_DATA_DIR,
+            logger,
+            metadata_dir=config.EOD_METADATA_DIR,
+            daily_bhavcopy_dir=config.BSE_DAILY_BHAVCOPY_DIR
+        )
+    except Exception as e:
+        logger.error(color(f"  ✗ Failed to execute BSE EOD update in Python: {e}", 'RED'))
+        sys.exit(1)
+        
+    if not success_bse:
+        logger.error(color(f"  ✗ BSE EOD update FAILED after {time.time() - t0_bse:.1f}s", 'RED'))
         sys.exit(1)
         
     elapsed = time.time() - t0
-    if not success:
-        logger.error(color(f"  ✗ EOD update FAILED after {elapsed:.1f}s", 'RED'))
-        sys.exit(1)
-        
     logger.info(color(f"  ✓ EOD update completed in {elapsed:.1f}s", 'GREEN'))
 
     # --- Step 2: fundamentals download ------------------------------------

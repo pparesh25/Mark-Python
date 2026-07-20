@@ -189,35 +189,52 @@ def _make_adjustment(
     dates: Dates,
     logger: logging.Logger,
 ) -> None:
-    # Adjust normal stock file
-    file = data_dir / f"{symbol.lower()}.csv"
-    if not file.is_file():
-        file = data_dir / f"{symbol.lower()}_sme.csv"
-        if not file.is_file():
-            return
+    # Try normal symbol, then SME symbol
+    for sym_suffix in ("", "_SME"):
+        sym = f"{symbol.upper()}{sym_suffix}"
+        import duckdb
+        conn = duckdb.connect(str(config.DUCKDB_FILE))
+        try:
+            df = conn.execute("SELECT * FROM eod_data WHERE Symbol = ? AND Exchange = 'BSE'", (sym,)).fetchdf()
+        finally:
+            conn.close()
 
-    logger.info(f"BSE Adjusting: {file.name} by factor {adjustmentFactor:.4f}")
-    df = pd.read_csv(file, index_col="Date", parse_dates=["Date"])
+        if df.empty:
+            continue
 
-    # Remove timezone info as DataFrame index is not timezone aware
-    dt = dates.dt.replace(tzinfo=None)
+        logger.info(f"BSE Adjusting in DuckDB: {sym} by factor {adjustmentFactor:.4f}")
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.set_index("Date")
 
-    if dt in df.index:
-        idx = df.index.get_loc(dt)
-        if isinstance(idx, slice):
-            logger.warning(f"Duplicate dates detected on BSE {symbol} making adjustment - {dates.pandasDt}")
-            raise RuntimeError()
-        last = df.iloc[idx:]
-        df = df.iloc[:idx].copy()
-    else:
-        last = df.loc[dt:]
-        df = df.loc[:dt].copy()
+        # Remove timezone info as DataFrame index is not timezone aware
+        dt = dates.dt.replace(tzinfo=None)
 
-    for col in ("Open", "High", "Low", "Close"):
-        df.loc[:, col] = ((df[col] / adjustmentFactor / 0.05).round() * 0.05).round(2)
+        if dt in df.index:
+            idx = df.index.get_loc(dt)
+            if isinstance(idx, slice):
+                logger.warning(f"Duplicate dates detected on BSE {sym} making adjustment - {dates.pandasDt}")
+                raise RuntimeError()
+            last = df.iloc[idx:]
+            df = df.iloc[:idx].copy()
+        else:
+            last = df.loc[dt:]
+            df = df.loc[:dt].copy()
 
-    df = pd.concat([df, last])
-    df.to_csv(file)
+        for col in ("Open", "High", "Low", "Close"):
+            df.loc[:, col] = ((df[col] / adjustmentFactor / 0.05).round() * 0.05).round(2)
+
+        df = pd.concat([df, last])
+
+        # Write back to DuckDB
+        conn = duckdb.connect(str(config.DUCKDB_FILE))
+        try:
+            conn.execute("DELETE FROM eod_data WHERE Symbol = ? AND Exchange = 'BSE'", (sym,))
+            df_insert = df.reset_index()
+            df_insert['Date'] = pd.to_datetime(df_insert['Date']).dt.date
+            conn.execute("INSERT INTO eod_data SELECT * FROM df_insert")
+        finally:
+            conn.close()
+        break
 
 
 def _adjust_bse_stocks(actions_df: pd.DataFrame, data_dir: Path, dates: Dates, logger: logging.Logger):

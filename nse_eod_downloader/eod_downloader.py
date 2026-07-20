@@ -128,19 +128,25 @@ def _make_adjustment(
     dates: Dates,
     logger: logging.Logger,
     prev_commit: Optional[Dict[str, Any]] = None,
-) -> Optional[Tuple[pd.DataFrame, Path]]:
-    daily_folder = data_dir
+) -> Optional[Tuple[pd.DataFrame, Any]]:
     if prev_commit:
-        file: Path = prev_commit["file"]
-        df: pd.DataFrame = prev_commit["df"]
+        file = prev_commit["file"]
+        df = prev_commit["df"]
     else:
-        file = daily_folder / f"{symbol.lower()}.csv"
+        file = symbol
+        import duckdb
+        conn = duckdb.connect(str(config.DUCKDB_FILE))
+        try:
+            df = conn.execute("SELECT * FROM eod_data WHERE Symbol = ? AND Exchange = 'NSE'", (symbol,)).fetchdf()
+        finally:
+            conn.close()
 
-        if not file.is_file():
-            logger.warning(f"{symbol}: File not found for adjustment - {dates.pandasDt}")
+        if df.empty:
+            logger.warning(f"{symbol}: Data not found in DuckDB for adjustment - {dates.pandasDt}")
             return None
 
-        df = pd.read_csv(file, index_col="Date", parse_dates=["Date"])
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.set_index("Date")
 
     # Remove timezone info as DataFrame index is not timezone aware
     dt = dates.dt.replace(tzinfo=None)
@@ -265,8 +271,8 @@ def _adjust_nse_stocks(meta: dict, data_dir: Path, dates: Dates, logger: logging
 
         # commit changes
         for sym, commit in df_commits.items():
-            file: Path = commit["file"]
-            df: pd.DataFrame = commit["df"]
+            sym_name = commit["file"]
+            df = commit["df"]
 
             dt = dates.dt.replace(tzinfo=None)
 
@@ -287,7 +293,15 @@ def _adjust_nse_stocks(meta: dict, data_dir: Path, dates: Dates, logger: logging
                     f"Unable to verify adjustment on {sym} - Please confirm manually. - {dates.pandasDt}"
                 )
 
-            df.to_csv(file)
+            import duckdb
+            conn = duckdb.connect(str(config.DUCKDB_FILE))
+            try:
+                conn.execute("DELETE FROM eod_data WHERE Symbol = ? AND Exchange = 'NSE'", (sym,))
+                df_insert = df.reset_index()
+                df_insert['Date'] = pd.to_datetime(df_insert['Date']).dt.date
+                conn.execute("INSERT INTO eod_data SELECT * FROM df_insert")
+            finally:
+                conn.close()
 
         df_commits.clear()
         post_commits.clear()

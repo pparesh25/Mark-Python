@@ -19,11 +19,23 @@ def plot_save_chart(args):
         stock = row["symbol"]
         idx_val = str(row["Index"]) if "Index" in row else "0"
         mark_date = row[date_col]
-        stock_file = Path(data_dir) / f"{stock.lower()}.csv"
-        if not stock_file.exists():
+        exchange = row.get("Exchange", "NSE")
+        import duckdb
+        conn = duckdb.connect(str(config.DUCKDB_FILE), read_only=True)
+        try:
+            stock_data = conn.execute("""
+                SELECT Date, Open, High, Low, Close, Volume, Series, Total_Trades as TOTAL_TRADES, Qty_Per_Trade as QTY_PER_TRADE, Dlv_Qty as DLV_QTY
+                FROM eod_data 
+                WHERE Symbol = ? AND Exchange = ?
+                ORDER BY Date ASC
+            """, (stock, exchange)).fetchdf()
+        finally:
+            conn.close()
+
+        if stock_data.empty:
             return
 
-        stock_data = pd.read_csv(stock_file).tail(500)
+        stock_data = stock_data.tail(500)
         stock_data["Date"] = pd.to_datetime(stock_data["Date"])
         stock_data.set_index("Date", inplace=True)
         stock_data["EMA_50"] = ta.EMA(stock_data["Close"], timeperiod=50)

@@ -32,6 +32,8 @@ else:
 BASE_DIR = Path(__file__).resolve().parent                    # live git repo (dynamic)
 DATA_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'NSE_EOD'
 BSE_DATA_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'BSE_EOD'
+DUCKDB_FILE = Path.home() / 'Mark EMA and HTF' / 'Database' / 'NSE_BSE_EOD.duckdb'
+BSE_ONLY_STOCKS = True
 
 # Fundamentals (all-company.csv) are downloaded fresh into the project's own
 # fundamental_files/ folder, timestamped per run.
