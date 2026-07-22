@@ -14,23 +14,32 @@ import config
 
 
 def plot_save_chart(args):
-    row, target_dir, date_col, data_dir = args
+    if len(args) == 5:
+        row, target_dir, date_col, data_dir, eod_df = args
+    else:
+        row, target_dir, date_col, data_dir = args
+        eod_df = None
+        
     try:
         stock = row["symbol"]
         idx_val = str(row["Index"]) if "Index" in row else "0"
         mark_date = row[date_col]
         exchange = row.get("Exchange", row.get("exchange", "NSE"))
-        import duckdb
-        conn = duckdb.connect(str(config.DUCKDB_FILE), read_only=True)
-        try:
-            stock_data = conn.execute("""
-                SELECT Date, Open, High, Low, Close, Volume, Series, Total_Trades as TOTAL_TRADES, Qty_Per_Trade as QTY_PER_TRADE, Dlv_Qty as DLV_QTY
-                FROM eod_data 
-                WHERE Symbol = ? AND Exchange = ?
-                ORDER BY Date ASC
-            """, (stock, exchange)).fetchdf()
-        finally:
-            conn.close()
+        
+        if eod_df is None or eod_df.empty:
+            import duckdb
+            conn = duckdb.connect(str(config.DUCKDB_FILE), read_only=True)
+            try:
+                stock_data = conn.execute("""
+                    SELECT Date, Open, High, Low, Close, Volume, Series, Total_Trades as TOTAL_TRADES, Qty_Per_Trade as QTY_PER_TRADE, Dlv_Qty as DLV_QTY
+                    FROM eod_data 
+                    WHERE Symbol = ? AND Exchange = ?
+                    ORDER BY Date ASC
+                """, (stock, exchange)).fetchdf()
+            finally:
+                conn.close()
+        else:
+            stock_data = eod_df.copy()
 
         if stock_data.empty:
             return
@@ -96,10 +105,47 @@ def plot_save_chart(args):
         ax_volume.yaxis.set_label_position("right")
         ax_price.grid(True, linestyle=":", linewidth=0.3, color="gray", alpha=0.5)
         ax_volume.grid(True, linestyle=":", linewidth=0.3, color="gray", alpha=0.5)
-        try:
-            ax_price.axvline(x=stock_data.index.get_loc(mark_date), color="blue", linestyle=":", linewidth=0.8, alpha=0.7)
-        except (KeyError, ValueError):
-            pass
+        # Draw vertical lines for patterns
+        if date_col in ("flag_date", "tight_flag_date"):
+            start_date = row.get("flag_start_date" if date_col == "flag_date" else "tight_start_date")
+            peak_date = row.get("flag_peak_date" if date_col == "flag_date" else "tight_peak_date")
+            breakout_date = row.get("breakout_date") if date_col == "tight_flag_date" else None
+            
+            # Start of 90% runup (Flag Pole start) - Green
+            if pd.notna(start_date):
+                try:
+                    ax_price.axvline(x=stock_data.index.get_loc(pd.to_datetime(start_date)), 
+                                     color="green", linestyle="--", linewidth=1.2, alpha=0.8, 
+                                     label="Flag Pole Start")
+                except (KeyError, ValueError):
+                    pass
+            
+            # End of 90% runup (Flag Pole peak) - Red
+            if pd.notna(peak_date):
+                try:
+                    ax_price.axvline(x=stock_data.index.get_loc(pd.to_datetime(peak_date)), 
+                                     color="red", linestyle="--", linewidth=1.2, alpha=0.8, 
+                                     label="Flag Pole Peak")
+                except (KeyError, ValueError):
+                    pass
+                    
+            # Breakout point (Tight Flag breakout) - Blue
+            if pd.notna(breakout_date):
+                try:
+                    ax_price.axvline(x=stock_data.index.get_loc(pd.to_datetime(breakout_date)), 
+                                     color="blue", linestyle="-.", linewidth=1.5, alpha=0.9, 
+                                     label="Breakout")
+                except (KeyError, ValueError):
+                    pass
+            
+            # Add legend to ax_price so the user knows what colors mean
+            ax_price.legend(loc="upper left", fontsize=8)
+        else:
+            # Default single line for Mark screener
+            try:
+                ax_price.axvline(x=stock_data.index.get_loc(mark_date), color="blue", linestyle=":", linewidth=0.8, alpha=0.7)
+            except (KeyError, ValueError):
+                pass
         plt.setp(ax_volume.xaxis.get_majorticklabels(), rotation=0, ha="center")
         plt.savefig(target_dir / f"{idx_val}_{stock}.png", bbox_inches="tight", pad_inches=0.1, dpi=150)
         plt.close()

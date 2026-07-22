@@ -226,6 +226,7 @@ def main():
     logger.info(color("▶ Step 1/4: EOD Data Update (eod2)", 'BOLD'))
     logger.info(color("  Starting NSE EOD download and adjustment in Python...", 'CYAN'))
     t0 = time.time()
+    t_nse_start = time.time()
     try:
         from nse_eod_downloader import eod_downloader
         success_nse = eod_downloader.sync_database(
@@ -238,12 +239,14 @@ def main():
         logger.error(color(f"  ✗ Failed to execute NSE EOD update in Python: {e}", 'RED'))
         sys.exit(1)
         
+    elapsed_nse = time.time() - t_nse_start
     if not success_nse:
-        logger.error(color(f"  ✗ NSE EOD update FAILED after {time.time() - t0:.1f}s", 'RED'))
+        logger.error(color(f"  ✗ NSE EOD update FAILED after {elapsed_nse:.1f}s", 'RED'))
         sys.exit(1)
+    logger.info(color(f"  ✓ NSE EOD update completed in {elapsed_nse:.1f}s", 'GREEN'))
         
     logger.info(color("  Starting BSE EOD download and adjustment in Python...", 'CYAN'))
-    t0_bse = time.time()
+    t_bse_start = time.time()
     try:
         from bse_eod_downloader import eod_downloader as bse_eod_downloader
         success_bse = bse_eod_downloader.sync_database(
@@ -256,12 +259,14 @@ def main():
         logger.error(color(f"  ✗ Failed to execute BSE EOD update in Python: {e}", 'RED'))
         sys.exit(1)
         
+    elapsed_bse = time.time() - t_bse_start
     if not success_bse:
-        logger.error(color(f"  ✗ BSE EOD update FAILED after {time.time() - t0_bse:.1f}s", 'RED'))
+        logger.error(color(f"  ✗ BSE EOD update FAILED after {elapsed_bse:.1f}s", 'RED'))
         sys.exit(1)
+    logger.info(color(f"  ✓ BSE EOD update completed in {elapsed_bse:.1f}s", 'GREEN'))
         
     elapsed = time.time() - t0
-    logger.info(color(f"  ✓ EOD update completed in {elapsed:.1f}s", 'GREEN'))
+    logger.info(color(f"  ✓ Total EOD update completed in {elapsed:.1f}s", 'GREEN'))
 
     # --- Step 2: fundamentals download ------------------------------------
     logger.info(color("▶ Step 2/4: Fundamental Data Download (screener.in)", 'BOLD'))
