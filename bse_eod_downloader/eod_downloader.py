@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 import tzlocal
+import config
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options

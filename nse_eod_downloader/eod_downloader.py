@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 import tzlocal
+import config
 
 from .corporate_actions import parse_bonus_factor, parse_split_factor
 from .delivery import update_pending_delivery_data
