@@ -1,4 +1,5 @@
 mod chart;
+mod screener;
 
 use std::fs;
 use std::path::Path;
@@ -119,8 +120,13 @@ fn clean_opt_date(opt: &Option<String>) -> Option<&str> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && args[1] == "screen" {
+        return screener::run_screener_cmd(&args[2..]);
+    }
+
     if args.len() < 4 {
         eprintln!("Usage: {} <tasks_csv> <duckdb_file> <output_dir>", args[0]);
+        eprintln!("   OR: {} screen <duckdb_file> <fundamental_csv> <exchange> <out_dir>", args[0]);
         std::process::exit(1);
     }
 

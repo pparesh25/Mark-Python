@@ -35,8 +35,13 @@ BSE_DATA_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'BSE_EOD'
 DUCKDB_FILE = Path.home() / 'Mark EMA and HTF' / 'Database' / 'NSE_BSE_EOD.duckdb'
 BSE_ONLY_STOCKS = True
 
-# Use Rust for high-speed charting. If set to True, the screener will use
-# the Rust binary. If the binary is not found or fails, it falls back to Python (matplotlib).
+# Pipeline Mode Flags:
+# USE_RUST_CALCULATION: If True, screening calculation is performed by the Rust engine.
+# USE_RUST_CHARTS: If True, chart image export is performed by the Rust engine.
+# Mode 1 (Full Rust): USE_RUST_CALCULATION = True, USE_RUST_CHARTS = True
+# Mode 2 (Hybrid R&D): USE_RUST_CALCULATION = False, USE_RUST_CHARTS = True
+# Mode 3 (Pure Python): USE_RUST_CALCULATION = False, USE_RUST_CHARTS = False
+USE_RUST_CALCULATION = True
 USE_RUST_CHARTS = True
 
 # Fundamentals (all-company.csv) are downloaded fresh into the project's own
@@ -45,7 +50,12 @@ USE_RUST_CHARTS = True
 # whatever name the server returns), then the orchestrator renames it to
 # all-company_{timestamp}.csv.
 FUNDAMENTAL_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'fundamental_files'
-FUNDAMENTAL_FILE = FUNDAMENTAL_DIR / f"all-company_{CURRENT_DATE}.csv"
+_today_fund_file = FUNDAMENTAL_DIR / f"all-company_{CURRENT_DATE}.csv"
+if _today_fund_file.exists():
+    FUNDAMENTAL_FILE = _today_fund_file
+else:
+    _existing_funds = sorted(list(FUNDAMENTAL_DIR.glob("all-company_*.csv")))
+    FUNDAMENTAL_FILE = _existing_funds[-1] if _existing_funds else _today_fund_file
 
 # ---------------------------------------------------------------------------
 # Outputs (relative to USER HOME / Mark EMA and HTF)

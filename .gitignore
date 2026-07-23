@@ -49,5 +49,8 @@ Thumbs.db
 /metadata/
 /Daily Bhavcopy NSE/
 
-# Rust compiled binary
+# Rust compiled binary & build artifacts
 stock_analysis/stock_analysis
+stock_analysis/target/
+stock_analysis/src/bin/
+scratch/

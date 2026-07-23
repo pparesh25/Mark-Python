@@ -24,8 +24,10 @@ start_time = time.time()
 # Parse arguments
 parser = argparse.ArgumentParser()
 parser.add_argument('--exchange', type=str, default='NSE', choices=['NSE', 'BSE'])
+parser.add_argument('--max-date', type=str, default=None)
 args = parser.parse_args()
 exchange = args.exchange.upper()
+max_date = args.max_date
 
 dirs = config.get_output_dirs(exchange)
 MARK_OUT_DIR = dirs['mark_out']
@@ -116,6 +118,35 @@ def main():
     logging.basicConfig(level=logging.INFO, format=log_format, datefmt='%H:%M:%S')
     logging.info(f"Starting Mark Screener for {exchange} using DuckDB...")
     
+    # Mode 1: Full Rust Engine (Calculation + RAM Charts)
+    if getattr(config, "USE_RUST_CALCULATION", False):
+        import subprocess
+        rust_bin = config.BASE_DIR / 'stock_analysis' / 'stock_analysis'
+        if rust_bin.exists():
+            logging.info(f"▶ Mode 1: Executing Single-Pass Rust Engine (Calculation + Charts) for {exchange}...")
+            t0_rust = time.time()
+            chart_base_dir = config.CHART_DIR if getattr(config, "USE_RUST_CHARTS", False) else ""
+            out_temp = config.OUT_DIR / exchange
+            out_temp.mkdir(parents=True, exist_ok=True)
+            
+            cmd = [
+                str(rust_bin),
+                "screen",
+                str(config.DUCKDB_FILE),
+                str(config.FUNDAMENTAL_FILE),
+                exchange,
+                str(out_temp),
+                max_date or "",
+                str(chart_base_dir) if chart_base_dir else ""
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode == 0:
+                logging.info(f"✓ Completed Single-Pass Rust Pipeline for {exchange} in {time.time() - t0_rust:.2f}s")
+                return
+            else:
+                logging.error(f"Rust pipeline error: {res.stderr}\nFalling back to Python mode...")
+
+    # Mode 2 & Mode 3: Python Calculation Mode
     # 1. Load fundamental list to screen only listed equity symbols
     try:
         query_df = pd.read_csv(FUNDAMENTAL_FILE)
@@ -207,6 +238,9 @@ def main():
         logging.info("No EOD data found in database.")
         return
         
+    if max_date:
+        df_all = df_all[df_all['Date'].astype(str).str.split('T').str[0] <= max_date].copy()
+
     # Group by Symbol
     grouped = df_all.groupby('Symbol')
     tasks = [(symbol, group) for symbol, group in grouped]
