@@ -118,14 +118,14 @@ def main():
     logging.basicConfig(level=logging.INFO, format=log_format, datefmt='%H:%M:%S')
     logging.info(f"Starting Mark Screener for {exchange} using DuckDB...")
     
-    # Mode 1: Full Rust Engine (Calculation + RAM Charts)
+    # Mode 1: High-Speed Rust Screening + Fundamental Merge & Charting
     if getattr(config, "USE_RUST_CALCULATION", False):
         import subprocess
+        import json
         rust_bin = config.BASE_DIR / 'stock_analysis' / 'stock_analysis'
         if rust_bin.exists():
-            logging.info(f"▶ Mode 1: Executing Single-Pass Rust Engine (Calculation + Charts) for {exchange}...")
+            logging.info(f"▶ Mode 1: Executing High-Speed Rust Screener for {exchange}...")
             t0_rust = time.time()
-            chart_base_dir = config.CHART_DIR if getattr(config, "USE_RUST_CHARTS", False) else ""
             out_temp = config.OUT_DIR / exchange
             out_temp.mkdir(parents=True, exist_ok=True)
             
@@ -135,13 +135,35 @@ def main():
                 str(config.DUCKDB_FILE),
                 str(config.FUNDAMENTAL_FILE),
                 exchange,
-                str(out_temp),
-                max_date or "",
-                str(chart_base_dir) if chart_base_dir else ""
+                str(out_temp)
             ]
+            if max_date:
+                cmd.append(max_date)
+
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode == 0:
-                logging.info(f"✓ Completed Single-Pass Rust Pipeline for {exchange} in {time.time() - t0_rust:.2f}s")
+                logging.info(f"✓ Rust screening completed in {time.time() - t0_rust:.2f}s. Processing fundamental merge and charts...")
+                json_path = out_temp / f"{exchange}_rust_screened.json"
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    rust_dataset = json.load(f)
+
+                fundamental_df = pd.read_csv(FUNDAMENTAL_FILE)
+                dirs = config.get_output_dirs(exchange)
+
+                # Process Stage 1 Mark Results
+                df_mark = pd.DataFrame(rust_dataset['mark_qualified'])
+                if not df_mark.empty:
+                    df_mark['Exchange'] = exchange
+                    df_mark = df_mark.rename(columns={'ema_50': 'EMA_50', 'ema_150': 'EMA_150', 'ema_200': 'EMA_200', 'high_52w': '52 week high', 'low_52w': '52 week low', 'mark_date': 'Mark_Date', 'down_52w_high': 'Down from 52w high'})
+                    process_results(df_mark, fundamental_df, f"{exchange.lower()}_mark", dirs['mark_out'], dirs['mark_chart'], 'Mark_Date', config.DATA_DIR if exchange == 'NSE' else config.BSE_DATA_DIR, plot_days=500)
+
+                # Process Stage 2 Mark Tight Results
+                df_mark_tight = pd.DataFrame(rust_dataset['mark_tight_qualified'])
+                if not df_mark_tight.empty:
+                    df_mark_tight['Exchange'] = exchange
+                    df_mark_tight = df_mark_tight.rename(columns={'ema_50': 'EMA_50', 'ema_150': 'EMA_150', 'ema_200': 'EMA_200', 'high_52w': '52 week high', 'low_52w': '52 week low', 'mark_date': 'Mark_Date', 'mark_tight_date': 'Mark_Tight_Date', 'down_52w_high': 'Down from 52w high'})
+                    process_results(df_mark_tight, fundamental_df, f"{exchange.lower()}_mark_tight", dirs['mark_tight_out'], dirs['mark_tight_chart'], 'Mark_Date', config.DATA_DIR if exchange == 'NSE' else config.BSE_DATA_DIR, plot_days=500)
+
                 return
             else:
                 logging.error(f"Rust pipeline error: {res.stderr}\nFalling back to Python mode...")

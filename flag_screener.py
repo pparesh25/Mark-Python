@@ -144,40 +144,56 @@ def main():
     logging.basicConfig(level=logging.INFO, format=log_format)
     logging.info(f"Starting Flag Screener for {exchange} using DuckDB...")
     
-    # Mode 1: Full Rust Engine (Calculation + RAM Charts)
+    # Mode 1: High-Speed Rust Screening + Fundamental Merge & Charting
     if getattr(config, "USE_RUST_CALCULATION", False):
         import subprocess
+        import json
         rust_bin = config.BASE_DIR / 'stock_analysis' / 'stock_analysis'
         out_temp = config.OUT_DIR / exchange
         out_temp.mkdir(parents=True, exist_ok=True)
         json_path = out_temp / f"{exchange}_rust_screened.json"
-        
-        # Check if single-pass Rust engine already executed for this exchange during Step 3
-        if json_path.exists() and (time.time() - json_path.stat().st_mtime) < 120:
-            logging.info(f"✓ Mode 1: Single-Pass Rust Engine already completed Mark & Flag screeners + charts for {exchange} in Step 3.")
-            return
 
-        if rust_bin.exists():
-            logging.info(f"▶ Mode 1: Executing Single-Pass Rust Engine (Calculation + Charts) for {exchange}...")
-            t0_rust = time.time()
-            chart_base_dir = config.CHART_DIR if getattr(config, "USE_RUST_CHARTS", False) else ""
-            
-            cmd = [
-                str(rust_bin),
-                "screen",
-                str(config.DUCKDB_FILE),
-                str(config.FUNDAMENTAL_FILE),
-                exchange,
-                str(out_temp),
-                max_date or "",
-                str(chart_base_dir) if chart_base_dir else ""
-            ]
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode == 0:
-                logging.info(f"✓ Completed Single-Pass Rust Pipeline for {exchange} in {time.time() - t0_rust:.2f}s")
-                return
-            else:
-                logging.error(f"Rust pipeline error: {res.stderr}\nFalling back to Python mode...")
+        # Check if single-pass Rust engine already executed for this exchange during Step 3
+        if not json_path.exists():
+            if rust_bin.exists():
+                logging.info(f"▶ Mode 1: Executing High-Speed Rust Screener for {exchange}...")
+                t0_rust = time.time()
+                cmd = [
+                    str(rust_bin),
+                    "screen",
+                    str(config.DUCKDB_FILE),
+                    str(config.FUNDAMENTAL_FILE),
+                    exchange,
+                    str(out_temp)
+                ]
+                if max_date:
+                    cmd.append(max_date)
+
+                res = subprocess.run(cmd, capture_output=True, text=True)
+                if res.returncode != 0:
+                    logging.error(f"Rust pipeline error: {res.stderr}\nFalling back to Python mode...")
+
+        if json_path.exists():
+            logging.info(f"✓ Processing Rust Flag screening results for {exchange}...")
+            with open(json_path, 'r', encoding='utf-8') as f:
+                rust_dataset = json.load(f)
+
+            fundamental_df = pd.read_csv(FUNDAMENTAL_FILE)
+            dirs = config.get_output_dirs(exchange)
+
+            # Process Stage 1 Flag Results
+            df_flag = pd.DataFrame(rust_dataset['flag_qualified'])
+            if not df_flag.empty:
+                df_flag['Exchange'] = exchange
+                process_results(df_flag, fundamental_df, f"{exchange.lower()}_flag", dirs['flag_out'], dirs['flag_chart'], 'flag_date', config.DATA_DIR if exchange == 'NSE' else config.BSE_DATA_DIR, plot_days=200)
+
+            # Process Stage 2 Tight Flag Results
+            df_tight_flag = pd.DataFrame(rust_dataset['tight_flag_qualified'])
+            if not df_tight_flag.empty:
+                df_tight_flag['Exchange'] = exchange
+                process_results(df_tight_flag, fundamental_df, f"{exchange.lower()}_tight_flag", dirs['tight_flag_out'], dirs['tight_flag_chart'], 'tight_flag_date', config.DATA_DIR if exchange == 'NSE' else config.BSE_DATA_DIR, plot_days=200)
+
+            return
 
     # Mode 2 & Mode 3: Python Calculation Mode
     # 1. Load fundamental list to screen only listed equity symbols

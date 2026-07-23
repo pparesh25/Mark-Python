@@ -31,7 +31,10 @@ def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date
     df_sorted["Plot Start"] = pd.to_datetime(df_sorted[date_col]) - pd.to_timedelta(plot_days, unit="D")
     df_sorted["Plot End"] = pd.to_datetime(date.today())
     df_sorted["Days_In_Trend"] = (pd.to_datetime(df_sorted["date"]) - pd.to_datetime(df_sorted[date_col])).dt.days
-    df_sorted["Trend_Strength"] = ((df_sorted["EMA_50"] - df_sorted["EMA_200"]) / df_sorted["EMA_200"] * 100).round(2)
+    if "EMA_50" in df_sorted.columns and "EMA_200" in df_sorted.columns:
+        df_sorted["Trend_Strength"] = ((df_sorted["EMA_50"] - df_sorted["EMA_200"]) / df_sorted["EMA_200"] * 100).round(2)
+    else:
+        df_sorted["Trend_Strength"] = 0.0
     df_sorted = df_sorted.reset_index(drop=True)
     df_sorted["Index"] = df_sorted.index
  
