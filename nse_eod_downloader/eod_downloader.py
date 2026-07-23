@@ -152,26 +152,10 @@ def _make_adjustment(
     # Remove timezone info as DataFrame index is not timezone aware
     dt = dates.dt.replace(tzinfo=None)
 
-    if dt in df.index:
-        idx = df.index.get_loc(dt)
-        if isinstance(idx, slice):
-            logger.warning(
-                f"Duplicate dates detected on {symbol} making adjustment - {dates.pandasDt}"
-            )
-            raise RuntimeError()
-        last = df.iloc[idx:]
-        df = df.iloc[:idx].copy()
-    else:
-        last = df.loc[dt:]
-        df = df.loc[:dt].copy()
-        if not df.empty:
-            idx = df.index.get_loc(df.index[-1])
-
+    # Use boolean masking to adjust prices before Ex Date in-place
+    mask_before = df.index < dt
     for col in ("Open", "High", "Low", "Close"):
-        # nearest 0.05 = round(nu / 0.05) * 0.05
-        df.loc[:, col] = ((df[col] / adjustmentFactor / 0.05).round() * 0.05).round(2)
-
-    df = pd.concat([df, last])
+        df.loc[mask_before, col] = ((df.loc[mask_before, col] / adjustmentFactor / 0.05).round() * 0.05).round(2)
 
     return (df, file)
 

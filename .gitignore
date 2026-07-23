@@ -48,3 +48,6 @@ Thumbs.db
 /BennyThadikaran_eod2_data.txt
 /metadata/
 /Daily Bhavcopy NSE/
+
+# Rust compiled binary
+stock_analysis/stock_analysis

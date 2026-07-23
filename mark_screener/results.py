@@ -61,7 +61,47 @@ def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date
     
     import time
     t0_charts = time.time()
-    
+
+    # Try Rust charting if enabled
+    if getattr(config, "USE_RUST_CHARTS", False):
+        import subprocess
+        rust_bin = config.BASE_DIR / 'stock_analysis' / 'stock_analysis'
+        if rust_bin.exists():
+            temp_csv = config.BASE_DIR / f'temp_chart_tasks_{suffix}.csv'
+            try:
+                logging.info(f"Using RUST charting engine for {suffix}...")
+                df_sorted.to_csv(temp_csv, index=False)
+                
+                # Command arguments: tasks_csv duckdb_file output_dir
+                result = subprocess.run([
+                    str(rust_bin),
+                    str(temp_csv),
+                    str(config.DUCKDB_FILE),
+                    str(chart_dir)
+                ], capture_output=True, text=True)
+                
+                if result.stderr:
+                    logging.warning(f"Rust charting stderr:\n{result.stderr}")
+                
+                if temp_csv.exists():
+                    temp_csv.unlink()
+                    
+                if result.returncode == 0:
+                    elapsed_charts = time.time() - t0_charts
+                    logging.info(f"✓ Generated {len(df_sorted)} charts using RUST for {suffix} in {elapsed_charts:.2f}s")
+                    return df_sorted
+                else:
+                    logging.error(f"Rust charting failed with exit code {result.returncode}: {result.stderr}")
+                    logging.warning("Falling back to Python charting...")
+            except Exception as e:
+                logging.error(f"Error during Rust charting execution: {e}")
+                if temp_csv.exists():
+                    temp_csv.unlink()
+                logging.warning("Falling back to Python charting...")
+        else:
+            logging.warning(f"Rust binary not found at {rust_bin}. Falling back to Python charting...")
+
+    # Fallback / Default Python Charting
     # Prepare task arguments, passing the pre-loaded EOD DataFrame if available
     tasks = []
     for _, row in df_sorted.iterrows():

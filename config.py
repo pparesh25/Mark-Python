@@ -35,6 +35,10 @@ BSE_DATA_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'BSE_EOD'
 DUCKDB_FILE = Path.home() / 'Mark EMA and HTF' / 'Database' / 'NSE_BSE_EOD.duckdb'
 BSE_ONLY_STOCKS = True
 
+# Use Rust for high-speed charting. If set to True, the screener will use
+# the Rust binary. If the binary is not found or fails, it falls back to Python (matplotlib).
+USE_RUST_CHARTS = True
+
 # Fundamentals (all-company.csv) are downloaded fresh into the project's own
 # fundamental_files/ folder, timestamped per run.
 # The downloader first writes a fixed-name all-company.csv there (Chrome saves
@@ -60,7 +64,7 @@ DAILY_BHAVCOPY_DIR = Path.home() / 'Mark EMA and HTF' / 'Daily Bhavcopy NSE'
 BSE_DAILY_BHAVCOPY_DIR = Path.home() / 'Mark EMA and HTF' / 'Daily Bhavcopy BSE'
 
 # EOD downloader metadata (meta.json and isin.csv) goes here.
-EOD_METADATA_DIR = BASE_DIR / 'metadata'
+EOD_METADATA_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'metadata'
 
 
 def get_output_dirs(exchange: str):

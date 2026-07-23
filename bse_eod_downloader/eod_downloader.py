@@ -19,14 +19,6 @@ import requests
 import tzlocal
 import config
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
-
 from .corporate_actions import parse_bonus_factor, parse_split_factor
 from .holidays import load_holidays_from_meta, load_special_sessions_from_meta, is_special_session
 from .stock_data import update_bse_eod, update_bse_symbol
@@ -74,97 +66,49 @@ class Dates:
 def _download_corporate_actions(
     start_date: datetime,
     end_date: datetime,
-    download_dir: Path,
     logger: logging.Logger,
 ) -> pd.DataFrame:
-    """Download corporate actions from BSE website using Selenium and load as DataFrame."""
-    logger.info("Downloading BSE Corporate Actions using Selenium...")
-    download_dir.mkdir(parents=True, exist_ok=True)
+    """Download corporate actions from BSE website directly using HTTP API and return as DataFrame."""
+    logger.info("Downloading BSE Corporate Actions directly via API...")
     
-    # Clean up existing Corporate_Actions files in temp dir
-    for f in download_dir.glob("Corporate_Actions*.csv"):
-        try:
-            f.unlink()
-        except OSError:
-            pass
-
-    chrome_options = Options()
-    chrome_options.add_argument('--headless=new')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-    chrome_options.add_experimental_option("prefs", {
-        "download.default_directory": str(download_dir),
-        "download.prompt_for_download": False,
-        "download.directory_upgrade": True,
-        "safebrowsing.enabled": True
-    })
-
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=chrome_options)
+    url = "https://api.bseindia.com/BseIndiaAPI/api/CorpactCSVDownload/w"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": "https://www.bseindia.com/",
+        "Origin": "https://www.bseindia.com"
+    }
     
-    # Enable headless downloads
-    driver.execute_cdp_cmd('Page.setDownloadBehavior', {
-        'behavior': 'allow',
-        'downloadPath': str(download_dir)
-    })
-
-    try:
-        driver.get("https://www.bseindia.com/corporates/corporate_act")
-        time.sleep(5)
+    fdate_str = start_date.strftime("%Y%m%d")
+    tdate_str = end_date.strftime("%Y%m%d")
+    
+    params = {
+        "scripcode": "",
+        "Fdate": fdate_str,
+        "TDate": tdate_str,
+        "Purposecode": "",
+        "strSearch": "S",
+        "ddlindustrys": "",
+        "ddlcategorys": "E",
+        "segment": "0"
+    }
+    
+    logger.info(f"BSE API Call: dates {fdate_str} to {tdate_str}")
+    r = requests.get(url, headers=headers, params=params, timeout=15)
+    
+    if r.status_code != 200 or not r.text.strip():
+        logger.warning("Failed to retrieve corporate actions from API. Sync continuing without adjustments.")
+        return pd.DataFrame()
         
-        datepickers = driver.find_elements(By.NAME, "datepicker")
-        if len(datepickers) < 2:
-            raise RuntimeError("Could not find date picker inputs on page.")
-
-        from_date_input = datepickers[0]
-        to_date_input = datepickers[1]
-
-        from_date_str = start_date.strftime("%d/%m/%Y")
-        to_date_str = end_date.strftime("%d/%m/%Y")
-
-        driver.execute_script("arguments[0].value = arguments[1];", from_date_input, from_date_str)
-        driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", from_date_input)
-        driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", from_date_input)
-
-        driver.execute_script("arguments[0].value = arguments[1];", to_date_input, to_date_str)
-        driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", to_date_input)
-        driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", to_date_input)
-
-        logger.info(f"Setting dates: {from_date_str} to {to_date_str}")
-        time.sleep(1)
-
-        submit_btn = driver.find_element(By.ID, "btnSubmit")
-        driver.execute_script("arguments[0].click();", submit_btn)
-        time.sleep(5)
-
-        download_btn = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "dwld-icon"))
-        )
-        driver.execute_script("arguments[0].click();", download_btn)
-        
-        # Wait for file to download
-        time.sleep(5)
-        
-        downloaded_files = list(download_dir.glob("Corporate_Actions*.csv"))
-        if not downloaded_files:
-            raise FileNotFoundError("Corporate Actions CSV download failed.")
-        
-        csv_file = downloaded_files[0]
-        logger.info(f"Successfully downloaded: {csv_file.name}")
-        df = pd.read_csv(csv_file)
-        
-        # Normalize columns
-        df.columns = [c.strip() for c in df.columns]
-        
-        # Parse Ex Date
-        df["Ex_Date_Parsed"] = pd.to_datetime(df["Ex Date"], format="%d %b %Y", errors="coerce")
-        return df
-
-    finally:
-        driver.quit()
+    df = pd.read_csv(StringIO(r.text))
+    
+    # Normalize columns
+    df.columns = [c.strip() for c in df.columns]
+    
+    # Parse Ex Date
+    df["Ex_Date_Parsed"] = pd.to_datetime(df["Ex Date"], format="%d %b %Y", errors="coerce")
+    return df
 
 
 def _get_split(sym: str, string: str, logger: logging.Logger) -> float | None:
@@ -210,21 +154,10 @@ def _make_adjustment(
         # Remove timezone info as DataFrame index is not timezone aware
         dt = dates.dt.replace(tzinfo=None)
 
-        if dt in df.index:
-            idx = df.index.get_loc(dt)
-            if isinstance(idx, slice):
-                logger.warning(f"Duplicate dates detected on BSE {sym} making adjustment - {dates.pandasDt}")
-                raise RuntimeError()
-            last = df.iloc[idx:]
-            df = df.iloc[:idx].copy()
-        else:
-            last = df.loc[dt:]
-            df = df.loc[:dt].copy()
-
+        # Use boolean masking to adjust prices before Ex Date in-place
+        mask_before = df.index < dt
         for col in ("Open", "High", "Low", "Close"):
-            df.loc[:, col] = ((df[col] / adjustmentFactor / 0.05).round() * 0.05).round(2)
-
-        df = pd.concat([df, last])
+            df.loc[mask_before, col] = ((df.loc[mask_before, col] / adjustmentFactor / 0.05).round() * 0.05).round(2)
 
         # Write back to DuckDB
         conn = duckdb.connect(str(config.DUCKDB_FILE))
@@ -321,13 +254,15 @@ def sync_database(
             actions_df = _download_corporate_actions(
                 start_date=dates.dt,
                 end_date=datetime.now(tz_IN),
-                download_dir=temp_dir,
                 logger=logger
             )
         except Exception as e:
             logger.error(f"Failed to download BSE corporate actions: {e}. Sync continuing without adjustments.")
 
     # Main Day-by-Day Loop
+    session = requests.Session()
+    session.headers.update(headers)
+    
     while dates.nextDate():
         curDt = dates.dt.strftime("%d-%b-%Y")
         is_weekend = dates.dt.weekday() in (5, 6)
@@ -364,7 +299,7 @@ def sync_database(
         deliverables_url = f"https://www.bseindia.com/BSEDATA/gross/{dates.dt.year}/SCBSEALL{delv_date_str}.zip"
 
         logger.info(f"Downloading BSE Bhavcopy for {dates.pandasDt}...")
-        r_bhav = requests.get(bhavcopy_url, headers=headers, timeout=15)
+        r_bhav = session.get(bhavcopy_url, timeout=15)
         if r_bhav.status_code == 404:
             logger.warning(f"BSE Bhavcopy not found for {dates.pandasDt}. Skipping day (likely a market holiday).")
             meta["lastUpdate"] = dates.dt.isoformat()
@@ -376,7 +311,7 @@ def sync_database(
             return False
 
         logger.info(f"Downloading BSE Deliverables for {dates.pandasDt}...")
-        r_delv = requests.get(deliverables_url, headers=headers, timeout=15)
+        r_delv = session.get(deliverables_url, timeout=15)
         if r_delv.status_code == 404:
             logger.warning(f"BSE Deliverables not found for {dates.pandasDt}. Skipping day (likely a market holiday).")
             meta["lastUpdate"] = dates.dt.isoformat()
@@ -386,6 +321,7 @@ def sync_database(
         elif r_delv.status_code != 200:
             logger.error(f"Failed to download BSE Deliverables for {dates.pandasDt} (HTTP {r_delv.status_code})")
             return False
+
 
         # Load both DataFrames
         try:

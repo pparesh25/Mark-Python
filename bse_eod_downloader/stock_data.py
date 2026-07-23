@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 import pandas as pd
 import duckdb
 import config
@@ -26,76 +26,105 @@ def update_bse_eod(
 
     isin_updated = False
 
-    # Sort to keep processing order stable
-    df_merged = df_merged.sort_values(by="TckrSymb")
+    # Convert isin DataFrame to dictionary for O(1) high-speed lookup and modification
+    isin_dict = isin["SYMBOL"].to_dict()
 
-    for _, row in df_merged.iterrows():
-        symbol = str(row.TckrSymb).strip()
-        if not symbol or pd.isna(row.TckrSymb):
-            continue
+    # Parse date exactly once for the entire day's run to avoid slow Pandas parse in the loop
+    date_val = pd.to_datetime(dates.pandasDt).date()
 
-        isin_code = row.ISIN
-        series = str(row.SctySrs).strip()
+    # Open a single DuckDB connection for this day's updates and run in a transaction
+    conn = duckdb.connect(str(config.DUCKDB_FILE))
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        insert_rows = []
+        # Use high-speed itertuples instead of iterrows
+        for row in df_merged.itertuples():
+            symbol = str(row.TckrSymb).strip()
+            if not symbol or pd.isna(row.TckrSymb):
+                continue
 
-        # BSE SME groups are M and MT
-        prefix = "_sme" if series in ("M", "MT") else ""
-        symbol_name = f"{symbol.upper()}{prefix.upper()}"
+            isin_code = row.ISIN
+            series = str(row.SctySrs).strip()
 
-        if pd.isna(isin_code):
-            logger.warning(f"BSE Symbol {symbol} missing ISIN.")
-            continue
+            # BSE SME groups are M and MT
+            prefix = "_sme" if series in ("M", "MT") else ""
+            symbol_name = f"{symbol.upper()}{prefix.upper()}"
 
-        # Check for Symbol Rename using ISIN database
-        if isin_code not in isin.index:
-            isin_updated = True
-            isin.at[isin_code, "SYMBOL"] = symbol
+            if pd.isna(isin_code):
+                logger.warning(f"BSE Symbol {symbol} missing ISIN.")
+                continue
 
-        if symbol != isin.at[isin_code, "SYMBOL"]:
-            isin_updated = True
-            old = isin.at[isin_code, "SYMBOL"].upper()
-            new = symbol.upper()
-            isin.at[isin_code, "SYMBOL"] = symbol
-            
-            # Execute rename query in DuckDB
-            conn = duckdb.connect(str(config.DUCKDB_FILE))
-            try:
+            # Check for Symbol Rename using high-speed dictionary
+            existing_symbol = isin_dict.get(isin_code)
+            if existing_symbol is None:
+                isin_updated = True
+                isin_dict[isin_code] = symbol
+                existing_symbol = symbol
+
+            if symbol != existing_symbol:
+                isin_updated = True
+                old = existing_symbol.upper()
+                new = symbol.upper()
+                isin_dict[isin_code] = symbol
+                
+                # Execute rename query in DuckDB using the shared connection
                 conn.execute(
                     "UPDATE eod_data SET Symbol = ? WHERE ISIN = ? AND Exchange = 'BSE'",
                     (f"{new}{prefix.upper()}", isin_code)
                 )
-            finally:
-                conn.close()
-            logger.warning(f"BSE Name Changed in DuckDB: {old}{prefix.upper()} to {new}{prefix.upper()}")
+                logger.warning(f"BSE Name Changed in DuckDB: {old}{prefix.upper()} to {new}{prefix.upper()}")
 
-        # Prepare parameters to append
-        trades = row.get("TOTAL_TRADES", "")
-        if pd.isna(trades) or trades == "":
-            trades = ""
-        else:
-            trades = int(trades)
+            # Prepare parameters to append
+            def is_nan(val):
+                return val is None or val == "" or (isinstance(val, float) and val != val)
 
-        delivered = row.get("DLV_QTY", "")
-        if pd.isna(delivered) or delivered == "":
-            delivered = ""
-        else:
-            delivered = int(delivered)
+            trades = getattr(row, "TOTAL_TRADES", "")
+            if is_nan(trades):
+                trades = ""
+            else:
+                trades = int(trades)
 
-        update_bse_symbol(
-            symbol_name,
-            isin_code,
-            series,
-            row.OpnPric,
-            row.HghPric,
-            row.LwPric,
-            row.ClsPric,
-            row.TtlTradgVol,
-            trades,
-            delivered,
-            dates,
-        )
+            delivered = getattr(row, "DLV_QTY", "")
+            if is_nan(delivered):
+                delivered = ""
+            else:
+                delivered = int(delivered)
+
+            # Collect parameters for bulk insertion
+            open_p = float(row.OpnPric) if not is_nan(row.OpnPric) else None
+            high_p = float(row.HghPric) if not is_nan(row.HghPric) else None
+            low_p = float(row.LwPric) if not is_nan(row.LwPric) else None
+            close_p = float(row.ClsPric) if not is_nan(row.ClsPric) else None
+            vol = int(row.TtlTradgVol) if not is_nan(row.TtlTradgVol) else 0
+            
+            total_trades = int(trades) if not is_nan(trades) else None
+            qty_per_trade = round(vol / total_trades, 2) if total_trades and total_trades > 0 else None
+            dlv_qty = int(delivered) if not is_nan(delivered) else None
+
+            insert_rows.append((
+                date_val, symbol_name, 'BSE', isin_code, open_p, high_p, low_p, close_p, vol, series, total_trades, qty_per_trade, dlv_qty
+            ))
+
+        if insert_rows:
+            # Create a DataFrame from the collected rows and insert it in a single vectorized SQL query
+            df_insert = pd.DataFrame(insert_rows, columns=[
+                'Date', 'Symbol', 'Exchange', 'ISIN', 'Open', 'High', 'Low', 'Close', 'Volume', 'Series', 'Total_Trades', 'Qty_Per_Trade', 'Dlv_Qty'
+            ])
+            conn.execute("INSERT OR IGNORE INTO eod_data SELECT * FROM df_insert")
+
+        conn.execute("COMMIT")
+    except Exception as e:
+        conn.execute("ROLLBACK")
+        raise e
+    finally:
+        conn.close()
 
     if isin_updated:
-        isin.to_csv(isin_file)
+        # Convert dictionary back to DataFrame and save
+        isin_new = pd.DataFrame.from_dict(isin_dict, orient='index', columns=['SYMBOL'])
+        isin_new.index.name = 'ISIN'
+        isin_new.to_csv(isin_file)
+
     logger.info("BSE EOD sync complete")
 
 
@@ -110,23 +139,28 @@ def update_bse_symbol(
     volume: Any,
     trades: Any,
     delivered: Any,
-    dates: Any,
+    date_val: Any,
+    conn: Optional[duckdb.DuckDBPyConnection] = None,
 ) -> None:
-    """Insert one stock row into DuckDB database, avoiding duplicate dates."""
-    conn = duckdb.connect(str(config.DUCKDB_FILE))
+    """Insert one stock row into DuckDB database, avoiding duplicate dates. (Kept for compatibility)"""
+    should_close = False
+    if conn is None:
+        conn = duckdb.connect(str(config.DUCKDB_FILE))
+        should_close = True
     
     try:
-        date_val = pd.to_datetime(dates.pandasDt).date()
+        def is_nan(val):
+            return val is None or val == "" or (isinstance(val, float) and val != val)
         
-        open_p = float(open_price) if not pd.isna(open_price) and open_price != "" else None
-        high_p = float(high_price) if not pd.isna(high_price) and high_price != "" else None
-        low_p = float(low_price) if not pd.isna(low_price) and low_price != "" else None
-        close_p = float(close_price) if not pd.isna(close_price) and close_price != "" else None
-        vol = int(volume) if not pd.isna(volume) and volume != "" else 0
+        open_p = float(open_price) if not is_nan(open_price) else None
+        high_p = float(high_price) if not is_nan(high_price) else None
+        low_p = float(low_price) if not is_nan(low_price) else None
+        close_p = float(close_price) if not is_nan(close_price) else None
+        vol = int(volume) if not is_nan(volume) else 0
         
-        total_trades = int(trades) if not pd.isna(trades) and trades != "" else None
+        total_trades = int(trades) if not is_nan(trades) else None
         qty_per_trade = round(vol / total_trades, 2) if total_trades and total_trades > 0 else None
-        dlv_qty = int(delivered) if not pd.isna(delivered) and delivered != "" else None
+        dlv_qty = int(delivered) if not is_nan(delivered) else None
         
         conn.execute("""
             INSERT OR IGNORE INTO eod_data 
@@ -136,4 +170,5 @@ def update_bse_symbol(
             date_val, symbol, 'BSE', isin_code, open_p, high_p, low_p, close_p, vol, series, total_trades, qty_per_trade, dlv_qty
         ))
     finally:
-        conn.close()
+        if should_close:
+            conn.close()
