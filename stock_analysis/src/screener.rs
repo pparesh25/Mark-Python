@@ -604,11 +604,15 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
     if let Some(ref base_chart_dir) = chart_out_base {
         let t_render = std::time::Instant::now();
 
-        // Exact Folder Alignment: mark, mark_tight, Flag, Tight Flag
         let mark_chart_dir = base_chart_dir.join(&exchange).join("mark");
         let mark_tight_chart_dir = base_chart_dir.join(&exchange).join("mark_tight");
         let flag_chart_dir = base_chart_dir.join(&exchange).join("Flag");
         let tight_flag_chart_dir = base_chart_dir.join(&exchange).join("Tight Flag");
+
+        if mark_chart_dir.exists() { let _ = std::fs::remove_dir_all(&mark_chart_dir); }
+        if mark_tight_chart_dir.exists() { let _ = std::fs::remove_dir_all(&mark_tight_chart_dir); }
+        if flag_chart_dir.exists() { let _ = std::fs::remove_dir_all(&flag_chart_dir); }
+        if tight_flag_chart_dir.exists() { let _ = std::fs::remove_dir_all(&tight_flag_chart_dir); }
 
         std::fs::create_dir_all(&mark_chart_dir)?;
         std::fs::create_dir_all(&mark_tight_chart_dir)?;
