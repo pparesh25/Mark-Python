@@ -55,34 +55,42 @@ def check_flag_patterns(df):
     tight_peak_date = None
     breakout_date = None
     
-    for j in range(n - 1, -1, -1):
-        start = max(0, j - 45)
-        for i in range(start, j):
-            run_up = (highs[j] - lows[i]) / lows[i]
-            if run_up >= 0.90:
-                if not is_flag:
-                    is_flag = True
-                    flag_date = dates[j]
-                    flag_start_date = dates[i]
-                    flag_peak_date = dates[j]
+    for i in range(n - 1):
+        max_j = min(n - 1, i + 45)
+        if max_j <= i:
+            continue
+            
+        # Find peak high in range [i + 1, max_j]
+        j_peak = i + 1
+        max_h = highs[j_peak]
+        for candidate_j in range(i + 1, max_j + 1):
+            if highs[candidate_j] > max_h:
+                max_h = highs[candidate_j]
+                j_peak = candidate_j
                 
-                if (n - 1 - j <= 15) and (j < n - 1) and (closes[-1] > highs[j]):
-                    if not is_tight_flag:
-                        is_tight_flag = True
-                        tight_flag_date = dates[j]
-                        tight_start_date = dates[i]
-                        tight_peak_date = dates[j]
-                        
-                        # Find the breakout date: the first day after the peak (j) where close > peak_high
-                        for k in range(j + 1, n):
-                            if closes[k] > highs[j]:
-                                breakout_date = dates[k]
-                                break
-                
-                if is_flag and is_tight_flag:
-                    break
-        if is_flag and is_tight_flag:
-            break
+        run_up = (highs[j_peak] - lows[i]) / lows[i]
+        if run_up >= 0.90:
+            if not is_flag:
+                is_flag = True
+                flag_date = dates[j_peak]
+                flag_start_date = dates[i]
+                flag_peak_date = dates[j_peak]
+            
+            if (n - 1 - j_peak <= 15) and (j_peak < n - 1) and (closes[-1] > highs[j_peak]):
+                if not is_tight_flag:
+                    is_tight_flag = True
+                    tight_flag_date = dates[j_peak]
+                    tight_start_date = dates[i]
+                    tight_peak_date = dates[j_peak]
+                    
+                    # Find the breakout date: the first day after peak (j_peak) where close > peak_high
+                    for k in range(j_peak + 1, n):
+                        if closes[k] > highs[j_peak]:
+                            breakout_date = dates[k]
+                            break
+                            
+            if is_flag and is_tight_flag:
+                break
             
     return is_flag, flag_date, flag_start_date, flag_peak_date, is_tight_flag, tight_flag_date, tight_start_date, tight_peak_date, breakout_date
 
