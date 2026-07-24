@@ -225,19 +225,26 @@ fn process_flag_screener(data: &SymbolData) -> Option<FlagResult> {
                 flag_peak_date = Some(dates[j_peak].clone());
             }
 
-            // --- STAGE 2: Tight Flag Breakout Check (Only evaluated when Flag pattern exists) ---
-            if (n - 1 - j_peak <= 15) && (j_peak < n - 1) && (closes[n - 1] > highs[j_peak]) {
-                if !is_tight_flag {
-                    is_tight_flag = true;
-                    tight_flag_date = Some(dates[j_peak].clone());
-                    tight_start_date = Some(dates[i].clone());
-                    tight_peak_date = Some(dates[j_peak].clone());
+            // --- STAGE 2: Tight Flag Breakout Check ---
+            // 1. Breakout within 15 days of peak (k - j_peak <= 15)
+            // 2. Current close (closes[n - 1]) remains > highs[j_peak]
+            let mut breakout_k: Option<usize> = None;
+            let max_breakout_k = std::cmp::min(n, j_peak + 16);
+            for k in (j_peak + 1)..max_breakout_k {
+                if closes[k] > highs[j_peak] {
+                    breakout_k = Some(k);
+                    break;
+                }
+            }
 
-                    for k in (j_peak + 1)..n {
-                        if closes[k] > highs[j_peak] {
-                            breakout_date = Some(dates[k].clone());
-                            break;
-                        }
+            if let Some(k_idx) = breakout_k {
+                if closes[n - 1] > highs[j_peak] {
+                    if !is_tight_flag {
+                        is_tight_flag = true;
+                        tight_flag_date = Some(dates[j_peak].clone());
+                        tight_start_date = Some(dates[i].clone());
+                        tight_peak_date = Some(dates[j_peak].clone());
+                        breakout_date = Some(dates[k_idx].clone());
                     }
                 }
             }
