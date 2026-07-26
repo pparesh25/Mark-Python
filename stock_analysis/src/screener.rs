@@ -80,8 +80,9 @@ fn calculate_ema(closes: &[f64], period: usize) -> Vec<f64> {
     ema
 }
 
-/// Stage 1 ("Mark") -> Stage 2 ("Mark Tight") Hierarchical Screening
-fn process_mark_screener(data: &SymbolData, breakout_window: usize) -> Option<MarkResult> {
+/// Mark is an internal trend setup.  Mark Tight qualifies when the latest close
+/// clears the 60-day Donchian level fixed at the start of that setup.
+fn process_mark_screener(data: &SymbolData) -> Option<MarkResult> {
     let n = data.closes.len();
     if n < 252 {
         return None;
@@ -112,7 +113,7 @@ fn process_mark_screener(data: &SymbolData, breakout_window: usize) -> Option<Ma
     }
 
     // --- STAGE 1: Mark Date Calculation ---
-    let mut first_match_date_mark: Option<String> = None;
+    let mut first_match_index: Option<usize> = None;
     for i in (0..n).rev() {
         if ema_50[i].is_nan()
             || ema_150[i].is_nan()
@@ -128,48 +129,31 @@ fn process_mark_screener(data: &SymbolData, breakout_window: usize) -> Option<Ma
         let low_cond = data.closes[i] >= low_52w[i] * 1.50;
 
         if ema_cond && high_cond && low_cond {
-            first_match_date_mark = Some(data.dates[i].clone());
+            first_match_index = Some(i);
         } else {
             break;
         }
     }
 
-    // EARLY EXIT: If Stage 1 ("Mark") fails, exit immediately without Donchian computation!
-    let mark_date = match first_match_date_mark {
-        Some(d) => d,
+    // The oldest valid day in the current Mark run is the fixed-base date.
+    let mark_index = match first_match_index {
+        Some(index) => index,
         None => return None,
     };
+    let mark_date = data.dates[mark_index].clone();
 
-    // --- STAGE 2: Mark Tight Refinement (Computed ONLY for Stage 1 Candidates) ---
-    let mut base_last = f64::NAN;
-    if n >= 65 {
-        // Requires at least 60 + 5 bars for 60-day shifted Donchian
-        let shift_end = n - 1 - breakout_window;
-        if shift_end >= 59 {
-            let start = shift_end + 1 - 60;
-            base_last = data.highs[start..=shift_end]
-                .iter()
-                .cloned()
-                .fold(f64::NEG_INFINITY, f64::max);
-        }
+    // Freeze the Donchian high from the 60 sessions *before* Mark starts.
+    // Excluding the Mark candle avoids putting that day's high into the level
+    // the close is expected to clear.
+    if mark_index < 60 {
+        return None;
     }
-
-    let mut tight_breakout = false;
-    let mut first_match_date_tight: Option<String> = None;
-
-    if !base_last.is_nan() {
-        let start_w = if n >= breakout_window {
-            n - breakout_window
-        } else {
-            0
-        };
-        for i in start_w..n {
-            if data.closes[i] > base_last {
-                tight_breakout = true;
-                first_match_date_tight = Some(data.dates[i].clone());
-            }
-        }
-    }
+    let base_last = data.highs[mark_index - 60..mark_index]
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let tight_breakout = data.closes[n - 1] > base_last;
+    let first_match_date_tight = tight_breakout.then(|| data.dates[n - 1].clone());
 
     let down_52w_high =
         (((high_52w[n - 1] - data.closes[n - 1]) / high_52w[n - 1]) * 100.0 * 100.0).round()
@@ -385,54 +369,15 @@ fn export_qualified_csvs(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ex = &dataset.exchange;
 
-    let mark_dir = base_out_dir.join(ex).join("mark");
     let mark_tight_dir = base_out_dir.join(ex).join("mark_tight");
     let flag_dir = base_out_dir.join(ex).join("Flag");
     let tight_flag_dir = base_out_dir.join(ex).join("Tight Flag");
 
-    std::fs::create_dir_all(&mark_dir)?;
     std::fs::create_dir_all(&mark_tight_dir)?;
     std::fs::create_dir_all(&flag_dir)?;
     std::fs::create_dir_all(&tight_flag_dir)?;
 
-    // 1. Mark CSV
-    let mark_file = mark_dir.join(format!(
-        "{}_{}_mark_qualified.csv",
-        timestamp,
-        ex.to_lowercase()
-    ));
-    let mut w_mark = csv::Writer::from_path(&mark_file)?;
-    w_mark.write_record(&[
-        "symbol",
-        "isin",
-        "date",
-        "close",
-        "ema_50",
-        "ema_150",
-        "ema_200",
-        "high_52w",
-        "low_52w",
-        "mark_date",
-        "down_52w_high",
-    ])?;
-    for r in &dataset.mark_qualified {
-        w_mark.write_record(&[
-            &r.symbol,
-            &r.isin,
-            &r.date,
-            &r.close.to_string(),
-            &r.ema_50.to_string(),
-            &r.ema_150.to_string(),
-            &r.ema_200.to_string(),
-            &r.high_52w.to_string(),
-            &r.low_52w.to_string(),
-            &r.mark_date,
-            &r.down_52w_high.to_string(),
-        ])?;
-    }
-    w_mark.flush()?;
-
-    // 2. Mark Tight CSV
+    // 1. Mark Tight CSV. Mark remains an internal setup and is not exported.
     let mark_tight_file = mark_tight_dir.join(format!(
         "{}_{}_mark_tight_qualified.csv",
         timestamp,
@@ -471,7 +416,7 @@ fn export_qualified_csvs(
     }
     w_mt.flush()?;
 
-    // 3. Flag CSV
+    // 2. Flag CSV
     let flag_file = flag_dir.join(format!(
         "{}_{}_flag_qualified.csv",
         timestamp,
@@ -787,7 +732,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
 
     let mark_results: Vec<MarkResult> = symbol_datasets
         .par_iter()
-        .filter_map(|d| process_mark_screener(d, 5))
+        .filter_map(process_mark_screener)
         .collect();
 
     let flag_results: Vec<FlagResult> = symbol_datasets
@@ -797,7 +742,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
 
     let mark_tight: Vec<MarkResult> = mark_results
         .iter()
-        .filter(|m| m.tight_breakout && m.close >= m.high_52w * 0.85)
+        .filter(|m| m.tight_breakout)
         .cloned()
         .collect();
 
@@ -855,14 +800,10 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
     if let Some(ref base_chart_dir) = chart_out_base {
         let t_render = std::time::Instant::now();
 
-        let mark_chart_dir = base_chart_dir.join(&exchange).join("mark");
         let mark_tight_chart_dir = base_chart_dir.join(&exchange).join("mark_tight");
         let flag_chart_dir = base_chart_dir.join(&exchange).join("Flag");
         let tight_flag_chart_dir = base_chart_dir.join(&exchange).join("Tight Flag");
 
-        if mark_chart_dir.exists() {
-            let _ = std::fs::remove_dir_all(&mark_chart_dir);
-        }
         if mark_tight_chart_dir.exists() {
             let _ = std::fs::remove_dir_all(&mark_tight_chart_dir);
         }
@@ -873,29 +814,9 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
             let _ = std::fs::remove_dir_all(&tight_flag_chart_dir);
         }
 
-        std::fs::create_dir_all(&mark_chart_dir)?;
         std::fs::create_dir_all(&mark_tight_chart_dir)?;
         std::fs::create_dir_all(&flag_chart_dir)?;
         std::fs::create_dir_all(&tight_flag_chart_dir)?;
-
-        // Render Mark Charts
-        mark_results.par_iter().for_each(|res| {
-            if let Some(&idx) = dataset_map.get(&res.symbol) {
-                let data = &symbol_datasets[idx];
-                let _ = render_symbol_chart(
-                    data,
-                    &mark_chart_dir,
-                    500,
-                    Some(&res.mark_date),
-                    res.mark_tight_date.as_deref(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                );
-            }
-        });
 
         // Render Mark Tight Charts
         mark_tight.par_iter().for_each(|res| {
@@ -954,10 +875,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
             }
         });
 
-        let total_charts = mark_results.len()
-            + mark_tight.len()
-            + flag_qualified.len()
-            + tight_flag_qualified.len();
+        let total_charts = mark_tight.len() + flag_qualified.len() + tight_flag_qualified.len();
         println!(
             "⏱️ [4/4] Parallel RAM Chart Rendering: {:.2}s (Created {} charts)",
             t_render.elapsed().as_secs_f64(),
@@ -973,4 +891,65 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
     println!("----------------------------------------------------------------------");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{process_mark_screener, SymbolData};
+
+    fn symbol_data(closes: Vec<f64>, highs: Vec<f64>) -> SymbolData {
+        let len = closes.len();
+        SymbolData {
+            symbol: "TEST".to_string(),
+            isin: "INE000TEST".to_string(),
+            dates: (0..len).map(|i| format!("2024-{:03}", i)).collect(),
+            opens: closes.clone(),
+            highs,
+            lows: vec![100.0; len],
+            closes,
+            volumes: vec![1_000.0; len],
+        }
+    }
+
+    #[test]
+    fn freezes_the_donchian_level_when_mark_starts() {
+        let mut closes = vec![100.0; 270];
+        let mut highs = vec![100.0; 270];
+        for i in 251..270 {
+            closes[i] = 200.0;
+            highs[i] = 200.0;
+        }
+        highs[252] = 220.0;
+
+        let result = process_mark_screener(&symbol_data(closes, highs)).unwrap();
+
+        assert_eq!(result.mark_date, "2024-251");
+        assert_eq!(result.donchian_60_base, 100.0);
+        assert!(result.tight_breakout);
+        assert_eq!(result.mark_tight_date.as_deref(), Some("2024-269"));
+    }
+
+    #[test]
+    fn requires_the_latest_close_to_clear_the_fixed_donchian_level() {
+        let mut closes = vec![100.0; 270];
+        let mut highs = vec![100.0; 270];
+        for i in 191..251 {
+            highs[i] = 300.0;
+        }
+        closes[251] = 250.0;
+        highs[251] = 250.0;
+        closes[252] = 310.0;
+        highs[252] = 310.0;
+        for i in 253..270 {
+            closes[i] = 250.0;
+            highs[i] = 260.0;
+        }
+
+        let result = process_mark_screener(&symbol_data(closes, highs)).unwrap();
+
+        assert_eq!(result.mark_date, "2024-251");
+        assert_eq!(result.donchian_60_base, 300.0);
+        assert!(!result.tight_breakout);
+        assert_eq!(result.mark_tight_date, None);
+    }
 }

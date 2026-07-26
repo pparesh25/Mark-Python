@@ -1,11 +1,11 @@
 mod chart;
 mod screener;
 
+use chrono::NaiveDate;
+use rayon::prelude::*;
+use serde::Deserialize;
 use std::fs;
 use std::path::Path;
-use serde::Deserialize;
-use rayon::prelude::*;
-use chrono::NaiveDate;
 
 #[derive(Debug, Deserialize)]
 struct ChartTask {
@@ -17,7 +17,7 @@ struct ChartTask {
     plot_start: String,
     #[serde(rename = "Plot End")]
     plot_end: String,
-    
+
     // Pattern dates (optional)
     #[serde(rename = "flag_start_date")]
     flag_start_date: Option<String>,
@@ -29,13 +29,13 @@ struct ChartTask {
     tight_peak_date: Option<String>,
     #[serde(rename = "breakout_date")]
     breakout_date: Option<String>,
-    
+
     // Screener dates (optional)
     #[serde(rename = "date")]
     date: Option<String>,
-    #[serde(rename = "mark_date")]
+    #[serde(rename = "mark_date", alias = "Mark_Date")]
     mark_date: Option<String>,
-    #[serde(rename = "mark_tight_date")]
+    #[serde(rename = "mark_tight_date", alias = "Mark_Tight_Date")]
     mark_tight_date: Option<String>,
     #[serde(rename = "flag_date")]
     flag_date: Option<String>,
@@ -108,7 +108,10 @@ fn clean_opt_date(opt: &Option<String>) -> Option<&str> {
     match opt {
         Some(s) => {
             let trimmed = s.trim();
-            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("nan") || trimmed.eq_ignore_ascii_case("nat") {
+            if trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("nan")
+                || trimmed.eq_ignore_ascii_case("nat")
+            {
                 None
             } else {
                 Some(trimmed.split('T').next().unwrap().trim())
@@ -130,8 +133,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (&args[1], &args[2], &args[3])
     } else {
         eprintln!("Usage: {} <tasks_csv> <duckdb_file> <output_dir>", args[0]);
-        eprintln!("   OR: {} chart <duckdb_file> <tasks_json/csv> <output_dir>", args[0]);
-        eprintln!("   OR: {} screen <duckdb_file> <fundamental_csv> <exchange> <out_dir>", args[0]);
+        eprintln!(
+            "   OR: {} chart <duckdb_file> <tasks_json/csv> <output_dir>",
+            args[0]
+        );
+        eprintln!(
+            "   OR: {} screen <duckdb_file> <fundamental_csv> <exchange> <out_dir>",
+            args[0]
+        );
         std::process::exit(1);
     };
 
@@ -204,14 +213,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("No EOD data found in DuckDB for {} ({})", symbol, exchange);
         }
 
-        eod_cache.insert(cache_key, chart::EodData {
-            dates,
-            opens,
-            highs,
-            lows,
-            closes,
-            volumes,
-        });
+        eod_cache.insert(
+            cache_key,
+            chart::EodData {
+                dates,
+                opens,
+                highs,
+                lows,
+                closes,
+                volumes,
+            },
+        );
     }
 
     std::mem::drop(stmt);
@@ -305,7 +317,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let duration = start_time.elapsed();
-    println!("Completed in {:.2} seconds. Output at: {}", duration.as_secs_f64(), output_dir);
+    println!(
+        "Completed in {:.2} seconds. Output at: {}",
+        duration.as_secs_f64(),
+        output_dir
+    );
 
     Ok(())
 }

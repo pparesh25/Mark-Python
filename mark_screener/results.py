@@ -41,7 +41,7 @@ def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date
     csv_columns = ["Index", "symbol", "Priority_Score", "Tradeable", "Turnover_cr", "Days_In_Trend", "Trend_Strength"]
     excluded = {
         "Index", "symbol", "date", "close", "EMA_50", "EMA_150", "EMA_200",
-        "52 week high", "52 week low", "Mark_Date", "Mark_Tight_Date",
+        "52 week high", "52 week low",
         "Down from 52w high_x", "Donchian_60_High", "Donchian_60_Base", "Tight_Breakout",
         "Plot Start", "Plot End", "Days_In_Trend", "Trend_Strength",
         "Priority_Score", "Tradeable", "Turnover_cr",
