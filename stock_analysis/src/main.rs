@@ -124,20 +124,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return screener::run_screener_cmd(&args[2..]);
     }
 
-    if args.len() < 4 {
+    let (tasks_csv, duckdb_file, output_dir) = if args.len() >= 5 && args[1] == "chart" {
+        (&args[3], &args[2], &args[4])
+    } else if args.len() >= 4 {
+        (&args[1], &args[2], &args[3])
+    } else {
         eprintln!("Usage: {} <tasks_csv> <duckdb_file> <output_dir>", args[0]);
+        eprintln!("   OR: {} chart <duckdb_file> <tasks_json/csv> <output_dir>", args[0]);
         eprintln!("   OR: {} screen <duckdb_file> <fundamental_csv> <exchange> <out_dir>", args[0]);
         std::process::exit(1);
-    }
-
-    let tasks_csv = &args[1];
-    let duckdb_file = &args[2];
-    let output_dir = &args[3];
+    };
 
     // Initialize Rayon ThreadPoolBuilder with 8MB stack size to prevent stack overflow
-    rayon::ThreadPoolBuilder::new()
+    let _ = rayon::ThreadPoolBuilder::new()
         .stack_size(8 * 1024 * 1024)
-        .build_global()?;
+        .build_global();
 
     let start_time = std::time::Instant::now();
 
@@ -162,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut eod_cache = HashMap::new();
 
     let mut stmt = conn.prepare("
-        SELECT CAST(Date AS VARCHAR), Open, High, Low, Close, Volume 
+        SELECT CAST(Date AS VARCHAR), COALESCE(Open, 0.0), COALESCE(High, 0.0), COALESCE(Low, 0.0), COALESCE(Close, 0.0), COALESCE(Volume, 0.0)
         FROM eod_data 
         WHERE Symbol = ? AND Exchange = ? 
         ORDER BY Date ASC
@@ -248,32 +249,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let plot_start = NaiveDate::parse_from_str(clean_plot_start, "%Y-%m-%d").unwrap();
         let plot_end = NaiveDate::parse_from_str(clean_plot_end, "%Y-%m-%d").unwrap();
 
-        // Layout vertical lines based on Screener Type
-        let (p_start, p_end, breakout, mark) = if clean_opt_date(&task.breakout_date).is_some() {
-            // Tight Flag: 3 lines (Pattern Start, Pattern End, Breakout)
-            (
-                clean_opt_date(&task.tight_start_date).and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()),
-                clean_opt_date(&task.tight_peak_date).and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()),
-                clean_opt_date(&task.breakout_date).and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()),
-                None,
-            )
-        } else if clean_opt_date(&task.flag_start_date).is_some() {
-            // Standard Flag: 2 lines (Pattern Start, Pattern End)
-            (
-                clean_opt_date(&task.flag_start_date).and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()),
-                clean_opt_date(&task.flag_peak_date).and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()),
-                None,
-                None,
-            )
-        } else {
-            // Mark / Mark Tight: 1 line (breakout / mark date)
-            (
-                None,
-                None,
-                None,
-                clean_opt_date(&task.mark_date).or_else(|| clean_opt_date(&task.mark_tight_date)).and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()),
-            )
-        };
+        // Layout vertical lines based on task date fields
+        let p_start = clean_opt_date(&task.flag_start_date)
+            .or_else(|| clean_opt_date(&task.tight_start_date))
+            .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+        let p_end = clean_opt_date(&task.flag_peak_date)
+            .or_else(|| clean_opt_date(&task.tight_peak_date))
+            .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+        let breakout = clean_opt_date(&task.breakout_date)
+            .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+        let mark = clean_opt_date(&task.mark_date)
+            .or_else(|| clean_opt_date(&task.mark_tight_date))
+            .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
 
         // Construct fundamental info lines exactly like Python
         let info_line1 = format!(

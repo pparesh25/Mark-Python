@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 import talib as ta
 import duckdb
+import polars as pl
 
 import config
 from mark_screener.results import process_results
@@ -24,9 +25,13 @@ start_time = time.time()
 parser = argparse.ArgumentParser()
 parser.add_argument('--exchange', type=str, default='NSE', choices=['NSE', 'BSE'])
 parser.add_argument('--max-date', type=str, default=None)
+parser.add_argument('--include-sme', action='store_true', help="Include SME stocks in screening")
+parser.add_argument('--only-sme', action='store_true', help="Screen ONLY SME stocks")
 args = parser.parse_args()
 exchange = args.exchange.upper()
 max_date = args.max_date
+include_sme = args.include_sme
+only_sme = args.only_sme
 
 dirs = config.get_output_dirs(exchange)
 FLAG_OUT_DIR = dirs['flag_out']
@@ -38,10 +43,18 @@ config.ensure_dirs()
 
 
 def check_flag_patterns(df):
-    highs = df['high'].values
-    lows = df['low'].values
-    closes = df['close'].values
-    dates = df['date'].values
+    if isinstance(df, pl.DataFrame):
+        opens = df['open'].to_numpy()
+        highs = df['high'].to_numpy()
+        lows = df['low'].to_numpy()
+        closes = df['close'].to_numpy()
+        dates = df['date'].cast(pl.String).to_numpy()
+    else:
+        opens = df['open'].values
+        highs = df['high'].values
+        lows = df['low'].values
+        closes = df['close'].values
+        dates = df['date'].values
     n = len(df)
     
     is_flag = False
@@ -68,6 +81,9 @@ def check_flag_patterns(df):
                 max_h = highs[candidate_j]
                 j_peak = candidate_j
                 
+        if lows[i] <= 0.0:
+            continue
+
         run_up = (highs[j_peak] - lows[i]) / lows[i]
         if run_up >= 0.90:
             if not is_flag:
@@ -76,23 +92,35 @@ def check_flag_patterns(df):
                 flag_start_date = dates[i]
                 flag_peak_date = dates[j_peak]
             
-            # Stage 2 Tight Flag check:
-            # 1. Breakout within 15 days of peak (k - j_peak <= 15)
-            # 2. Current close (closes[-1]) remains > highs[j_peak]
-            breakout_k = None
-            max_breakout_k = min(n, j_peak + 16)
-            for k in range(j_peak + 1, max_breakout_k):
-                if closes[k] > highs[j_peak]:
-                    breakout_k = k
-                    break
-                    
-            if breakout_k is not None and closes[-1] > highs[j_peak]:
-                if not is_tight_flag:
-                    is_tight_flag = True
-                    tight_flag_date = dates[j_peak]
-                    tight_start_date = dates[i]
-                    tight_peak_date = dates[j_peak]
-                    breakout_date = dates[breakout_k]
+            # Stage 2: reject short poles, extreme gaps and circuit traps,
+            # then require a sustained breakout within 15 sessions.
+            if j_peak - i > 3:
+                has_extreme_gap = any(
+                    closes[p_idx - 1] > 0
+                    and abs(opens[p_idx] - closes[p_idx - 1]) / closes[p_idx - 1] > 0.50
+                    for p_idx in range(i + 1, j_peak + 1)
+                )
+                circuit_count = sum(
+                    abs(highs[p_idx] - lows[p_idx]) < 1e-4
+                    for p_idx in range(i, j_peak + 1)
+                )
+                circuit_pct = circuit_count / (j_peak - i + 1) * 100
+
+                if not has_extreme_gap and circuit_pct <= 40.0:
+                    breakout_k = None
+                    max_breakout_k = min(n, j_peak + 16)
+                    for k in range(j_peak + 1, max_breakout_k):
+                        if closes[k] > highs[j_peak]:
+                            breakout_k = k
+                            break
+
+                    if breakout_k is not None and closes[-1] > highs[j_peak]:
+                        if not is_tight_flag:
+                            is_tight_flag = True
+                            tight_flag_date = dates[j_peak]
+                            tight_start_date = dates[i]
+                            tight_peak_date = dates[j_peak]
+                            breakout_date = dates[breakout_k]
                             
             if is_flag and is_tight_flag:
                 break
@@ -101,47 +129,79 @@ def check_flag_patterns(df):
 
 
 def process_symbol_data(args_tuple):
-    symbol, df_sym = args_tuple
+    symbol, df = args_tuple
+    if df is None or len(df) < 50:
+        return None
+
     try:
-        if len(df_sym) < 10:
+        if isinstance(df, pl.DataFrame):
+            closes = df['close'].to_numpy()
+            highs = df['high'].to_numpy()
+            lows = df['low'].to_numpy()
+            dates = df['date'].cast(pl.String).to_numpy()
+            last_close = closes[-1]
+            last_low = lows[-1]
+        else:
+            df.columns = df.columns.str.lower()
+            closes = df['close'].values
+            highs = df['high'].values
+            lows = df['low'].values
+            dates = df['date'].values
+            last_close = closes[-1]
+            last_low = lows[-1]
+
+        # Mechanical Hard Filter 1: Price Floor >= Rs 5.0
+        if last_low < 5.0:
             return None
-            
-        df = df_sym.copy()
-        df.columns = df.columns.str.lower()
-        df['date'] = pd.to_datetime(df['date'])
-        
-        # Calculate moving averages
-        df['EMA_50'] = ta.EMA(df['close'], timeperiod=50).round(2)
-        df['EMA_150'] = ta.EMA(df['close'], timeperiod=150).round(2)
-        df['EMA_200'] = ta.EMA(df['close'], timeperiod=200).round(2)
-        
-        # 52-week high / low (fallback to max available days if history is slightly less than 252)
-        period_52w = min(252, len(df))
-        df['52 week high'] = ta.MAX(df['high'], timeperiod=period_52w)
-        df['52 week low'] = ta.MIN(df['low'], timeperiod=period_52w)
-        
-        df_screening = df.tail(90).copy()
-        (is_flag, flag_date, flag_start_date, flag_peak_date, 
-         is_tight_flag, tight_flag_date, tight_start_date, 
+
+        # Moving averages & 52W high
+        n = len(closes)
+        ema_200 = ta.EMA(closes, timeperiod=min(200, max(5, n-1)))
+        period_52w = min(252, n)
+        high_52w = ta.MAX(highs, timeperiod=period_52w)
+
+        last_ema200 = ema_200[-1]
+        last_52w_high = high_52w[-1]
+
+        # Mechanical Hard Filter 2: Stage 2 Uptrend (Close > EMA 200)
+        if not np.isnan(last_ema200) and last_close < last_ema200:
+            return None
+
+        # Mechanical Hard Filter 3: 52W High Proximity (Dist <= 45%)
+        if last_52w_high > 0:
+            dist_52w = (last_52w_high - last_close) / last_52w_high * 100
+            if dist_52w > 45.0:
+                return None
+
+        df_screening = df[-90:] if isinstance(df, pl.DataFrame) else df.tail(90).copy()
+        (is_flag, flag_date, flag_start_date, flag_peak_date,
+         is_tight_flag, tight_flag_date, tight_start_date,
          tight_peak_date, breakout_date) = check_flag_patterns(df_screening)
         
         if not is_flag and not is_tight_flag:
             return None
-            
-        last_row = df.iloc[[-1]].copy()
-        last_row['flag_date'] = flag_date
-        last_row['flag_start_date'] = flag_start_date
-        last_row['flag_peak_date'] = flag_peak_date
-        
-        last_row['tight_flag_date'] = tight_flag_date
-        last_row['tight_start_date'] = tight_start_date
-        last_row['tight_peak_date'] = tight_peak_date
-        last_row['breakout_date'] = breakout_date
-        
-        last_row['is_flag'] = is_flag
-        last_row['is_tight_flag'] = is_tight_flag
-        
-        return last_row
+
+        res_dict = {
+            'symbol': symbol,
+            'date': dates[-1],
+            'open': df['open'][-1] if isinstance(df, pl.DataFrame) else df['open'].iloc[-1],
+            'high': highs[-1],
+            'low': lows[-1],
+            'close': last_close,
+            'volume': df['volume'][-1] if isinstance(df, pl.DataFrame) else df['volume'].iloc[-1],
+            'EMA_200': round(last_ema200, 2) if not np.isnan(last_ema200) else 0.0,
+            '52 week high': round(last_52w_high, 2) if not np.isnan(last_52w_high) else 0.0,
+            'flag_date': flag_date,
+            'flag_start_date': flag_start_date,
+            'flag_peak_date': flag_peak_date,
+            'tight_flag_date': tight_flag_date,
+            'tight_start_date': tight_start_date,
+            'tight_peak_date': tight_peak_date,
+            'breakout_date': breakout_date,
+            'is_flag': is_flag,
+            'is_tight_flag': is_tight_flag
+        }
+        return pd.DataFrame([res_dict])
     except Exception as e:
         logging.error(f"Error processing symbol {symbol}: {e}")
         return None
@@ -181,6 +241,10 @@ def main():
                 ]
                 if max_date:
                     cmd.append(max_date)
+                if include_sme:
+                    cmd.append("--include-sme")
+                if only_sme:
+                    cmd.append("--only-sme")
 
                 res = subprocess.run(cmd, capture_output=True, text=True)
                 if res.returncode != 0:
@@ -282,31 +346,41 @@ def main():
     symbols_list = list(df_symbols['Symbol'].str.upper())
     logging.info(f"Screening {len(symbols_list)} symbols for {exchange}...")
     
-    # Load EOD data for these symbols from DuckDB
+    # Load EOD data for these symbols from DuckDB via Arrow
     t_eod_start = time.time()
     conn = duckdb.connect(str(config.DUCKDB_FILE), read_only=True)
     try:
-        df_all = conn.execute("""
+        arrow_table = conn.execute("""
             SELECT Date, Symbol, Exchange, ISIN, Open, High, Low, Close, Volume, Series
             FROM eod_data 
             WHERE Exchange = ? AND Symbol IN (SELECT column0 FROM (SELECT UNNEST(?) as column0))
             ORDER BY Symbol, Date ASC
-        """, (exchange, symbols_list)).fetchdf()
+        """, (exchange, symbols_list)).to_arrow_table()
     finally:
         conn.close()
+
+    df_all = pl.from_arrow(arrow_table).rename({
+        'Date': 'date', 'Symbol': 'symbol', 'Open': 'open',
+        'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'
+    })
+    df_all = df_all.with_columns(pl.col('symbol').str.strip_chars())
+    symbol_is_sme = pl.col('symbol').str.to_uppercase().str.ends_with('_SME')
+    if only_sme:
+        df_all = df_all.filter(symbol_is_sme)
+    elif not include_sme:
+        df_all = df_all.filter(~symbol_is_sme)
     logging.info(f"✓ Loaded EOD data for {len(symbols_list)} symbols in {time.time() - t_eod_start:.2f}s")
         
-    if df_all.empty:
+    if df_all.is_empty():
         logging.info("No EOD data found in database.")
         return
         
     if max_date:
-        df_all = df_all[df_all['Date'].astype(str).str.split('T').str[0] <= max_date].copy()
+        df_all = df_all.filter(pl.col('date').cast(pl.String).str.slice(0, 10) <= max_date)
 
-    # Group by Symbol
-    grouped = df_all.groupby('Symbol')
-    tasks = [(symbol, group) for symbol, group in grouped]
-    eod_data_dict = {symbol.upper(): group for symbol, group in grouped}
+    # Group by Symbol with Polars partition_by
+    tasks = [(df_sym['symbol'][0], df_sym) for df_sym in df_all.partition_by('symbol')]
+    eod_data_dict = {sym: df_sym.to_pandas() for sym, df_sym in tasks}
     
     logging.info(f"Running Technical Analysis across {len(tasks)} symbols...")
     t_ta_start = time.time()

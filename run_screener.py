@@ -199,10 +199,19 @@ def run_screening(logger):
     return success_nse and success_bse
 
 
-def run_flag_screening(logger):
+def run_flag_screening(logger, include_sme=False, only_sme=False):
     """Execute flag_screener.py as a subprocess for NSE and BSE."""
-    success_nse = run_step("Step 4/4: NSE Flag & Tight Flag Screening", [sys.executable, "-u", str(FLAG_SCREENER_MODULE), "--exchange", "NSE"], logger)
-    success_bse = run_step("Step 4/4: BSE Flag & Tight Flag Screening", [sys.executable, "-u", str(FLAG_SCREENER_MODULE), "--exchange", "BSE"], logger)
+    cmd_nse = [sys.executable, "-u", str(FLAG_SCREENER_MODULE), "--exchange", "NSE"]
+    cmd_bse = [sys.executable, "-u", str(FLAG_SCREENER_MODULE), "--exchange", "BSE"]
+    if include_sme:
+        cmd_nse.append("--include-sme")
+        cmd_bse.append("--include-sme")
+    if only_sme:
+        cmd_nse.append("--only-sme")
+        cmd_bse.append("--only-sme")
+
+    success_nse = run_step("Step 4/4: NSE Flag & Tight Flag Screening", cmd_nse, logger)
+    success_bse = run_step("Step 4/4: BSE Flag & Tight Flag Screening", cmd_bse, logger)
     return success_nse and success_bse
 
 
@@ -210,6 +219,12 @@ def run_flag_screening(logger):
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Unified Mark Screener Orchestrator")
+    parser.add_argument('--include-sme', action='store_true', help="Include SME stocks in screening")
+    parser.add_argument('--only-sme', action='store_true', help="Screen ONLY SME stocks")
+    args = parser.parse_args()
+
     os.environ['MARK_SCREENER_TIMESTAMP'] = config.CURRENT_TIMESTAMP
     logger = setup_logging()
     workflow_start = time.time()
@@ -318,7 +333,7 @@ def main():
     run_screening(logger)
 
     # --- Step 4: flag screening -------------------------------------------
-    run_flag_screening(logger)
+    run_flag_screening(logger, include_sme=args.include_sme, only_sme=args.only_sme)
 
     # --- Summary ----------------------------------------------------------
     total = time.time() - workflow_start

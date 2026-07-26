@@ -181,6 +181,7 @@ fn process_flag_screener(data: &SymbolData) -> Option<FlagResult> {
     let tail_len = std::cmp::min(90, n_total);
     let start_offset = n_total - tail_len;
 
+    let opens = &data.opens[start_offset..n_total];
     let highs = &data.highs[start_offset..n_total];
     let lows = &data.lows[start_offset..n_total];
     let closes = &data.closes[start_offset..n_total];
@@ -201,6 +202,9 @@ fn process_flag_screener(data: &SymbolData) -> Option<FlagResult> {
 
     // --- STAGE 1: Flag Pattern Detection (90%+ gain in 45 days) ---
     for i in 0..(n - 1) {
+        if lows[i] <= 0.0 {
+            continue;
+        }
         let max_j = std::cmp::min(n - 1, i + 45);
         if max_j <= i {
             continue;
@@ -225,26 +229,69 @@ fn process_flag_screener(data: &SymbolData) -> Option<FlagResult> {
                 flag_peak_date = Some(dates[j_peak].clone());
             }
 
-            // --- STAGE 2: Tight Flag Breakout Check ---
-            // 1. Breakout within 15 days of peak (k - j_peak <= 15)
-            // 2. Current close (closes[n - 1]) remains > highs[j_peak]
-            let mut breakout_k: Option<usize> = None;
-            let max_breakout_k = std::cmp::min(n, j_peak + 16);
-            for k in (j_peak + 1)..max_breakout_k {
-                if closes[k] > highs[j_peak] {
-                    breakout_k = Some(k);
-                    break;
+            // --- STAGE 2: Tight Flag Checks ---
+            // 1. Minimum Pole Duration > 3 candles
+            if j_peak - i > 3 {
+                // 2. Extreme Gap Check (No single-day gap > 50% in pole)
+                let mut has_extreme_gap = false;
+                for p_idx in (i + 1)..=j_peak {
+                    let prev_c = closes[p_idx - 1];
+                    let open_gap = if prev_c > 0.0 { (opens[p_idx] - prev_c).abs() / prev_c } else { 0.0 };
+                    if open_gap > 0.50 {
+                        has_extreme_gap = true;
+                        break;
+                    }
                 }
-            }
 
-            if let Some(k_idx) = breakout_k {
-                if closes[n - 1] > highs[j_peak] {
-                    if !is_tight_flag {
-                        is_tight_flag = true;
-                        tight_flag_date = Some(dates[j_peak].clone());
-                        tight_start_date = Some(dates[i].clone());
-                        tight_peak_date = Some(dates[j_peak].clone());
-                        breakout_date = Some(dates[k_idx].clone());
+                if !has_extreme_gap {
+                    // 3. Circuit Trap Check (Circuit candles <= 40% in pole)
+                    let mut circuit_count = 0;
+                    let pole_candles = j_peak - i + 1;
+                    for p_idx in i..=j_peak {
+                        if (highs[p_idx] - lows[p_idx]).abs() < 1e-4 {
+                            circuit_count += 1;
+                        }
+                    }
+                    let circuit_pct = (circuit_count as f64) / (pole_candles as f64) * 100.0;
+
+                    if circuit_pct <= 40.0 {
+                        // 4. Tight Breakout Check (within 15 days of peak)
+                        let mut breakout_k: Option<usize> = None;
+                        let max_breakout_k = std::cmp::min(n, j_peak + 16);
+                        for k in (j_peak + 1)..max_breakout_k {
+                            if closes[k] > highs[j_peak] {
+                                breakout_k = Some(k);
+                                break;
+                            }
+                        }
+
+                        if let Some(k_idx) = breakout_k {
+                            // 5. Breakout Holding Rule: Latest close > Pole Peak High
+                            if closes[n - 1] > highs[j_peak] {
+                                // 6. Stage-2 Mechanical Hard Filters for Tight Flag
+                                let last_close = closes[n - 1];
+                                if last_close >= 5.0 {
+                                    let ema_200 = calculate_ema(&data.closes, 200);
+                                    let last_ema200 = ema_200[n - 1];
+                                    if last_ema200.is_nan() || last_close >= last_ema200 {
+                                        let period_52w = std::cmp::min(252, n);
+                                        let start_52w = if n > period_52w { n - period_52w } else { 0 };
+                                        let high_52w = highs[start_52w..n].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                                        let dist_52w = if high_52w > 0.0 { (high_52w - last_close) / high_52w * 100.0 } else { 0.0 };
+
+                                        if dist_52w <= 45.0 {
+                                            if !is_tight_flag {
+                                                is_tight_flag = true;
+                                                tight_flag_date = Some(dates[j_peak].clone());
+                                                tight_start_date = Some(dates[i].clone());
+                                                tight_peak_date = Some(dates[j_peak].clone());
+                                                breakout_date = Some(dates[k_idx].clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -255,7 +302,7 @@ fn process_flag_screener(data: &SymbolData) -> Option<FlagResult> {
         }
     }
 
-    // EARLY EXIT: If Stage 1 ("Flag") fails, exit immediately!
+    // EARLY EXIT: If neither Flag nor Tight Flag matched
     if !is_flag && !is_tight_flag {
         return None;
     }
@@ -468,6 +515,9 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
     let mut stmt = conn.prepare(bulk_eod_sql)?;
     let mut rows = stmt.query([])?;
 
+    let include_sme = args.iter().any(|a| a == "--include-sme");
+    let only_sme = args.iter().any(|a| a == "--only-sme");
+
     let mut symbol_datasets: Vec<SymbolData> = Vec::new();
     let mut dataset_map: HashMap<String, usize> = HashMap::new();
 
@@ -483,6 +533,13 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
     while let Some(row) = rows.next()? {
         let d_str: String = row.get(0)?;
         let sym: String = row.get(1)?;
+        let is_sme = sym.trim().to_uppercase().ends_with("_SME");
+        if only_sme {
+            if !is_sme { continue; }
+        } else if !include_sme {
+            if is_sme { continue; }
+        }
+
         let isin: String = row.get(2)?;
         let isin_clean = isin.trim().to_uppercase();
 
