@@ -6,7 +6,7 @@ Python orchestrator that:
 
   Step 1 — updates the eod2 price database (via the existing run_eod2.sh).
   Step 2 — downloads fresh fundamentals from screener.in (Selenium downloader).
-  Step 3 — runs the technical + fundamental screen (Mark screener_5dbreakout.py).
+  Step 3 — runs the technical + fundamental screen (Mark_screener.py).
 
 Improvements over the legacy shell orchestrator:
   * Real error propagation — a non-zero exit from any step aborts the run.
@@ -37,7 +37,7 @@ from config import (
 )
 
 # Screener module executed in Step 3 (filename has a space — quoted via Path).
-SCREENER_MODULE = BASE_DIR / 'Mark screener_5dbreakout.py'
+SCREENER_MODULE = BASE_DIR / 'Mark_screener.py'
 
 # ANSI colours for the console (log file gets plain text via strip).
 _C = {
@@ -193,7 +193,7 @@ def validate_fundamentals(logger):
 FLAG_SCREENER_MODULE = BASE_DIR / 'flag_screener.py'
 
 def run_screening(logger, include_sme=False, only_sme=False):
-    """Execute Mark screener_5dbreakout.py as a subprocess for NSE and BSE."""
+    """Execute Mark_screener.py as a subprocess for NSE and BSE."""
     cmd_nse = [sys.executable, "-u", str(SCREENER_MODULE), "--exchange", "NSE"]
     cmd_bse = [sys.executable, "-u", str(SCREENER_MODULE), "--exchange", "BSE"]
     if include_sme:
@@ -219,8 +219,8 @@ def run_flag_screening(logger, include_sme=False, only_sme=False):
         cmd_nse.append("--only-sme")
         cmd_bse.append("--only-sme")
 
-    success_nse = run_step("Step 4/4: NSE Flag & Tight Flag Screening", cmd_nse, logger)
-    success_bse = run_step("Step 4/4: BSE Flag & Tight Flag Screening", cmd_bse, logger)
+    success_nse = run_step("Step 4/4: NSE Tight Flag Screening", cmd_nse, logger)
+    success_bse = run_step("Step 4/4: BSE Tight Flag Screening", cmd_bse, logger)
     return success_nse and success_bse
 
 

@@ -45,9 +45,7 @@ pub struct FlagResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenedDataset {
     pub exchange: String,
-    pub mark_qualified: Vec<MarkResult>,
     pub mark_tight_qualified: Vec<MarkResult>,
-    pub flag_qualified: Vec<FlagResult>,
     pub tight_flag_qualified: Vec<FlagResult>,
 }
 
@@ -206,6 +204,22 @@ fn process_flag_screener(data: &SymbolData, flag_lookback: usize) -> Option<Flag
     let mut tight_peak_date: Option<String> = None;
     let mut breakout_date: Option<String> = None;
 
+    // These full-history quality checks are invariant for the symbol, so
+    // calculate them once instead of for every 90%-run-up candidate.
+    let last_close = data.closes[n_total - 1];
+    let last_ema200 = calculate_ema(&data.closes, 200)[n_total - 1];
+    let high_52w = data.highs[n_total - 252..n_total]
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let dist_52w = if high_52w > 0.0 {
+        (high_52w - last_close) / high_52w * 100.0
+    } else {
+        f64::INFINITY
+    };
+    let passes_quality =
+        last_close >= 5.0 && !last_ema200.is_nan() && last_close >= last_ema200 && dist_52w <= 45.0;
+
     // --- STAGE 1: Flag Pattern Detection (90%+ gain in 45 days) ---
     for i in 0..(n - 1) {
         if lows[i] <= 0.0 {
@@ -277,33 +291,13 @@ fn process_flag_screener(data: &SymbolData, flag_lookback: usize) -> Option<Flag
 
                         if let Some(k_idx) = breakout_k {
                             // 5. Breakout Holding Rule: Latest close > Pole Peak High
-                            if closes[n - 1] > highs[j_peak] {
-                                // 6. Tight Flag hard filters use the full 200/252-day history.
-                                let last_close = data.closes[n_total - 1];
-                                if last_close >= 5.0 {
-                                    let ema_200 = calculate_ema(&data.closes, 200);
-                                    let last_ema200 = ema_200[n_total - 1];
-                                    if !last_ema200.is_nan() && last_close >= last_ema200 {
-                                        let high_52w = data.highs[n_total - 252..n_total]
-                                            .iter()
-                                            .cloned()
-                                            .fold(f64::NEG_INFINITY, f64::max);
-                                        let dist_52w = if high_52w > 0.0 {
-                                            (high_52w - last_close) / high_52w * 100.0
-                                        } else {
-                                            0.0
-                                        };
-
-                                        if dist_52w <= 45.0 {
-                                            if !is_tight_flag {
-                                                is_tight_flag = true;
-                                                tight_flag_date = Some(dates[j_peak].clone());
-                                                tight_start_date = Some(dates[i].clone());
-                                                tight_peak_date = Some(dates[j_peak].clone());
-                                                breakout_date = Some(dates[k_idx].clone());
-                                            }
-                                        }
-                                    }
+                            if closes[n - 1] > highs[j_peak] && passes_quality {
+                                if !is_tight_flag {
+                                    is_tight_flag = true;
+                                    tight_flag_date = Some(dates[j_peak].clone());
+                                    tight_start_date = Some(dates[i].clone());
+                                    tight_peak_date = Some(dates[j_peak].clone());
+                                    breakout_date = Some(dates[k_idx].clone());
                                 }
                             }
                         }
@@ -317,8 +311,9 @@ fn process_flag_screener(data: &SymbolData, flag_lookback: usize) -> Option<Flag
         }
     }
 
-    // EARLY EXIT: If neither Flag nor Tight Flag matched
-    if !is_flag && !is_tight_flag {
+    // Flag is only an internal 90%-in-45-days candidate gate. Returning Tight
+    // Flag matches only avoids carrying rejected flag-only candidates.
+    if !is_tight_flag {
         return None;
     }
 
@@ -369,112 +364,81 @@ fn export_qualified_csvs(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ex = &dataset.exchange;
 
-    let mark_tight_dir = base_out_dir.join(ex).join("mark_tight");
-    let flag_dir = base_out_dir.join(ex).join("Flag");
-    let tight_flag_dir = base_out_dir.join(ex).join("Tight Flag");
-
-    std::fs::create_dir_all(&mark_tight_dir)?;
-    std::fs::create_dir_all(&flag_dir)?;
-    std::fs::create_dir_all(&tight_flag_dir)?;
-
-    // 1. Mark Tight CSV. Mark remains an internal setup and is not exported.
-    let mark_tight_file = mark_tight_dir.join(format!(
-        "{}_{}_mark_tight_qualified.csv",
-        timestamp,
-        ex.to_lowercase()
-    ));
-    let mut w_mt = csv::Writer::from_path(&mark_tight_file)?;
-    w_mt.write_record(&[
-        "symbol",
-        "isin",
-        "date",
-        "close",
-        "ema_50",
-        "ema_150",
-        "ema_200",
-        "high_52w",
-        "low_52w",
-        "mark_date",
-        "mark_tight_date",
-        "down_52w_high",
-    ])?;
-    for r in &dataset.mark_tight_qualified {
-        w_mt.write_record(&[
-            &r.symbol,
-            &r.isin,
-            &r.date,
-            &r.close.to_string(),
-            &r.ema_50.to_string(),
-            &r.ema_150.to_string(),
-            &r.ema_200.to_string(),
-            &r.high_52w.to_string(),
-            &r.low_52w.to_string(),
-            &r.mark_date,
-            r.mark_tight_date.as_deref().unwrap_or(""),
-            &r.down_52w_high.to_string(),
+    if !dataset.mark_tight_qualified.is_empty() {
+        let mark_tight_dir = base_out_dir.join(ex).join("mark_tight");
+        std::fs::create_dir_all(&mark_tight_dir)?;
+        let mark_tight_file = mark_tight_dir.join(format!(
+            "{}_{}_mark_tight_qualified.csv",
+            timestamp,
+            ex.to_lowercase()
+        ));
+        let mut writer = csv::Writer::from_path(&mark_tight_file)?;
+        writer.write_record(&[
+            "symbol",
+            "isin",
+            "date",
+            "close",
+            "ema_50",
+            "ema_150",
+            "ema_200",
+            "high_52w",
+            "low_52w",
+            "mark_date",
+            "mark_tight_date",
+            "down_52w_high",
         ])?;
+        for r in &dataset.mark_tight_qualified {
+            writer.write_record(&[
+                &r.symbol,
+                &r.isin,
+                &r.date,
+                &r.close.to_string(),
+                &r.ema_50.to_string(),
+                &r.ema_150.to_string(),
+                &r.ema_200.to_string(),
+                &r.high_52w.to_string(),
+                &r.low_52w.to_string(),
+                &r.mark_date,
+                r.mark_tight_date.as_deref().unwrap_or(""),
+                &r.down_52w_high.to_string(),
+            ])?;
+        }
+        writer.flush()?;
     }
-    w_mt.flush()?;
 
-    // 2. Flag CSV
-    let flag_file = flag_dir.join(format!(
-        "{}_{}_flag_qualified.csv",
-        timestamp,
-        ex.to_lowercase()
-    ));
-    let mut w_flag = csv::Writer::from_path(&flag_file)?;
-    w_flag.write_record(&[
-        "symbol",
-        "isin",
-        "date",
-        "close",
-        "flag_date",
-        "flag_start_date",
-        "flag_peak_date",
-    ])?;
-    for r in &dataset.flag_qualified {
-        w_flag.write_record(&[
-            &r.symbol,
-            &r.isin,
-            &r.date,
-            &r.close.to_string(),
-            r.flag_date.as_deref().unwrap_or(""),
-            r.flag_start_date.as_deref().unwrap_or(""),
-            r.flag_peak_date.as_deref().unwrap_or(""),
+    if !dataset.tight_flag_qualified.is_empty() {
+        let tight_flag_dir = base_out_dir.join(ex).join("Tight Flag");
+        std::fs::create_dir_all(&tight_flag_dir)?;
+        let tight_flag_file = tight_flag_dir.join(format!(
+            "{}_{}_tight_flag_qualified.csv",
+            timestamp,
+            ex.to_lowercase()
+        ));
+        let mut writer = csv::Writer::from_path(&tight_flag_file)?;
+        writer.write_record(&[
+            "symbol",
+            "isin",
+            "date",
+            "close",
+            "tight_flag_date",
+            "tight_start_date",
+            "tight_peak_date",
+            "breakout_date",
         ])?;
+        for r in &dataset.tight_flag_qualified {
+            writer.write_record(&[
+                &r.symbol,
+                &r.isin,
+                &r.date,
+                &r.close.to_string(),
+                r.tight_flag_date.as_deref().unwrap_or(""),
+                r.tight_start_date.as_deref().unwrap_or(""),
+                r.tight_peak_date.as_deref().unwrap_or(""),
+                r.breakout_date.as_deref().unwrap_or(""),
+            ])?;
+        }
+        writer.flush()?;
     }
-    w_flag.flush()?;
-
-    // 4. Tight Flag CSV
-    let tight_flag_file = tight_flag_dir.join(format!(
-        "{}_{}_tight_flag_qualified.csv",
-        timestamp,
-        ex.to_lowercase()
-    ));
-    let mut w_tf = csv::Writer::from_path(&tight_flag_file)?;
-    w_tf.write_record(&[
-        "symbol",
-        "isin",
-        "date",
-        "close",
-        "tight_flag_date",
-        "tight_start_date",
-        "tight_peak_date",
-        "breakout_date",
-    ])?;
-    for r in &dataset.tight_flag_qualified {
-        w_tf.write_record(&[
-            &r.symbol,
-            &r.isin,
-            &r.date,
-            &r.close.to_string(),
-            r.tight_flag_date.as_deref().unwrap_or(""),
-            r.tight_start_date.as_deref().unwrap_or(""),
-            r.tight_peak_date.as_deref().unwrap_or(""),
-            r.breakout_date.as_deref().unwrap_or(""),
-        ])?;
-    }
-    w_tf.flush()?;
 
     Ok(())
 }
@@ -543,12 +507,16 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
     let mut include_sme = false;
     let mut only_sme = false;
     let mut flag_lookback = 90_usize;
+    let mut mark_tight_only = false;
+    let mut tight_flag_only = false;
     let mut index = 0;
 
     while index < args.len() {
         match args[index].as_str() {
             "--include-sme" => include_sme = true,
             "--only-sme" => only_sme = true,
+            "--mark-tight-only" => mark_tight_only = true,
+            "--tight-flag-only" => tight_flag_only = true,
             "--flag-lookback" => {
                 let value = args.get(index + 1).ok_or_else(|| {
                     std::io::Error::new(
@@ -584,8 +552,15 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
     }
 
     if positional.len() < 4 {
-        eprintln!("Usage: stock_analysis screen <duckdb_file> <fundamental_csv> <exchange> <out_dir> [max_date] [chart_out_base] [--include-sme|--only-sme] [--flag-lookback N]");
+        eprintln!("Usage: stock_analysis screen <duckdb_file> <fundamental_csv> <exchange> <out_dir> [max_date] [chart_out_base] [--mark-tight-only|--tight-flag-only] [--include-sme|--only-sme] [--flag-lookback N]");
         std::process::exit(1);
+    }
+    if mark_tight_only && tight_flag_only {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--mark-tight-only and --tight-flag-only cannot be combined",
+        )
+        .into());
     }
 
     let duckdb_file = positional[0];
@@ -730,24 +705,29 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
     // --- STEP 2: PARALLEL HIERARCHICAL TA SCREENING ---
     let t1 = std::time::Instant::now();
 
-    let mark_results: Vec<MarkResult> = symbol_datasets
-        .par_iter()
-        .filter_map(process_mark_screener)
-        .collect();
+    let mark_results: Vec<MarkResult> = if tight_flag_only {
+        Vec::new()
+    } else {
+        symbol_datasets
+            .par_iter()
+            .filter_map(process_mark_screener)
+            .collect()
+    };
 
-    let flag_results: Vec<FlagResult> = symbol_datasets
-        .par_iter()
-        .filter_map(|d| process_flag_screener(d, flag_lookback))
-        .collect();
+    let flag_results: Vec<FlagResult> = if mark_tight_only {
+        Vec::new()
+    } else {
+        symbol_datasets
+            .par_iter()
+            .filter_map(|d| process_flag_screener(d, flag_lookback))
+            .collect()
+    };
 
     let mark_tight: Vec<MarkResult> = mark_results
         .iter()
         .filter(|m| m.tight_breakout)
         .cloned()
         .collect();
-
-    let flag_qualified: Vec<FlagResult> =
-        flag_results.iter().filter(|f| f.is_flag).cloned().collect();
 
     let tight_flag_qualified: Vec<FlagResult> = flag_results
         .iter()
@@ -758,10 +738,8 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
     let elapsed_calc = t1.elapsed().as_secs_f64();
     println!("⏱️ [2/4] Hierarchical TA Screening: {:.4}s", elapsed_calc);
     println!(
-        "   └─ Mark: {} | Mark Tight: {} | Flag: {} | Tight Flag: {}",
-        mark_results.len(),
+        "   └─ Mark Tight: {} | Tight Flag: {}",
         mark_tight.len(),
-        flag_qualified.len(),
         tight_flag_qualified.len()
     );
 
@@ -769,9 +747,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
     let t2 = std::time::Instant::now();
     let dataset = ScreenedDataset {
         exchange: exchange.clone(),
-        mark_qualified: mark_results.clone(),
         mark_tight_qualified: mark_tight.clone(),
-        flag_qualified: flag_qualified.clone(),
         tight_flag_qualified: tight_flag_qualified.clone(),
     };
 
@@ -801,21 +777,16 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
         let t_render = std::time::Instant::now();
 
         let mark_tight_chart_dir = base_chart_dir.join(&exchange).join("mark_tight");
-        let flag_chart_dir = base_chart_dir.join(&exchange).join("Flag");
         let tight_flag_chart_dir = base_chart_dir.join(&exchange).join("Tight Flag");
 
         if mark_tight_chart_dir.exists() {
             let _ = std::fs::remove_dir_all(&mark_tight_chart_dir);
-        }
-        if flag_chart_dir.exists() {
-            let _ = std::fs::remove_dir_all(&flag_chart_dir);
         }
         if tight_flag_chart_dir.exists() {
             let _ = std::fs::remove_dir_all(&tight_flag_chart_dir);
         }
 
         std::fs::create_dir_all(&mark_tight_chart_dir)?;
-        std::fs::create_dir_all(&flag_chart_dir)?;
         std::fs::create_dir_all(&tight_flag_chart_dir)?;
 
         // Render Mark Tight Charts
@@ -833,25 +804,6 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
                     None,
                     None,
                     None,
-                );
-            }
-        });
-
-        // Render Flag Charts
-        flag_qualified.par_iter().for_each(|res| {
-            if let Some(&idx) = dataset_map.get(&res.symbol) {
-                let data = &symbol_datasets[idx];
-                let _ = render_symbol_chart(
-                    data,
-                    &flag_chart_dir,
-                    200,
-                    None,
-                    None,
-                    res.flag_start_date.as_deref(),
-                    res.flag_peak_date.as_deref(),
-                    res.tight_start_date.as_deref(),
-                    res.tight_peak_date.as_deref(),
-                    res.breakout_date.as_deref(),
                 );
             }
         });
@@ -875,7 +827,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
             }
         });
 
-        let total_charts = mark_tight.len() + flag_qualified.len() + tight_flag_qualified.len();
+        let total_charts = mark_tight.len() + tight_flag_qualified.len();
         println!(
             "⏱️ [4/4] Parallel RAM Chart Rendering: {:.2}s (Created {} charts)",
             t_render.elapsed().as_secs_f64(),

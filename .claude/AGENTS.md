@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-NSE India stock screening pipeline. Downloads EOD price data, fundamental data from screener.in, runs technical screens (Mark / Mark Tight) with priority scoring, outputs qualified stock CSVs + charts + AmiBroker watchlists.
+NSE India stock screening pipeline. Downloads EOD price data and fundamentals, then runs Mark Tight and Tight Flag screens with priority scoring, CSVs, charts, and AmiBroker watchlists.
 
 ## Team Workflow
 
@@ -26,7 +26,7 @@ NSE India stock screening pipeline. Downloads EOD price data, fundamental data f
 ### Core Pipeline (run_screener.py)
 1. **Step 1** — `nse_eod_downloader/eod_downloader.py`: Syncs NSE EOD database (daily OHLCV from NSE India)
 2. **Step 2** — `fundamental_downloader.py`: Selenium download from screener.in (screen 3427564)
-3. **Step 3** — `Mark screener_5dbreakout.py`: Technical + fundamental screening
+3. **Step 3** — `Mark_screener.py`: Technical + fundamental screening
 
 ### Key Files
 
@@ -36,16 +36,15 @@ NSE India stock screening pipeline. Downloads EOD price data, fundamental data f
 | `config.py` | Centralized paths, parameters, strategy settings |
 | `nse_eod_downloader/` | NSE EOD downloader and database maintenance modules |
 | `fundamental_downloader.py` | Screener.in CSV download (Selenium) |
-| `Mark screener_5dbreakout.py` | Main screener: Mark + Mark Tight + Priority Score |
+| `Mark_screener.py` | Main screener: Mark Tight + Priority Score |
 | `clean_nse_eod.py` | Cleans NSE_EOD CSVs to Date,Open,High,Low,Close,Volume |
 
 ### Config Details (config.py)
 - `BASE_DIR` = dynamic to project root
-- `BREAKOUT_WINDOW = 5` days
 - `DATA_DIR` = NSE_EOD/
 - Screener screen ID = 3427564
-- Output: qualified_stocks/mark/ and qualified_stocks/mark_tight/
-- Charts: chart_images/mark/ and chart_images/mark_tight/
+- Output: qualified_stocks/mark_tight/ and qualified_stocks/Tight Flag/
+- Charts: chart_images/mark_tight/ and chart_images/Tight Flag/
 - Logs: logs/screening_log_{timestamp}.txt
 - AmiBroker watchlists in ~/.opentrader-pro/databases/NSE_EOD/watchlists/
 
@@ -72,7 +71,7 @@ python -c "from nse_eod_downloader.eod_downloader import sync_database; import c
 python fundamental_downloader.py --headless
 
 # Screener only:
-python "Mark screener_5dbreakout.py"
+python Mark_screener.py
 ```
 
 ### Credentials
@@ -95,15 +94,17 @@ python "Mark screener_5dbreakout.py"
 
 ## Screening Strategy Details
 
-### Stage 1 — Mark
+### Mark setup (internal)
 Conditions: EMA 50 > EMA 150 > EMA 200 (stack) AND close >= 80% of 52w high AND close >= 150% of 52w low
-Reverse-walk through history to find the earliest date satisfying conditions → Mark_Date
+Reverse-walk through history to find the start of the active setup → Mark_Date
 
-### Stage 2 — Mark Tight
-Frozen base: Donchian 60-day high of highs EXCLUDING last 5 days (BREAKOUT_WINDOW)
-Breakout: close > frozen base on ANY of last 5 days
-Filters: close >= 85% of 52w high AND Tight_Breakout flag
-Most-recent breakout day = Mark_Tight_Date
+### Mark Tight
+Frozen base: Donchian 60-day high of highs immediately before Mark starts.
+Breakout: latest close > frozen base; the 20%/50% Mark conditions remain active.
+Latest breakout day = Mark_Tight_Date.
+
+### Tight Flag
+Internal candidate gate: a 90%+ run-up within 45 trading days.  Only candidates passing pole quality, breakout, holding, EMA200, and 52-week-distance filters are exported.
 
 ### Priority Score (add_priority_score in process_results)
 - 30% Momentum (1y + 3m return percentiles)

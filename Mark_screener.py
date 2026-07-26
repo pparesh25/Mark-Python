@@ -138,7 +138,7 @@ def main():
             ]
             if max_date:
                 cmd.append(max_date)
-            cmd.extend(["--flag-lookback", str(config.FLAG_LOOKBACK_DAYS)])
+            cmd.append("--mark-tight-only")
             if include_sme:
                 cmd.append("--include-sme")
             if only_sme:

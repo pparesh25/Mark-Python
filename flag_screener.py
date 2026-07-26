@@ -34,9 +34,7 @@ include_sme = args.include_sme
 only_sme = args.only_sme
 
 dirs = config.get_output_dirs(exchange)
-FLAG_OUT_DIR = dirs['flag_out']
 TIGHT_FLAG_OUT_DIR = dirs['tight_flag_out']
-FLAG_CHART_DIR = dirs['flag_chart']
 TIGHT_FLAG_CHART_DIR = dirs['tight_flag_chart']
 
 config.ensure_dirs()
@@ -165,23 +163,18 @@ def process_symbol_data(args_tuple):
          is_tight_flag, tight_flag_date, tight_start_date,
          tight_peak_date, breakout_date) = check_flag_patterns(df_screening)
         
-        if not is_flag and not is_tight_flag:
+        # The 90%-in-45-days Flag condition is an internal candidate gate.
+        # Only complete Tight Flag matches continue to result processing.
+        if not is_tight_flag:
             return None
 
-        # Flag is only the 90%-in-45-days pattern.  All quality gates belong
-        # exclusively to Tight Flag and must be satisfiable with full windows.
-        if is_tight_flag:
-            dist_52w = ((last_52w_high - last_close) / last_52w_high * 100
-                         if last_52w_high > 0 else float('inf'))
-            if (last_close < 5.0
-                    or np.isnan(last_ema200)
-                    or last_close < last_ema200
-                    or dist_52w > 45.0):
-                is_tight_flag = False
-                tight_flag_date = None
-                tight_start_date = None
-                tight_peak_date = None
-                breakout_date = None
+        dist_52w = ((last_52w_high - last_close) / last_52w_high * 100
+                     if last_52w_high > 0 else float('inf'))
+        if (last_close < 5.0
+                or np.isnan(last_ema200)
+                or last_close < last_ema200
+                or dist_52w > 45.0):
+            return None
 
         res_dict = {
             'symbol': symbol,
@@ -243,7 +236,7 @@ def main():
             ]
             if max_date:
                 cmd.append(max_date)
-            cmd.extend(["--flag-lookback", str(config.FLAG_LOOKBACK_DAYS)])
+            cmd.extend(["--tight-flag-only", "--flag-lookback", str(config.FLAG_LOOKBACK_DAYS)])
             if include_sme:
                 cmd.append("--include-sme")
             if only_sme:
@@ -263,13 +256,8 @@ def main():
             fundamental_df = pd.read_csv(FUNDAMENTAL_FILE)
             dirs = config.get_output_dirs(exchange)
 
-            # Process Stage 1 Flag Results
-            df_flag = pd.DataFrame(rust_dataset['flag_qualified'])
-            if not df_flag.empty:
-                df_flag['Exchange'] = exchange
-                process_results(df_flag, fundamental_df, f"{exchange.lower()}_flag", dirs['flag_out'], dirs['flag_chart'], 'flag_date', config.DATA_DIR if exchange == 'NSE' else config.BSE_DATA_DIR, plot_days=200)
-
-            # Process Stage 2 Tight Flag Results
+            # Flag is an internal 90%-in-45-days candidate gate. Only Tight
+            # Flag candidates receive ranked output, charts, and a watchlist.
             df_tight_flag = pd.DataFrame(rust_dataset['tight_flag_qualified'])
             if not df_tight_flag.empty:
                 df_tight_flag['Exchange'] = exchange
@@ -395,36 +383,11 @@ def main():
         
     results_list = [r for r in results_list if r is not None]
     if not results_list:
-        logging.info("No stocks matched Flag or Tight Flag criteria.")
+        logging.info("No stocks matched the Tight Flag criteria.")
         return
         
     results_all = pd.concat(results_list, ignore_index=True)
     
-    # 1. Process Flag results
-    results_flag = results_all[results_all['is_flag'] == True].copy()
-    if not results_flag.empty:
-        logging.info(f"Found {len(results_flag)} Flag stocks. Generating results and charts...")
-        t_flag_start = time.time()
-        process_results(
-            results_flag, query_df, f"{exchange.lower()}_flag", FLAG_OUT_DIR,
-            FLAG_CHART_DIR, "flag_date", config.DATA_DIR, plot_days=200, eod_data_dict=eod_data_dict
-        )
-        
-        # Save watchlist to OpenTrader Pro database watchlist directory
-        watchlist_dir = config.AMIBROKER_WATCHLIST_DIR
-        if exchange == 'BSE':
-            watchlist_dir = Path('/Users/paresh/.opentrader-pro/databases/BSE_EOD/watchlists')
-        watchlist_dir.mkdir(parents=True, exist_ok=True)
-        
-        watchlist_filepath = watchlist_dir / f"{CURRENT_TIMESTAMP}_flag.txt"
-        with open(watchlist_filepath, 'w') as f:
-            for symbol in results_flag['symbol']:
-                clean_symbol = symbol.replace('_SME', '').upper()
-                f.write(f"{clean_symbol}\n")
-        logging.info(f"Watchlist created: {watchlist_filepath}")
-        logging.info(f"✓ Processed Flag results in {time.time() - t_flag_start:.2f}s")
-        
-    # 2. Process Tight Flag results
     results_tight = results_all[results_all['is_tight_flag'] == True].copy()
     if not results_tight.empty:
         logging.info(f"Found {len(results_tight)} Tight Flag stocks. Generating results and charts...")

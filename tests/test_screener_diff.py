@@ -24,7 +24,7 @@ def run_python_screeners(exchange, max_date=None, logger=print):
     t0 = time.time()
     
     # Run Mark Screener
-    mark_script = BASE_DIR / 'Mark screener_5dbreakout.py'
+    mark_script = BASE_DIR / 'Mark_screener.py'
     cmd_mark = [sys.executable, str(mark_script), '--exchange', exchange]
     if max_date:
         cmd_mark.extend(['--max-date', max_date])
@@ -56,9 +56,7 @@ def run_python_screeners(exchange, max_date=None, logger=print):
         return pd.read_csv(latest)
 
     py_data = {
-        'mark': get_latest_csv(dirs['mark_out']),
         'mark_tight': get_latest_csv(dirs['mark_tight_out']),
-        'flag': get_latest_csv(dirs['flag_out']),
         'tight_flag': get_latest_csv(dirs['tight_flag_out']),
         'time': elapsed,
     }
@@ -118,9 +116,7 @@ def compare_results(py_data, rust_data, exchange):
     print("="*70)
     
     categories = [
-        ('Mark Screener', py_data['mark'], rust_data['mark_qualified'], 'mark_date', 'mark_date'),
         ('Mark Tight Screener', py_data['mark_tight'], rust_data['mark_tight_qualified'], 'mark_tight_date', 'mark_tight_date'),
-        ('Flag Screener', py_data['flag'], rust_data['flag_qualified'], 'flag_date', 'flag_date'),
         ('Tight Flag Screener', py_data['tight_flag'], rust_data['tight_flag_qualified'], 'tight_flag_date', 'tight_flag_date'),
     ]
     

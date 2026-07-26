@@ -96,12 +96,10 @@ def get_output_dirs(exchange: str):
     return {
         'mark_out': out_base / 'mark',
         'mark_tight_out': out_base / 'mark_tight',
-        'flag_out': out_base / 'Flag',
         'tight_flag_out': out_base / 'Tight Flag',
         
         'mark_chart': chart_base / 'mark',
         'mark_tight_chart': chart_base / 'mark_tight',
-        'flag_chart': chart_base / 'Flag',
         'tight_flag_chart': chart_base / 'Tight Flag',
     }
 
