@@ -279,12 +279,10 @@ def _adjust_nse_stocks(meta: dict, data_dir: Path, dates: Dates, logger: logging
                 )
 
             import duckdb
+            from eod_store import replace_symbol_prices
             conn = duckdb.connect(str(config.DUCKDB_FILE))
             try:
-                conn.execute("DELETE FROM eod_data WHERE Symbol = ? AND Exchange = 'NSE'", (sym,))
-                df_insert = df.reset_index()
-                df_insert['Date'] = pd.to_datetime(df_insert['Date']).dt.date
-                conn.execute("INSERT INTO eod_data SELECT * FROM df_insert")
+                replace_symbol_prices(conn, "NSE", sym, df.reset_index())
             finally:
                 conn.close()
 

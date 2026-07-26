@@ -50,6 +50,9 @@ RUST_BINARY = BASE_DIR / 'stock_analysis' / 'target' / 'release' / 'stock_analys
 # listed stock with a shortened indicator window.
 MIN_HISTORY_DAYS = 252
 EMA_PERIOD = 200
+# Keep a little under three years of sessions. It covers every indicator
+# window while bounding the local DuckDB price store.
+EOD_RETAIN_CANDLES = 600
 # Number of most-recent daily candles searched for a Flag pole.  This value is
 # passed to the Rust engine on every run so both implementations use it.
 FLAG_LOOKBACK_DAYS = 90
@@ -112,12 +115,6 @@ AMIBROKER_WATCHLIST_DIR = Path(
 )
 SCREENER_CREDS = BASE_DIR / 'Screener login' / 'screener.txt'
 SCREENER_SCREEN_ID = '3427564'
-
-# ---------------------------------------------------------------------------
-# Strategy parameters (guide §3.1)
-# ---------------------------------------------------------------------------
-# Breakout qualifies if it occurred on ANY of the last N days; N=1 = today-only
-BREAKOUT_WINDOW = 5
 
 # ---------------------------------------------------------------------------
 # Runtime

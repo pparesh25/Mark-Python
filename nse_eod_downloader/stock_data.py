@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import duckdb
 import config
+from eod_store import upsert_daily_prices
 
 STOCK_SERIES = ("EQ", "BE", "BZ", "SM", "ST")
 
@@ -91,11 +92,8 @@ def update_nse_eod(
                 new = row.TckrSymb.upper()
                 isin_dict[row.Index] = row.TckrSymb
                 
-                # Execute rename query in DuckDB using the shared connection
-                conn.execute(
-                    "UPDATE eod_data SET Symbol = ? WHERE ISIN = ? AND Exchange = 'NSE'",
-                    (new, row.Index)
-                )
+                # ``upsert_daily_prices`` moves the retained history using
+                # the stable ISIN before replacing the symbol metadata.
                 logger.warning(f"Name Changed in DuckDB: {old} to {new}")
 
             # Collect parameters to append
@@ -127,7 +125,7 @@ def update_nse_eod(
             df_insert = pd.DataFrame(insert_rows, columns=[
                 'Date', 'Symbol', 'Exchange', 'ISIN', 'Open', 'High', 'Low', 'Close', 'Volume', 'Series', 'Total_Trades', 'Qty_Per_Trade', 'Dlv_Qty'
             ])
-            conn.execute("INSERT OR IGNORE INTO eod_data SELECT * FROM df_insert")
+            upsert_daily_prices(conn, df_insert)
 
         conn.execute("COMMIT")
     except Exception as e:
@@ -179,13 +177,11 @@ def update_nse_symbol(
         qty_per_trade = round(vol / total_trades, 2) if total_trades and total_trades > 0 else None
         dlv_qty = int(delivered) if not is_nan(delivered) else None
         
-        conn.execute("""
-            INSERT OR IGNORE INTO eod_data 
-            (Date, Symbol, Exchange, ISIN, Open, High, Low, Close, Volume, Series, Total_Trades, Qty_Per_Trade, Dlv_Qty)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            date_val, symbol, 'NSE', isin_code, open_p, high_p, low_p, close_p, vol, series, total_trades, qty_per_trade, dlv_qty
-        ))
+        upsert_daily_prices(conn, pd.DataFrame([{
+            "Date": date_val, "Symbol": symbol, "Exchange": "NSE", "ISIN": isin_code,
+            "Open": open_p, "High": high_p, "Low": low_p, "Close": close_p,
+            "Volume": vol, "Series": series,
+        }]))
     finally:
         if should_close:
             conn.close()

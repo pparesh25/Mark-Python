@@ -162,10 +162,8 @@ def _make_adjustment(
         # Write back to DuckDB
         conn = duckdb.connect(str(config.DUCKDB_FILE))
         try:
-            conn.execute("DELETE FROM eod_data WHERE Symbol = ? AND Exchange = 'BSE'", (sym,))
-            df_insert = df.reset_index()
-            df_insert['Date'] = pd.to_datetime(df_insert['Date']).dt.date
-            conn.execute("INSERT INTO eod_data SELECT * FROM df_insert")
+            from eod_store import replace_symbol_prices
+            replace_symbol_prices(conn, "BSE", sym, df.reset_index())
         finally:
             conn.close()
         break

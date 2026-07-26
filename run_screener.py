@@ -29,11 +29,13 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import config
+from screening_readiness import LocalDataError, inspect_eod_readiness, rebase_sync_cursor
 from config import (
     BASE_DIR, FUNDAMENTAL_FILE, OUT_DIR,
-    BREAKOUT_WINDOW, CURRENT_TIMESTAMP,
+    CURRENT_TIMESTAMP, EOD_RETAIN_CANDLES,
 )
 
 # Screener module executed in Step 3 (filename has a space — quoted via Path).
@@ -241,61 +243,78 @@ def main():
     width = 64
     logger.info(color('═' * width, 'CYAN'))
     logger.info(color('  Mark Screener — Unified Pipeline', 'BOLD'))
-    logger.info(color(f'  Breakout window: {BREAKOUT_WINDOW} day(s)   |   '
+    logger.info(color(f'  Mark Tight + Tight Flag   |   {EOD_RETAIN_CANDLES} candles retained   |   '
                       f'run: {CURRENT_TIMESTAMP}   |   log: {config.LOG_FILE.name}',
                       'CYAN'))
     logger.info(color('═' * width, 'CYAN'))
 
-    # --- Step 1: eod2 database update -------------------------------------
+    # --- Step 1: EOD update only when a locally eligible session is missing
     logger.info(color("▶ Step 1/4: EOD Data Update (eod2)", 'BOLD'))
-    logger.info(color("  Starting NSE EOD download and adjustment in Python...", 'CYAN'))
-    t0 = time.time()
-    t_nse_start = time.time()
     try:
-        from nse_eod_downloader import eod_downloader
-        success_nse = eod_downloader.sync_database(
-            config.DATA_DIR,
-            logger,
-            metadata_dir=config.EOD_METADATA_DIR,
-            daily_bhavcopy_dir=config.DAILY_BHAVCOPY_DIR
+        readiness = inspect_eod_readiness(
+            config.DUCKDB_FILE,
+            config.EOD_METADATA_DIR,
+            datetime.now(ZoneInfo("Asia/Kolkata")),
         )
-    except Exception as e:
-        logger.error(color(f"  ✗ Failed to execute NSE EOD update in Python: {e}", 'RED'))
+    except LocalDataError as error:
+        logger.error(color(f"  ✗ Local EOD data is not usable: {error}", 'RED'))
         sys.exit(1)
-        
-    elapsed_nse = time.time() - t_nse_start
-    if not success_nse:
-        logger.error(color(f"  ✗ NSE EOD update FAILED after {elapsed_nse:.1f}s", 'RED'))
-        sys.exit(1)
-    logger.info(color(f"  ✓ NSE EOD update completed in {elapsed_nse:.1f}s", 'GREEN'))
-        
-    logger.info(color("  Starting BSE EOD download and adjustment in Python...", 'CYAN'))
-    t_bse_start = time.time()
-    try:
-        from bse_eod_downloader import eod_downloader as bse_eod_downloader
-        success_bse = bse_eod_downloader.sync_database(
-            config.BSE_DATA_DIR,
-            logger,
-            metadata_dir=config.EOD_METADATA_DIR,
-            daily_bhavcopy_dir=config.BSE_DAILY_BHAVCOPY_DIR
-        )
-    except Exception as e:
-        logger.error(color(f"  ✗ Failed to execute BSE EOD update in Python: {e}", 'RED'))
-        sys.exit(1)
-        
-    elapsed_bse = time.time() - t_bse_start
-    if not success_bse:
-        logger.error(color(f"  ✗ BSE EOD update FAILED after {elapsed_bse:.1f}s", 'RED'))
-        sys.exit(1)
-    logger.info(color(f"  ✓ BSE EOD update completed in {elapsed_bse:.1f}s", 'GREEN'))
-        
-    elapsed = time.time() - t0
-    logger.info(color(f"  ✓ Total EOD update completed in {elapsed:.1f}s", 'GREEN'))
+
+    as_of = ", ".join(f"{exchange}={value:%Y-%m-%d}" for exchange, value in readiness.as_of_dates.items())
+    logger.info(f"  Local EOD as-of: {as_of}; eligible target: {readiness.target_date:%Y-%m-%d}")
+    if readiness.needs_update:
+        logger.info(color("  Missing eligible EOD session; starting NSE/BSE update...", 'CYAN'))
+        if rebase_sync_cursor(config.EOD_METADATA_DIR / "meta.json", readiness.as_of_dates["NSE"]):
+            logger.info("  NSE sync cursor rebased to the actual local EOD date.")
+        if rebase_sync_cursor(config.EOD_METADATA_DIR / "bse_meta.json", readiness.as_of_dates["BSE"]):
+            logger.info("  BSE sync cursor rebased to the actual local EOD date.")
+        t0 = time.time()
+        try:
+            from nse_eod_downloader import eod_downloader
+            success_nse = eod_downloader.sync_database(
+                config.DATA_DIR, logger, metadata_dir=config.EOD_METADATA_DIR,
+                daily_bhavcopy_dir=config.DAILY_BHAVCOPY_DIR,
+            )
+        except Exception as error:
+            logger.warning(f"  NSE EOD update unavailable: {error}")
+            success_nse = False
+        try:
+            from bse_eod_downloader import eod_downloader as bse_eod_downloader
+            success_bse = bse_eod_downloader.sync_database(
+                config.BSE_DATA_DIR, logger, metadata_dir=config.EOD_METADATA_DIR,
+                daily_bhavcopy_dir=config.BSE_DAILY_BHAVCOPY_DIR,
+            )
+        except Exception as error:
+            logger.warning(f"  BSE EOD update unavailable: {error}")
+            success_bse = False
+
+        try:
+            after_update = inspect_eod_readiness(
+                config.DUCKDB_FILE,
+                config.EOD_METADATA_DIR,
+                datetime.now(ZoneInfo("Asia/Kolkata")),
+            )
+        except LocalDataError as error:
+            logger.error(color(f"  ✗ Local EOD data became unusable: {error}", 'RED'))
+            sys.exit(1)
+        readiness = after_update
+        if not success_nse or not success_bse or after_update.needs_update:
+            fallback_as_of = ", ".join(
+                f"{exchange}={value:%Y-%m-%d}" for exchange, value in after_update.as_of_dates.items()
+            )
+            logger.warning(
+                "  EOD update incomplete/unavailable; continuing on local data "
+                f"({fallback_as_of}; target {after_update.target_date:%Y-%m-%d})."
+            )
+        else:
+            logger.info(color(f"  ✓ EOD update completed in {time.time() - t0:.1f}s", 'GREEN'))
+    else:
+        logger.info(color("  ✓ Local EOD is current for this run; network update skipped.", 'GREEN'))
 
     # --- Step 2: fundamentals download ------------------------------------
     logger.info(color("▶ Step 2/4: Fundamental Data Download (screener.in)", 'BOLD'))
     if FUNDAMENTAL_FILE.exists():
-        logger.info(color(f"  ✓ Fundamentals file for today already exists: {FUNDAMENTAL_FILE.name}", 'GREEN'))
+        logger.info(color(f"  ✓ Using local fundamentals file: {FUNDAMENTAL_FILE.name}", 'GREEN'))
         logger.info(color("  Skipping browser download process.", 'CYAN'))
     else:
         logger.info(color("  Starting Selenium browser automation directly from Python...", 'CYAN'))
@@ -337,6 +356,16 @@ def main():
             sys.exit(1)
 
     validate_fundamentals(logger)
+
+    screening_as_of = min(readiness.as_of_dates.values())
+    freshness = "local fallback" if readiness.needs_update else "current eligible local data"
+    logger.info(
+        color(
+            f"  Screening as-of: {screening_as_of:%Y-%m-%d} ({freshness}; "
+            f"target {readiness.target_date:%Y-%m-%d})",
+            'CYAN',
+        )
+    )
 
     # --- Step 3: screening ------------------------------------------------
     run_screening(logger, include_sme=args.include_sme, only_sme=args.only_sme)

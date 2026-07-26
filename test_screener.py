@@ -22,9 +22,8 @@ def test_duckdb_file_exists():
     # Test query
     conn = duckdb.connect(str(db_file), read_only=True)
     try:
-        tables = conn.execute("SHOW TABLES").fetchall()
-        table_names = [t[0] for t in tables]
-        assert "eod_data" in table_names, "eod_data table not found in database"
+        # Compact schema provides eod_data as a compatibility view.
+        conn.execute("SELECT 1 FROM eod_data LIMIT 1")
         
         # Check that we can fetch some rows
         row_count = conn.execute("SELECT count(*) FROM eod_data").fetchone()[0]

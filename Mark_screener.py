@@ -1,4 +1,4 @@
-"""Mark Screener with 5-day breakout window + Priority Score using DuckDB database."""
+"""Mark Tight screener using the compact DuckDB price store."""
 
 import argparse
 import logging
