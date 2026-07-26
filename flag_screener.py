@@ -130,7 +130,7 @@ def check_flag_patterns(df):
 
 def process_symbol_data(args_tuple):
     symbol, df = args_tuple
-    if df is None or len(df) < 50:
+    if df is None or len(df) < config.MIN_HISTORY_DAYS:
         return None
 
     try:
@@ -150,36 +150,38 @@ def process_symbol_data(args_tuple):
             last_close = closes[-1]
             last_low = lows[-1]
 
-        # Mechanical Hard Filter 1: Price Floor >= Rs 5.0
-        if last_low < 5.0:
-            return None
-
-        # Moving averages & 52W high
+        # Tight Flag indicators use full, non-shortened windows.
         n = len(closes)
-        ema_200 = ta.EMA(closes, timeperiod=min(200, max(5, n-1)))
-        period_52w = min(252, n)
-        high_52w = ta.MAX(highs, timeperiod=period_52w)
+        ema_200 = ta.EMA(closes, timeperiod=config.EMA_PERIOD)
+        high_52w = ta.MAX(highs, timeperiod=config.MIN_HISTORY_DAYS)
 
         last_ema200 = ema_200[-1]
         last_52w_high = high_52w[-1]
 
-        # Mechanical Hard Filter 2: Stage 2 Uptrend (Close > EMA 200)
-        if not np.isnan(last_ema200) and last_close < last_ema200:
-            return None
-
-        # Mechanical Hard Filter 3: 52W High Proximity (Dist <= 45%)
-        if last_52w_high > 0:
-            dist_52w = (last_52w_high - last_close) / last_52w_high * 100
-            if dist_52w > 45.0:
-                return None
-
-        df_screening = df[-90:] if isinstance(df, pl.DataFrame) else df.tail(90).copy()
+        df_screening = df.tail(config.FLAG_LOOKBACK_DAYS)
+        if not isinstance(df_screening, pl.DataFrame):
+            df_screening = df_screening.copy()
         (is_flag, flag_date, flag_start_date, flag_peak_date,
          is_tight_flag, tight_flag_date, tight_start_date,
          tight_peak_date, breakout_date) = check_flag_patterns(df_screening)
         
         if not is_flag and not is_tight_flag:
             return None
+
+        # Flag is only the 90%-in-45-days pattern.  All quality gates belong
+        # exclusively to Tight Flag and must be satisfiable with full windows.
+        if is_tight_flag:
+            dist_52w = ((last_52w_high - last_close) / last_52w_high * 100
+                         if last_52w_high > 0 else float('inf'))
+            if (last_close < 5.0
+                    or np.isnan(last_ema200)
+                    or last_close < last_ema200
+                    or dist_52w > 45.0):
+                is_tight_flag = False
+                tight_flag_date = None
+                tight_start_date = None
+                tight_peak_date = None
+                breakout_date = None
 
         res_dict = {
             'symbol': symbol,
@@ -221,36 +223,39 @@ def main():
     if getattr(config, "USE_RUST_CALCULATION", False):
         import subprocess
         import json
-        rust_bin = config.BASE_DIR / 'stock_analysis' / 'stock_analysis'
+        rust_bin = config.RUST_BINARY
         out_temp = config.OUT_DIR / exchange
         out_temp.mkdir(parents=True, exist_ok=True)
         json_path = out_temp / f"{exchange}_rust_screened.json"
+        rust_succeeded = False
 
-        # Check if single-pass Rust engine already executed for this exchange during Step 3
-        if not json_path.exists():
-            if rust_bin.exists():
-                logging.info(f"▶ Mode 1: Executing High-Speed Rust Screener for {exchange}...")
-                t0_rust = time.time()
-                cmd = [
-                    str(rust_bin),
-                    "screen",
-                    str(config.DUCKDB_FILE),
-                    str(config.FUNDAMENTAL_FILE),
-                    exchange,
-                    str(out_temp)
-                ]
-                if max_date:
-                    cmd.append(max_date)
-                if include_sme:
-                    cmd.append("--include-sme")
-                if only_sme:
-                    cmd.append("--only-sme")
+        # Always run with this invocation's filters.  Reusing a previous JSON
+        # could silently apply the wrong SME selection.
+        if rust_bin.exists():
+            logging.info(f"▶ Mode 1: Executing High-Speed Rust Screener for {exchange}...")
+            cmd = [
+                str(rust_bin),
+                "screen",
+                str(config.DUCKDB_FILE),
+                str(config.FUNDAMENTAL_FILE),
+                exchange,
+                str(out_temp)
+            ]
+            if max_date:
+                cmd.append(max_date)
+            cmd.extend(["--flag-lookback", str(config.FLAG_LOOKBACK_DAYS)])
+            if include_sme:
+                cmd.append("--include-sme")
+            if only_sme:
+                cmd.append("--only-sme")
 
-                res = subprocess.run(cmd, capture_output=True, text=True)
-                if res.returncode != 0:
-                    logging.error(f"Rust pipeline error: {res.stderr}\nFalling back to Python mode...")
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                logging.error(f"Rust pipeline error: {res.stderr}\nFalling back to Python mode...")
+            else:
+                rust_succeeded = True
 
-        if json_path.exists():
+        if rust_succeeded and json_path.exists():
             logging.info(f"✓ Processing Rust Flag screening results for {exchange}...")
             with open(json_path, 'r', encoding='utf-8') as f:
                 rust_dataset = json.load(f)

@@ -68,7 +68,7 @@ def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date
     # Try Rust charting if enabled
     if getattr(config, "USE_RUST_CHARTS", False):
         import subprocess
-        rust_bin = config.BASE_DIR / 'stock_analysis' / 'stock_analysis'
+        rust_bin = config.RUST_BINARY
         if rust_bin.exists():
             temp_csv = config.BASE_DIR / f'temp_chart_tasks_{suffix}.csv'
             try:
@@ -117,4 +117,3 @@ def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date
     elapsed_charts = time.time() - t0_charts
     logging.info(f"✓ Generated {len(df_sorted)} charts for {suffix} in {elapsed_charts:.2f}s")
     return df_sorted
-

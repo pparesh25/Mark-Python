@@ -192,10 +192,19 @@ def validate_fundamentals(logger):
 # ---------------------------------------------------------------------------
 FLAG_SCREENER_MODULE = BASE_DIR / 'flag_screener.py'
 
-def run_screening(logger):
+def run_screening(logger, include_sme=False, only_sme=False):
     """Execute Mark screener_5dbreakout.py as a subprocess for NSE and BSE."""
-    success_nse = run_step("Step 3/4: NSE Stock Screening", [sys.executable, "-u", str(SCREENER_MODULE), "--exchange", "NSE"], logger)
-    success_bse = run_step("Step 3/4: BSE Stock Screening", [sys.executable, "-u", str(SCREENER_MODULE), "--exchange", "BSE"], logger)
+    cmd_nse = [sys.executable, "-u", str(SCREENER_MODULE), "--exchange", "NSE"]
+    cmd_bse = [sys.executable, "-u", str(SCREENER_MODULE), "--exchange", "BSE"]
+    if include_sme:
+        cmd_nse.append("--include-sme")
+        cmd_bse.append("--include-sme")
+    if only_sme:
+        cmd_nse.append("--only-sme")
+        cmd_bse.append("--only-sme")
+
+    success_nse = run_step("Step 3/4: NSE Stock Screening", cmd_nse, logger)
+    success_bse = run_step("Step 3/4: BSE Stock Screening", cmd_bse, logger)
     return success_nse and success_bse
 
 
@@ -330,7 +339,7 @@ def main():
     validate_fundamentals(logger)
 
     # --- Step 3: screening ------------------------------------------------
-    run_screening(logger)
+    run_screening(logger, include_sme=args.include_sme, only_sme=args.only_sme)
 
     # --- Step 4: flag screening -------------------------------------------
     run_flag_screening(logger, include_sme=args.include_sme, only_sme=args.only_sme)

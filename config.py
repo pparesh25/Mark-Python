@@ -43,6 +43,16 @@ BSE_ONLY_STOCKS = True
 # Mode 3 (Pure Python): USE_RUST_CALCULATION = False, USE_RUST_CHARTS = False
 USE_RUST_CALCULATION = True
 USE_RUST_CHARTS = True
+RUST_BINARY = BASE_DIR / 'stock_analysis' / 'target' / 'release' / 'stock_analysis'
+
+# All strategies require a full year of daily price history.  The same values
+# are mirrored in the Rust screener so neither engine can qualify a newly
+# listed stock with a shortened indicator window.
+MIN_HISTORY_DAYS = 252
+EMA_PERIOD = 200
+# Number of most-recent daily candles searched for a Flag pole.  This value is
+# passed to the Rust engine on every run so both implementations use it.
+FLAG_LOOKBACK_DAYS = 90
 
 # Fundamentals (all-company.csv) are downloaded fresh into the project's own
 # fundamental_files/ folder, timestamped per run.

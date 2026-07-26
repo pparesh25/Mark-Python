@@ -25,9 +25,13 @@ start_time = time.time()
 parser = argparse.ArgumentParser()
 parser.add_argument('--exchange', type=str, default='NSE', choices=['NSE', 'BSE'])
 parser.add_argument('--max-date', type=str, default=None)
+parser.add_argument('--include-sme', action='store_true', help="Include SME stocks in screening")
+parser.add_argument('--only-sme', action='store_true', help="Screen ONLY SME stocks")
 args = parser.parse_args()
 exchange = args.exchange.upper()
 max_date = args.max_date
+include_sme = args.include_sme
+only_sme = args.only_sme
 
 dirs = config.get_output_dirs(exchange)
 MARK_OUT_DIR = dirs['mark_out']
@@ -43,7 +47,7 @@ config.ensure_dirs()
 def process_symbol_data(args_tuple):
     symbol, df_sym = args_tuple
     try:
-        if len(df_sym) < 10:
+        if len(df_sym) < config.MIN_HISTORY_DAYS:
             return None
             
         df = df_sym.copy()
@@ -55,8 +59,8 @@ def process_symbol_data(args_tuple):
         df['EMA_150'] = ta.EMA(df['close'], timeperiod=150).round(2)
         df['EMA_200'] = ta.EMA(df['close'], timeperiod=200).round(2)
         
-        # 52-week high / low (fallback to max available days if history is slightly less than 252)
-        period_52w = min(252, len(df))
+        # A full 52-week history is mandatory for every qualified strategy.
+        period_52w = config.MIN_HISTORY_DAYS
         df['52 week high'] = ta.MAX(df['high'], timeperiod=period_52w)
         df['52 week low'] = ta.MIN(df['low'], timeperiod=period_52w)
         
@@ -122,7 +126,7 @@ def main():
     if getattr(config, "USE_RUST_CALCULATION", False):
         import subprocess
         import json
-        rust_bin = config.BASE_DIR / 'stock_analysis' / 'stock_analysis'
+        rust_bin = config.RUST_BINARY
         if rust_bin.exists():
             logging.info(f"▶ Mode 1: Executing High-Speed Rust Screener for {exchange}...")
             t0_rust = time.time()
@@ -139,6 +143,11 @@ def main():
             ]
             if max_date:
                 cmd.append(max_date)
+            cmd.extend(["--flag-lookback", str(config.FLAG_LOOKBACK_DAYS)])
+            if include_sme:
+                cmd.append("--include-sme")
+            if only_sme:
+                cmd.append("--only-sme")
 
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode == 0:
@@ -233,6 +242,12 @@ def main():
                 df_symbols = bse_symbols_db
     finally:
         conn.close()
+
+    symbol_is_sme = df_symbols['Symbol'].astype(str).str.strip().str.upper().str.endswith('_SME')
+    if only_sme:
+        df_symbols = df_symbols[symbol_is_sme].copy()
+    elif not include_sme:
+        df_symbols = df_symbols[~symbol_is_sme].copy()
     logging.info(f"✓ Retrieved valid symbols list in {time.time() - t_symbols_start:.2f}s")
         
     if df_symbols.empty:
