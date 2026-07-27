@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
-import time
-import os
-import re
+import hashlib
 import zipfile
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from io import BytesIO, StringIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -98,8 +95,10 @@ def _download_corporate_actions(
     r = requests.get(url, headers=headers, params=params, timeout=15)
     
     if r.status_code != 200 or not r.text.strip():
-        logger.warning("Failed to retrieve corporate actions from API. Sync continuing without adjustments.")
-        return pd.DataFrame()
+        raise RuntimeError(
+            f"BSE corporate-action API returned HTTP {r.status_code} "
+            "without usable data"
+        )
         
     df = pd.read_csv(StringIO(r.text))
     
@@ -133,43 +132,130 @@ def _make_adjustment(
     data_dir: Path,
     dates: Dates,
     logger: logging.Logger,
-) -> None:
+    action_key: str,
+) -> tuple[str, str | None, int]:
+    """Apply one action once and synchronize its text backup."""
+    import duckdb
+    from bse_eod_downloader.stock_data import sync_adjusted_text_prices
+
+    conn = duckdb.connect(str(config.DUCKDB_FILE))
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bse_corporate_action_ledger (
+            Action_Key VARCHAR NOT NULL,
+            Ex_Date DATE NOT NULL,
+            Symbol VARCHAR NOT NULL,
+            Factor DOUBLE NOT NULL,
+            Rows_Adjusted BIGINT NOT NULL,
+            Applied_At TIMESTAMP NOT NULL
+        )
+        """
+    )
+    already_applied = conn.execute(
+        """
+        SELECT Symbol, Rows_Adjusted
+        FROM bse_corporate_action_ledger
+        WHERE Action_Key = ?
+        LIMIT 1
+        """,
+        [action_key],
+    ).fetchone()
+    if already_applied:
+        adjusted = conn.execute(
+            """
+            SELECT *
+            FROM eod_data
+            WHERE Symbol = ? AND Exchange = 'BSE'
+            ORDER BY Date
+            """,
+            [already_applied[0]],
+        ).fetchdf()
+        conn.close()
+        if not adjusted.empty:
+            sync_adjusted_text_prices(
+                data_dir, already_applied[0], adjusted
+            )
+        logger.info(
+            f"BSE Corporate Action already applied; synchronized text backup: "
+            f"{already_applied[0]} on {dates.pandasDt}"
+        )
+        return "already_applied", already_applied[0], int(already_applied[1])
+
     # Try normal symbol, then SME symbol
-    for sym_suffix in ("", "_SME"):
-        sym = f"{symbol.upper()}{sym_suffix}"
-        import duckdb
-        conn = duckdb.connect(str(config.DUCKDB_FILE))
-        try:
+    try:
+        for sym_suffix in ("", "_SME"):
+            sym = f"{symbol.upper()}{sym_suffix}"
             df = conn.execute("SELECT * FROM eod_data WHERE Symbol = ? AND Exchange = 'BSE'", (sym,)).fetchdf()
-        finally:
-            conn.close()
 
-        if df.empty:
-            continue
+            if df.empty:
+                continue
 
-        logger.info(f"BSE Adjusting in DuckDB: {sym} by factor {adjustmentFactor:.4f}")
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.set_index("Date")
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index("Date")
 
-        # Remove timezone info as DataFrame index is not timezone aware
-        dt = dates.dt.replace(tzinfo=None)
+            # Remove timezone info as DataFrame index is not timezone aware
+            dt = dates.dt.replace(tzinfo=None)
+            mask_before = df.index < dt
+            rows_adjusted = int(mask_before.sum())
+            if rows_adjusted == 0:
+                logger.warning(
+                    f"BSE Corporate Action found {sym}, but it has no price "
+                    f"history before {dates.pandasDt}"
+                )
+                return "no_prior_history", sym, 0
 
-        # Use boolean masking to adjust prices before Ex Date in-place
-        mask_before = df.index < dt
-        for col in ("Open", "High", "Low", "Close"):
-            df.loc[mask_before, col] = ((df.loc[mask_before, col] / adjustmentFactor / 0.05).round() * 0.05).round(2)
+            logger.info(
+                f"BSE Adjusting in DuckDB: {sym} by factor "
+                f"{adjustmentFactor:.4f} ({rows_adjusted} prior rows)"
+            )
+            for col in ("Open", "High", "Low", "Close"):
+                df.loc[mask_before, col] = (
+                    (df.loc[mask_before, col] / adjustmentFactor / 0.05).round()
+                    * 0.05
+                ).round(2)
 
-        # Write back to DuckDB
-        conn = duckdb.connect(str(config.DUCKDB_FILE))
-        try:
+            conn.execute("BEGIN TRANSACTION")
             from eod_store import replace_symbol_prices
-            replace_symbol_prices(conn, "BSE", sym, df.reset_index())
-        finally:
-            conn.close()
-        break
+            adjusted = df.reset_index()
+            replace_symbol_prices(conn, "BSE", sym, adjusted)
+            conn.execute(
+                """
+                INSERT INTO bse_corporate_action_ledger
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                [
+                    action_key,
+                    dates.dt.date(),
+                    sym,
+                    adjustmentFactor,
+                    rows_adjusted,
+                ],
+            )
+            conn.execute("COMMIT")
+            sync_adjusted_text_prices(data_dir, sym, adjusted)
+            return "applied", sym, rows_adjusted
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+    logger.warning(
+        f"BSE Corporate Action symbol not found in price history: "
+        f"{symbol.upper()} on {dates.pandasDt}"
+    )
+    return "symbol_not_found", None, 0
 
 
-def _adjust_bse_stocks(actions_df: pd.DataFrame, data_dir: Path, dates: Dates, logger: logging.Logger):
+def _adjust_bse_stocks(
+    actions_df: pd.DataFrame,
+    data_dir: Path,
+    dates: Dates,
+    logger: logging.Logger,
+):
     """Adjust stock files for splits/bonuses on the Ex Date."""
     dt_today = dates.dt.replace(tzinfo=None)
     
@@ -185,18 +271,43 @@ def _adjust_bse_stocks(actions_df: pd.DataFrame, data_dir: Path, dates: Dates, l
         purpose = str(row["Purpose"]).lower()
         remarks = str(row.get("Detail/Remarks", "")).lower()
         symbol = str(row["Security Name"]).strip()
+        action_type = None
+        adjustmentFactor = None
 
         # BSE lists splits and bonuses in Purpose
         if "split" in purpose or "sub-division" in purpose:
+            action_type = "split"
             adjustmentFactor = _get_split(symbol, purpose + " " + remarks, logger)
-            if adjustmentFactor:
-                _make_adjustment(symbol, adjustmentFactor, data_dir, dates, logger)
 
         elif "bonus" in purpose:
-            # Reconstruct ratio
+            action_type = "bonus"
             adjustmentFactor = _get_bonus(symbol, purpose + " " + remarks, logger)
-            if adjustmentFactor:
-                _make_adjustment(symbol, adjustmentFactor, data_dir, dates, logger)
+
+        if action_type is None:
+            continue
+
+        action_key_source = "|".join(
+            [code, dates.pandasDt, str(row["Purpose"]).strip()]
+        )
+        action_key = hashlib.sha256(
+            action_key_source.encode("utf-8")
+        ).hexdigest()
+        if adjustmentFactor:
+            status, _, rows_adjusted = _make_adjustment(
+                symbol,
+                adjustmentFactor,
+                data_dir,
+                dates,
+                logger,
+                action_key=action_key,
+            )
+        else:
+            status, rows_adjusted = "factor_not_parsed", 0
+        logger.info(
+            f"BSE Corporate Action: {symbol} {action_type} "
+            f"factor={adjustmentFactor} status={status} "
+            f"rows={rows_adjusted}"
+        )
 
 
 def sync_database(
@@ -230,7 +341,6 @@ def sync_database(
     logger.info(f"BSE Database sync starting. Last update: {dates.pandasDt}")
 
     # Determine date range to download corporate actions
-    temp_dir = Path("/tmp/bse_actions")
     actions_df = pd.DataFrame()
     
     # Check if we have days to sync
@@ -250,12 +360,26 @@ def sync_database(
     if has_days_to_sync:
         try:
             actions_df = _download_corporate_actions(
-                start_date=dates.dt,
+                start_date=dates.dt + timedelta(days=1),
                 end_date=datetime.now(tz_IN),
                 logger=logger
             )
+            relevant_actions = actions_df["Purpose"].astype(str).str.contains(
+                "split|sub-division|bonus",
+                case=False,
+                regex=True,
+                na=False,
+            ).sum() if not actions_df.empty else 0
+            logger.info(
+                f"BSE Corporate Action download summary: {len(actions_df)} total, "
+                f"{relevant_actions} split/bonus actions"
+            )
         except Exception as e:
-            logger.error(f"Failed to download BSE corporate actions: {e}. Sync continuing without adjustments.")
+            logger.error(
+                f"Failed to download BSE corporate actions: {e}. "
+                f"Sync stopped so its checkpoint cannot skip adjustments."
+            )
+            return False
 
     # Main Day-by-Day Loop
     session = requests.Session()
@@ -288,6 +412,7 @@ def sync_database(
                 _adjust_bse_stocks(actions_df, data_dir, dates, logger)
             except Exception as e:
                 logger.error(f"Error applying corporate actions for {dates.pandasDt}: {e}")
+                return False
 
         # Step 2: Download Bhavcopy & Deliverables
         bhav_date_str = dates.pandasDt.replace("-", "")

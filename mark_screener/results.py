@@ -11,7 +11,6 @@ import pandas as pd
 
 import config
 from config import CURRENT_TIMESTAMP
-from .charts import plot_save_chart
 from .scoring import add_priority_score
 
 
@@ -105,6 +104,11 @@ def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date
             logging.warning(f"Rust binary not found at {rust_bin}. Falling back to Python charting...")
 
     # Fallback / Default Python Charting
+    # Matplotlib and mplfinance are expensive imports.  Keep them out of the
+    # normal Rust-backed pipeline and import the Python renderer only if the
+    # Rust chart command is unavailable or fails.
+    from .charts import plot_save_chart
+
     # Prepare task arguments, passing the pre-loaded EOD DataFrame if available
     tasks = []
     for _, row in df_sorted.iterrows():

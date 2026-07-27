@@ -226,6 +226,30 @@ def run_flag_screening(logger, include_sme=False, only_sme=False):
     return success_nse and success_bse
 
 
+def run_all_screening(logger, include_sme=False, only_sme=False):
+    """Use the combined Rust fast path, retaining the legacy fallback."""
+    if getattr(config, "USE_RUST_CALCULATION", False) and config.RUST_BINARY.exists():
+        from mark_screener.fast_pipeline import run_fast_screening
+
+        logger.info(color(
+            "▶ Steps 3-4/4: Combined NSE/BSE Mark Tight + Tight Flag Screening",
+            "BOLD",
+        ))
+        try:
+            if run_fast_screening(
+                logger,
+                include_sme=include_sme,
+                only_sme=only_sme,
+            ):
+                return
+        except Exception as error:
+            logger.error(f"  Combined Rust screening failed: {error}")
+            logger.warning("  Falling back to the legacy per-screener pipeline.")
+
+    run_screening(logger, include_sme=include_sme, only_sme=only_sme)
+    run_flag_screening(logger, include_sme=include_sme, only_sme=only_sme)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -367,11 +391,12 @@ def main():
         )
     )
 
-    # --- Step 3: screening ------------------------------------------------
-    run_screening(logger, include_sme=args.include_sme, only_sme=args.only_sme)
-
-    # --- Step 4: flag screening -------------------------------------------
-    run_flag_screening(logger, include_sme=args.include_sme, only_sme=args.only_sme)
+    # --- Steps 3 & 4: screening -------------------------------------------
+    run_all_screening(
+        logger,
+        include_sme=args.include_sme,
+        only_sme=args.only_sme,
+    )
 
     # --- Summary ----------------------------------------------------------
     total = time.time() - workflow_start

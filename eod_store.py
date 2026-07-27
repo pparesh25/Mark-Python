@@ -86,6 +86,42 @@ def _trim_symbols(conn, exchange: str, symbols: pd.Series, retain_candles: int) 
         conn.unregister("retention_symbols")
 
 
+def _deduplicate_symbols(conn, exchange: str, symbols: pd.Series) -> None:
+    """Collapse rename collisions to one row per symbol/date.
+
+    A renamed ISIN can move old history onto a ticker that already has price
+    rows.  Prefer the more liquid row for an overlapping date so the compact
+    store remains deterministic and its text backup can mirror it exactly.
+    """
+    symbol_frame = pd.DataFrame({"Symbol": symbols.dropna().astype(str).unique()})
+    if symbol_frame.empty:
+        return
+    conn.register("deduplicate_symbols", symbol_frame)
+    try:
+        conn.execute(
+            """
+            DELETE FROM eod_prices
+            WHERE rowid IN (
+                SELECT rowid
+                FROM (
+                    SELECT p.rowid,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY p.Symbol, p.Date
+                               ORDER BY COALESCE(p.Volume, 0) DESC, p.rowid DESC
+                           ) AS duplicate_rank
+                    FROM eod_prices p
+                    JOIN deduplicate_symbols ds ON ds.Symbol = p.Symbol
+                    WHERE p.Exchange = ?
+                )
+                WHERE duplicate_rank > 1
+            )
+            """,
+            [exchange],
+        )
+    finally:
+        conn.unregister("deduplicate_symbols")
+
+
 def upsert_daily_prices(conn, rows: pd.DataFrame, retain_candles: int = RETAIN_CANDLES) -> None:
     """Upsert one exchange's daily rows and retain only its newest candles."""
     required = set(PRICE_COLUMNS + ["ISIN", "Series"])
@@ -138,6 +174,22 @@ def upsert_daily_prices(conn, rows: pd.DataFrame, retain_candles: int = RETAIN_C
              WHERE s.Exchange = i.Exchange AND s.ISIN = i.ISIN
             """
         )
+        # Splits can change an ISIN without changing the ticker.  The fact
+        # table is keyed by ticker, so retain exactly the current ISIN metadata
+        # for every symbol present in this batch.  Keeping both the old and new
+        # ISIN would multiply every price row through the eod_data join.
+        conn.execute(
+            """
+            DELETE FROM securities s
+             USING (
+                    SELECT DISTINCT Exchange, Symbol, ISIN
+                    FROM incoming_prices
+                   ) i
+             WHERE s.Exchange = i.Exchange
+               AND s.Symbol = i.Symbol
+               AND s.ISIN <> i.ISIN
+            """
+        )
         conn.execute(
             """
             INSERT INTO securities (Exchange, Symbol, ISIN, Series)
@@ -149,8 +201,25 @@ def upsert_daily_prices(conn, rows: pd.DataFrame, retain_candles: int = RETAIN_C
             WHERE NOT EXISTS (
                 SELECT 1
                 FROM securities s
-                WHERE s.Exchange = i.Exchange AND s.ISIN = i.ISIN
+                WHERE s.Exchange = i.Exchange
+                  AND (s.ISIN = i.ISIN OR s.Symbol = i.Symbol)
             )
+            """
+        )
+        conn.execute(
+            """
+            UPDATE eod_prices p
+               SET Open = i.Open,
+                   High = i.High,
+                   Low = i.Low,
+                   Close = i.Close,
+                   Volume = i.Volume
+              FROM incoming_prices i
+              JOIN securities s
+                ON s.Exchange = i.Exchange AND s.ISIN = i.ISIN
+             WHERE p.Date = i.Date
+               AND p.Symbol = s.Symbol
+               AND p.Exchange = i.Exchange
             """
         )
         conn.execute(
@@ -170,6 +239,7 @@ def upsert_daily_prices(conn, rows: pd.DataFrame, retain_candles: int = RETAIN_C
             )
             """
         )
+        _deduplicate_symbols(conn, exchange, incoming["Symbol"])
         _trim_symbols(conn, exchange, incoming["Symbol"], retain_candles)
     finally:
         conn.unregister("incoming_prices")
