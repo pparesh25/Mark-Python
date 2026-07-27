@@ -5,6 +5,9 @@ use plotters::style::RGBColor;
 use polars::prelude::*;
 use std::path::Path;
 
+const SANS_FONT: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
+const MONOSPACE_FONT: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono.ttf");
+
 #[derive(Clone)]
 pub struct EodData {
     pub dates: Vec<String>,
@@ -36,19 +39,17 @@ pub fn create_stock_chart(
     info_line2: &str,
     info_line3: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Register Arial as "sans-serif"
-    plotters::style::register_font(
-        "sans-serif",
-        plotters::style::FontStyle::Normal,
-        include_bytes!("/System/Library/Fonts/Supplemental/Arial.ttf"),
-    ).map_err(|_| "Failed to register Arial font".to_string())?;
+    // Embed redistributable fonts so deployed binaries do not depend on fonts
+    // being installed on the target machine.
+    plotters::style::register_font("sans-serif", plotters::style::FontStyle::Normal, SANS_FONT)
+        .map_err(|_| "Failed to register DejaVu Sans font".to_string())?;
 
-    // Register Courier New as "monospace"
     plotters::style::register_font(
         "monospace",
         plotters::style::FontStyle::Normal,
-        include_bytes!("/System/Library/Fonts/Supplemental/Courier New.ttf"),
-    ).map_err(|_| "Failed to register Courier New font".to_string())?;
+        MONOSPACE_FONT,
+    )
+    .map_err(|_| "Failed to register DejaVu Sans Mono font".to_string())?;
 
     let df = df!(
         "Date" => &eod_data.dates,

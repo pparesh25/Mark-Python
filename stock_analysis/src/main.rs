@@ -123,6 +123,10 @@ fn clean_opt_date(opt: &Option<String>) -> Option<&str> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && matches!(args[1].as_str(), "--version" | "-V") {
+        println!("stock_analysis {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.len() >= 2 && args[1] == "screen" {
         return screener::run_screener_cmd(&args[2..]);
     }

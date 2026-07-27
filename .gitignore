@@ -52,5 +52,6 @@ Thumbs.db
 # Rust compiled binary & build artifacts
 stock_analysis/stock_analysis
 stock_analysis/target/
+stock_analysis/bin/
 stock_analysis/src/bin/
 scratch/
