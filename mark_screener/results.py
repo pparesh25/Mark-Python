@@ -118,7 +118,8 @@ def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date
                     str(temp_csv),
                     str(config.DUCKDB_FILE),
                     str(chart_dir)
-                ], capture_output=True, text=True)
+                ], capture_output=True, text=True,
+                    encoding="utf-8", errors="replace")
                 
                 if result.stderr:
                     logging.warning(f"Rust charting stderr:\n{result.stderr}")

@@ -158,7 +158,11 @@ def _screen_exchange(exchange, include_sme=False, only_sme=False):
         cmd.append("--only-sme")
 
     started = time.perf_counter()
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # The Rust engine emits UTF-8; decoding with the Windows locale codepage
+    # raises UnicodeDecodeError inside subprocess' reader thread.
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
     elapsed = time.perf_counter() - started
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
