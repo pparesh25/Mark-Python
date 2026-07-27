@@ -10,6 +10,116 @@ import duckdb
 import config
 from eod_store import upsert_daily_prices
 
+TEXT_COLUMNS = [
+    "Date", "Open", "High", "Low", "Close", "Volume", "Series",
+    "TOTAL_TRADES", "QTY_PER_TRADE", "DLV_QTY",
+]
+
+
+def _symbol_text_path(data_dir: Path, symbol: str) -> Path:
+    safe_name = "".join(
+        character.lower()
+        if character.isalnum() or character in "._-"
+        else "_"
+        for character in symbol.strip().upper()
+    )
+    return data_dir / f"{safe_name}.csv"
+
+
+def _write_text_frame(path: Path, frame: pd.DataFrame) -> None:
+    frame = frame.copy()
+    for column in TEXT_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = pd.NA
+    frame["Date"] = pd.to_datetime(frame["Date"]).dt.date
+    frame = (
+        frame.loc[:, TEXT_COLUMNS]
+        .drop_duplicates(subset=["Date"], keep="last")
+        .sort_values("Date")
+        .tail(config.EOD_RETAIN_CANDLES)
+    )
+    temporary = path.with_suffix(".csv.tmp")
+    frame.to_csv(temporary, index=False)
+    temporary.replace(path)
+
+
+def _merge_renamed_text_file(data_dir: Path, old_symbol: str, new_symbol: str) -> None:
+    old_path = _symbol_text_path(data_dir, old_symbol)
+    new_path = _symbol_text_path(data_dir, new_symbol)
+    if old_path == new_path or not old_path.exists():
+        return
+    old_frame = pd.read_csv(old_path)
+    if new_path.exists():
+        old_frame = pd.concat([old_frame, pd.read_csv(new_path)], ignore_index=True)
+    # Match DuckDB's rename-collision rule: when both tickers contain the same
+    # date, retain the row with the greater traded volume.
+    old_frame["_volume_rank"] = pd.to_numeric(
+        old_frame.get("Volume"), errors="coerce"
+    ).fillna(0)
+    old_frame = old_frame.sort_values(
+        ["Date", "_volume_rank"], kind="stable"
+    ).drop(columns=["_volume_rank"])
+    _write_text_frame(new_path, old_frame)
+    old_path.unlink()
+
+
+def _upsert_text_prices(
+    data_dir: Path,
+    rows: pd.DataFrame,
+    renames: list[tuple[str, str]],
+) -> None:
+    """Keep the per-symbol BSE text backup aligned with compact DuckDB."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for old_symbol, new_symbol in renames:
+        _merge_renamed_text_file(data_dir, old_symbol, new_symbol)
+
+    for row in rows.to_dict(orient="records"):
+        path = _symbol_text_path(data_dir, row["Symbol"])
+        incoming = pd.DataFrame([{
+            "Date": row["Date"],
+            "Open": row["Open"],
+            "High": row["High"],
+            "Low": row["Low"],
+            "Close": row["Close"],
+            "Volume": row["Volume"],
+            "Series": row["Series"],
+            "TOTAL_TRADES": row["Total_Trades"],
+            "QTY_PER_TRADE": row["Qty_Per_Trade"],
+            "DLV_QTY": row["Dlv_Qty"],
+        }])
+        if path.exists():
+            incoming = pd.concat(
+                [pd.read_csv(path), incoming],
+                ignore_index=True,
+            )
+        _write_text_frame(path, incoming)
+
+
+def sync_adjusted_text_prices(
+    data_dir: Path,
+    symbol: str,
+    adjusted_prices: pd.DataFrame,
+) -> None:
+    """Idempotently copy adjusted OHLCV values from DuckDB into one text file."""
+    path = _symbol_text_path(data_dir, symbol)
+    adjusted = adjusted_prices.copy()
+    adjusted["Date"] = pd.to_datetime(adjusted["Date"]).dt.date
+    adjusted = adjusted.set_index("Date")
+
+    if path.exists():
+        text = pd.read_csv(path)
+        text["Date"] = pd.to_datetime(text["Date"]).dt.date
+        text = text.set_index("Date")
+    else:
+        text = pd.DataFrame(index=adjusted.index)
+
+    for column in ("Open", "High", "Low", "Close", "Volume"):
+        text.loc[adjusted.index, column] = adjusted[column]
+    if "Series" in adjusted.columns:
+        text.loc[adjusted.index, "Series"] = adjusted["Series"]
+    text.index.name = "Date"
+    _write_text_frame(path, text.reset_index())
+
 
 def update_bse_eod(
     df_merged: pd.DataFrame,
@@ -18,7 +128,7 @@ def update_bse_eod(
     metadata_dir: Path,
     dates: Any,
 ) -> None:
-    """Process the merged daily BSE DataFrame and insert data into DuckDB database."""
+    """Update the dedicated DuckDB and its 600-candle BSE text backup."""
     isin_file = metadata_dir / "bse_isin.csv"
     if isin_file.is_file():
         isin = pd.read_csv(isin_file, index_col="ISIN")
@@ -33,13 +143,56 @@ def update_bse_eod(
     # Parse date exactly once for the entire day's run to avoid slow Pandas parse in the loop
     date_val = pd.to_datetime(dates.pandasDt).date()
 
+    # BSE occasionally publishes two security codes/tickers for the same ISIN
+    # on one day (for example ``BAJAJ-AUTO#`` and ``BAJAJ-AUTO``).  A stable
+    # ISIN must map to one daily row. Prefer a normal ticker over a temporary
+    # ``#`` alias, then the most liquid row.
+    daily_rows = df_merged.copy()
+    daily_rows["_clean_isin"] = daily_rows["ISIN"].astype(str).str.strip()
+    daily_rows["_clean_symbol"] = daily_rows["TckrSymb"].astype(str).str.strip()
+    daily_rows["_temporary_alias"] = daily_rows["_clean_symbol"].str.endswith("#")
+    daily_rows["_numeric_volume"] = pd.to_numeric(
+        daily_rows["TtlTradgVol"], errors="coerce"
+    ).fillna(0)
+    valid_isin = (
+        daily_rows["ISIN"].notna()
+        & daily_rows["_clean_isin"].ne("")
+        & daily_rows["_clean_isin"].str.upper().ne("NAN")
+    )
+    duplicate_isins = int(
+        daily_rows.loc[valid_isin, "_clean_isin"].duplicated(keep=False).sum()
+    )
+    if duplicate_isins:
+        logger.warning(
+            f"BSE {dates.pandasDt}: resolving {duplicate_isins} duplicate "
+            f"same-ISIN rows by primary ticker and volume"
+        )
+    daily_rows = (
+        daily_rows.sort_values(
+            ["_temporary_alias", "_numeric_volume"],
+            ascending=[True, False],
+            kind="stable",
+        )
+        .drop_duplicates(subset=["_clean_isin"], keep="first")
+        .drop(
+            columns=[
+                "_clean_isin",
+                "_clean_symbol",
+                "_temporary_alias",
+                "_numeric_volume",
+            ]
+        )
+    )
+
     # Open a single DuckDB connection for this day's updates and run in a transaction
     conn = duckdb.connect(str(config.DUCKDB_FILE))
     conn.execute("BEGIN TRANSACTION")
+    df_insert = pd.DataFrame()
+    renames: list[tuple[str, str]] = []
     try:
         insert_rows = []
         # Use high-speed itertuples instead of iterrows
-        for row in df_merged.itertuples():
+        for row in daily_rows.itertuples():
             symbol = str(row.TckrSymb).strip()
             if not symbol or pd.isna(row.TckrSymb):
                 continue
@@ -71,6 +224,10 @@ def update_bse_eod(
                 # ``upsert_daily_prices`` moves the retained history using
                 # the stable ISIN before replacing the symbol metadata.
                 logger.warning(f"BSE Name Changed in DuckDB: {old}{prefix.upper()} to {new}{prefix.upper()}")
+                renames.append((
+                    f"{old}{prefix.upper()}",
+                    f"{new}{prefix.upper()}",
+                ))
 
             # Prepare parameters to append
             def is_nan(val):
@@ -116,6 +273,9 @@ def update_bse_eod(
         raise e
     finally:
         conn.close()
+
+    if not df_insert.empty:
+        _upsert_text_prices(data_dir, df_insert, renames)
 
     if isin_updated:
         # Convert dictionary back to DataFrame and save
