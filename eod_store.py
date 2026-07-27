@@ -122,8 +122,12 @@ def _deduplicate_symbols(conn, exchange: str, symbols: pd.Series) -> None:
         conn.unregister("deduplicate_symbols")
 
 
-def upsert_daily_prices(conn, rows: pd.DataFrame, retain_candles: int = RETAIN_CANDLES) -> None:
-    """Upsert one exchange's daily rows and retain only its newest candles."""
+def upsert_daily_prices(
+    conn,
+    rows: pd.DataFrame,
+    retain_candles: int | None = RETAIN_CANDLES,
+) -> None:
+    """Upsert one exchange's daily rows, optionally applying an explicit cap."""
     required = set(PRICE_COLUMNS + ["ISIN", "Series"])
     missing = required.difference(rows.columns)
     if missing:
@@ -240,13 +244,19 @@ def upsert_daily_prices(conn, rows: pd.DataFrame, retain_candles: int = RETAIN_C
             """
         )
         _deduplicate_symbols(conn, exchange, incoming["Symbol"])
-        _trim_symbols(conn, exchange, incoming["Symbol"], retain_candles)
+        if retain_candles is not None:
+            _trim_symbols(conn, exchange, incoming["Symbol"], retain_candles)
     finally:
         conn.unregister("incoming_prices")
 
 
-def replace_symbol_prices(conn, exchange: str, symbol: str, frame: pd.DataFrame,
-                          retain_candles: int = RETAIN_CANDLES) -> None:
+def replace_symbol_prices(
+    conn,
+    exchange: str,
+    symbol: str,
+    frame: pd.DataFrame,
+    retain_candles: int | None = RETAIN_CANDLES,
+) -> None:
     """Replace one symbol's retained OHLCV history after a corporate action."""
     required = {"Date", "Open", "High", "Low", "Close", "Volume"}
     missing = required.difference(frame.columns)
@@ -274,6 +284,12 @@ def replace_symbol_prices(conn, exchange: str, symbol: str, frame: pd.DataFrame,
             FROM replacement_prices
             """
         )
-        _trim_symbols(conn, exchange, pd.Series([normalized_symbol]), retain_candles)
+        if retain_candles is not None:
+            _trim_symbols(
+                conn,
+                exchange,
+                pd.Series([normalized_symbol]),
+                retain_candles,
+            )
     finally:
         conn.unregister("replacement_prices")

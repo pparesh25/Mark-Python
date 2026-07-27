@@ -1,4 +1,4 @@
-"""Build and atomically install the compact 600-candle DuckDB price store."""
+"""Build and atomically install an explicitly capped DuckDB price store."""
 
 from __future__ import annotations
 
@@ -112,7 +112,11 @@ def install_compact_database(source: Path, retain_candles: int) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", type=Path, default=config.DUCKDB_FILE)
-    parser.add_argument("--retain-candles", type=int, default=config.EOD_RETAIN_CANDLES)
+    parser.add_argument(
+        "--retain-candles",
+        type=int,
+        default=config.EOD_COMPACT_CANDLES,
+    )
     parser.add_argument("--apply", action="store_true", help="Install after creating a backup")
     args = parser.parse_args()
     if args.retain_candles < 252:

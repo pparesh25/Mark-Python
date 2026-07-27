@@ -14,6 +14,43 @@ from config import CURRENT_TIMESTAMP
 from .scoring import add_priority_score
 
 
+def write_watchlist(frame: pd.DataFrame, suffix: str) -> Path | None:
+    """Write one ranked OpenTrader Pro watchlist for a result category."""
+    if not config.WATCHLISTS_ENABLED or frame.empty:
+        return None
+
+    exchange = ""
+    if "Exchange" in frame.columns and not frame["Exchange"].dropna().empty:
+        exchange = str(frame["Exchange"].dropna().iloc[0]).strip().upper()
+    if exchange not in {"NSE", "BSE"}:
+        exchange = suffix.split("_", 1)[0].strip().upper()
+    if exchange not in {"NSE", "BSE"}:
+        raise ValueError(f"Cannot determine watchlist exchange from {suffix!r}")
+
+    watchlist_dir = config.get_watchlist_dir(exchange)
+    watchlist_dir.mkdir(parents=True, exist_ok=True)
+    watchlist_path = (
+        watchlist_dir / f"{CURRENT_TIMESTAMP}_{suffix.lower()}.txt"
+    )
+    symbols = (
+        frame["symbol"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .loc[lambda values: values.ne("")]
+    )
+    if config.STRIP_SME_WATCHLIST_SUFFIX:
+        symbols = symbols.str.replace(r"_SME$", "", regex=True)
+    symbols = symbols.drop_duplicates()
+    watchlist_path.write_text(
+        "".join(f"{symbol}\n" for symbol in symbols),
+        encoding="utf-8",
+    )
+    logging.info(f"Watchlist created: {watchlist_path} ({len(symbols)} symbols)")
+    return watchlist_path
+
+
 def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date_col, data_dir, plot_days=500, eod_data_dict=None):
     df_results['isin'] = df_results['isin'].astype(str).str.strip().str.upper()
     fundamental_df['ISIN Code'] = fundamental_df['ISIN Code'].astype(str).str.strip().str.upper()
@@ -50,6 +87,7 @@ def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date
     csv_filepath = Path(out_dir) / f"{CURRENT_TIMESTAMP}_{suffix}_qualified.csv"
     df_sorted[csv_columns].to_csv(csv_filepath, index=False)
     logging.info(f"CSV exported: {csv_filepath} ({len(df_sorted)} stocks)")
+    write_watchlist(df_sorted, suffix)
  
     logging.info(f"Generating charts for {suffix} in {chart_dir}...")
     try:

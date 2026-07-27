@@ -24,7 +24,7 @@ def _prices(symbol: str, isin: str, dates: pd.DatetimeIndex) -> pd.DataFrame:
     )
 
 
-def test_compact_store_retains_rows_and_keeps_legacy_read_shape(tmp_path):
+def test_compact_store_can_apply_an_explicit_retention_limit(tmp_path):
     conn = duckdb.connect(str(tmp_path / "prices.duckdb"))
     try:
         create_compact_schema(conn)
@@ -36,6 +36,34 @@ def test_compact_store_retains_rows_and_keeps_legacy_read_shape(tmp_path):
         assert conn.execute("SELECT DISTINCT Symbol FROM eod_data").fetchall() == [("NEW",)]
         assert conn.execute("SELECT ISIN, Series FROM eod_data LIMIT 1").fetchone() == ("INE000A", "EQ")
         assert conn.execute("SELECT Total_Trades FROM eod_data LIMIT 1").fetchone() == (None,)
+    finally:
+        conn.close()
+
+
+def test_daily_upsert_keeps_full_history_by_default(tmp_path):
+    conn = duckdb.connect(str(tmp_path / "prices.duckdb"))
+    try:
+        create_compact_schema(conn)
+        upsert_daily_prices(
+            conn,
+            _prices(
+                "FULL",
+                "INE_FULL",
+                pd.date_range("2024-01-01", periods=600),
+            ),
+        )
+        upsert_daily_prices(
+            conn,
+            _prices(
+                "FULL",
+                "INE_FULL",
+                pd.date_range("2025-08-23", periods=1),
+            ),
+        )
+
+        assert conn.execute(
+            "SELECT COUNT(*) FROM eod_data WHERE Symbol = 'FULL'"
+        ).fetchone()[0] == 601
     finally:
         conn.close()
 

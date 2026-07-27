@@ -31,10 +31,23 @@ else:
 # Roots
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent                    # live git repo (dynamic)
-DATA_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'NSE_EOD'
-BSE_DATA_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'BSE_EOD'
-DUCKDB_FILE = Path.home() / 'Mark EMA and HTF' / 'Database' / 'NSE_BSE_EOD.duckdb'
 BSE_ONLY_STOCKS = True
+
+
+def _configured_path(environment_name: str, default: Path) -> Path:
+    """Return an expanded user-configurable path without assuming an OS."""
+    configured = os.environ.get(environment_name, "").strip()
+    return Path(configured).expanduser() if configured else default
+
+
+DATA_ROOT = _configured_path(
+    "MARK_DATA_ROOT",
+    Path.home() / "Mark EMA and HTF",
+)
+DATABASE_DIR = DATA_ROOT / "Database"
+DATA_DIR = DATABASE_DIR / "NSE_EOD"
+BSE_DATA_DIR = DATABASE_DIR / "BSE_EOD"
+DUCKDB_FILE = DATABASE_DIR / "NSE_BSE_EOD.duckdb"
 
 # Pipeline Mode Flags:
 # USE_RUST_CALCULATION: If True, screening calculation is performed by the Rust engine.
@@ -85,9 +98,11 @@ RUST_BINARY = _resolve_rust_binary()
 # listed stock with a shortened indicator window.
 MIN_HISTORY_DAYS = 252
 EMA_PERIOD = 200
-# Keep a little under three years of sessions. It covers every indicator
-# window while bounding the local DuckDB price store.
-EOD_RETAIN_CANDLES = 600
+# Daily updates retain all available price history.  A 600-candle database can
+# still be produced deliberately with ``compact_price_database.py``; ordinary
+# NSE/BSE syncs never delete an older candle.
+EOD_RETAIN_CANDLES = None
+EOD_COMPACT_CANDLES = 600
 # Number of most-recent daily candles searched for a Flag pole.  This value is
 # passed to the Rust engine on every run so both implementations use it.
 FLAG_LOOKBACK_DAYS = 90
@@ -97,13 +112,20 @@ FLAG_LOOKBACK_DAYS = 90
 # The downloader first writes a fixed-name all-company.csv there (Chrome saves
 # whatever name the server returns), then the orchestrator renames it to
 # all-company_{timestamp}.csv.
-FUNDAMENTAL_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'fundamental_files'
+FUNDAMENTAL_DIR = DATABASE_DIR / "fundamental_files"
 _today_fund_file = FUNDAMENTAL_DIR / f"all-company_{CURRENT_DATE}.csv"
-if _today_fund_file.exists():
-    FUNDAMENTAL_FILE = _today_fund_file
-else:
-    _existing_funds = sorted(list(FUNDAMENTAL_DIR.glob("all-company_*.csv")))
-    FUNDAMENTAL_FILE = _existing_funds[-1] if _existing_funds else _today_fund_file
+# The ordinary pipeline targets today's file.  Reusing an older file is an
+# explicit offline choice made through ``--allow-stale-fundamentals``.
+FUNDAMENTAL_FILE = _today_fund_file
+
+
+def select_fundamental_file(allow_stale: bool = False) -> Path:
+    """Choose today's fundamentals, or the newest local fallback on request."""
+    today_file = FUNDAMENTAL_DIR / f"all-company_{CURRENT_DATE}.csv"
+    if today_file.exists() or not allow_stale:
+        return today_file
+    existing = sorted(FUNDAMENTAL_DIR.glob("all-company_*.csv"))
+    return existing[-1] if existing else today_file
 
 # ---------------------------------------------------------------------------
 # Outputs (relative to USER HOME / Mark EMA and HTF)
@@ -111,18 +133,18 @@ else:
 # CSV outputs are split into per-suffix subfolders (mirrors chart_images),
 # and filenames carry a timestamp so a same-day morning run is not clobbered
 # by an evening run.
-OUT_DIR = Path.home() / 'Mark EMA and HTF' / 'qualified_stocks'
-CHART_DIR = Path.home() / 'Mark EMA and HTF' / 'chart_images'
+OUT_DIR = DATA_ROOT / "qualified_stocks"
+CHART_DIR = DATA_ROOT / "chart_images"
 
 # Per-run logs go here (not loose at the project root).
-LOG_DIR = Path.home() / 'Mark EMA and HTF' / 'logs'
+LOG_DIR = DATA_ROOT / "logs"
 
 # Consolidated daily bhavcopy text files go here.
-DAILY_BHAVCOPY_DIR = Path.home() / 'Mark EMA and HTF' / 'Daily Bhavcopy NSE'
-BSE_DAILY_BHAVCOPY_DIR = Path.home() / 'Mark EMA and HTF' / 'Daily Bhavcopy BSE'
+DAILY_BHAVCOPY_DIR = DATA_ROOT / "Daily Bhavcopy NSE"
+BSE_DAILY_BHAVCOPY_DIR = DATA_ROOT / "Daily Bhavcopy BSE"
 
 # EOD downloader metadata (meta.json and isin.csv) goes here.
-EOD_METADATA_DIR = Path.home() / 'Mark EMA and HTF' / 'Database' / 'metadata'
+EOD_METADATA_DIR = DATABASE_DIR / "metadata"
 
 
 def get_output_dirs(exchange: str):
@@ -145,10 +167,27 @@ def get_output_dirs(exchange: str):
 # ---------------------------------------------------------------------------
 # External tools / dependencies
 # ---------------------------------------------------------------------------
-AMIBROKER_WATCHLIST_DIR = Path(
-    '/Users/paresh/.opentrader-pro/databases/NSE_EOD/watchlists'
+OPENTRADER_ROOT = _configured_path(
+    "MARK_OPENTRADER_ROOT",
+    Path.home() / ".opentrader-pro",
 )
-SCREENER_CREDS = BASE_DIR / 'Screener login' / 'screener.txt'
+WATCHLISTS_ENABLED = os.environ.get(
+    "MARK_WRITE_WATCHLISTS", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+STRIP_SME_WATCHLIST_SUFFIX = os.environ.get(
+    "MARK_STRIP_SME_WATCHLIST_SUFFIX", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_screener_credentials_path(root: Path | None = None) -> Path:
+    """Return the private Screener.in credential file outside the repository."""
+    return _configured_path(
+        "MARK_SCREENER_CREDS",
+        (root or DATA_ROOT) / "Screener login" / "screener.txt",
+    )
+
+
+SCREENER_CREDS = get_screener_credentials_path()
 SCREENER_SCREEN_ID = '3427564'
 
 # ---------------------------------------------------------------------------
@@ -158,17 +197,79 @@ SCREENER_SCREEN_ID = '3427564'
 LOG_FILE = LOG_DIR / f"screening_log_{CURRENT_TIMESTAMP}.txt"
 
 
-def ensure_dirs():
+def get_watchlist_dir(exchange: str, root: Path | None = None) -> Path:
+    """Return OpenTrader Pro's exchange-specific watchlist directory."""
+    exchange_name = exchange.strip().upper()
+    if exchange_name not in {"NSE", "BSE"}:
+        raise ValueError(f"Unsupported exchange for watchlist: {exchange}")
+    database_name = f"{exchange_name}_EOD"
+    return (root or OPENTRADER_ROOT) / "databases" / database_name / "watchlists"
+
+
+def configure_watchlists(
+    enabled: bool,
+    root: Path | None = None,
+    strip_sme_suffix: bool | None = None,
+) -> None:
+    """Apply CLI watchlist settings to this process and child processes."""
+    global WATCHLISTS_ENABLED, OPENTRADER_ROOT, STRIP_SME_WATCHLIST_SUFFIX
+    WATCHLISTS_ENABLED = enabled
+    os.environ["MARK_WRITE_WATCHLISTS"] = "1" if enabled else "0"
+    if root is not None:
+        OPENTRADER_ROOT = Path(root).expanduser()
+        os.environ["MARK_OPENTRADER_ROOT"] = str(OPENTRADER_ROOT)
+    if strip_sme_suffix is not None:
+        STRIP_SME_WATCHLIST_SUFFIX = strip_sme_suffix
+        os.environ["MARK_STRIP_SME_WATCHLIST_SUFFIX"] = (
+            "1" if strip_sme_suffix else "0"
+        )
+
+
+def configure_data_root(root: Path) -> None:
+    """Rebase every mutable data/output path under one portable root."""
+    global DATA_ROOT, DATABASE_DIR, DATA_DIR, BSE_DATA_DIR, DUCKDB_FILE
+    global FUNDAMENTAL_DIR, FUNDAMENTAL_FILE, OUT_DIR, CHART_DIR, LOG_DIR
+    global DAILY_BHAVCOPY_DIR, BSE_DAILY_BHAVCOPY_DIR, EOD_METADATA_DIR, LOG_FILE
+    global SCREENER_CREDS
+
+    DATA_ROOT = Path(root).expanduser()
+    os.environ["MARK_DATA_ROOT"] = str(DATA_ROOT)
+    DATABASE_DIR = DATA_ROOT / "Database"
+    DATA_DIR = DATABASE_DIR / "NSE_EOD"
+    BSE_DATA_DIR = DATABASE_DIR / "BSE_EOD"
+    DUCKDB_FILE = DATABASE_DIR / "NSE_BSE_EOD.duckdb"
+    FUNDAMENTAL_DIR = DATABASE_DIR / "fundamental_files"
+    FUNDAMENTAL_FILE = select_fundamental_file()
+    OUT_DIR = DATA_ROOT / "qualified_stocks"
+    CHART_DIR = DATA_ROOT / "chart_images"
+    LOG_DIR = DATA_ROOT / "logs"
+    DAILY_BHAVCOPY_DIR = DATA_ROOT / "Daily Bhavcopy NSE"
+    BSE_DAILY_BHAVCOPY_DIR = DATA_ROOT / "Daily Bhavcopy BSE"
+    EOD_METADATA_DIR = DATABASE_DIR / "metadata"
+    SCREENER_CREDS = get_screener_credentials_path(DATA_ROOT)
+    LOG_FILE = LOG_DIR / f"screening_log_{CURRENT_TIMESTAMP}.txt"
+
+
+def ensure_dirs(include_watchlists: bool | None = None):
     """Create all output directories if they don't exist."""
     for ex in ('NSE', 'BSE'):
         dirs = get_output_dirs(ex)
         for d in dirs.values():
             d.mkdir(parents=True, exist_ok=True)
             
-    for d in (OUT_DIR, CHART_DIR, LOG_DIR, AMIBROKER_WATCHLIST_DIR, FUNDAMENTAL_DIR,
-              DAILY_BHAVCOPY_DIR, BSE_DAILY_BHAVCOPY_DIR, EOD_METADATA_DIR,
-              BSE_DATA_DIR):
+    for d in (
+        DATA_ROOT, DATABASE_DIR, DATA_DIR, BSE_DATA_DIR, FUNDAMENTAL_DIR,
+        OUT_DIR, CHART_DIR, LOG_DIR, DAILY_BHAVCOPY_DIR,
+        BSE_DAILY_BHAVCOPY_DIR, EOD_METADATA_DIR, SCREENER_CREDS.parent,
+    ):
         d.mkdir(parents=True, exist_ok=True)
+
+    write_watchlists = (
+        WATCHLISTS_ENABLED if include_watchlists is None else include_watchlists
+    )
+    if write_watchlists:
+        for exchange in ("NSE", "BSE"):
+            get_watchlist_dir(exchange).mkdir(parents=True, exist_ok=True)
 
 
 def validate_inputs():

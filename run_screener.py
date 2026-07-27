@@ -15,9 +15,11 @@ Improvements over the legacy shell orchestrator:
     and looks like the expected export before screening consumes it.
   * Per-step timing and a final summary, all tee'd to a timestamped log file.
 
-Usage (conda env required — TA-Lib / selenium / pandas live there):
-    conda activate mark_screener
-    python "/Users/paresh/Desktop/Mark Python/run_screener.py"
+Usage:
+    python run_screener.py
+
+Windows and Linux launchers create/use a project-local virtual environment;
+the normal precompiled-Rust path does not require TA-Lib.
 """
 
 import importlib.util
@@ -34,8 +36,7 @@ from zoneinfo import ZoneInfo
 import config
 from screening_readiness import LocalDataError, inspect_eod_readiness, rebase_sync_cursor
 from config import (
-    BASE_DIR, FUNDAMENTAL_FILE, OUT_DIR,
-    CURRENT_TIMESTAMP, EOD_RETAIN_CANDLES,
+    BASE_DIR, CURRENT_TIMESTAMP,
 )
 
 # Screener module executed in Step 3 (filename has a space — quoted via Path).
@@ -155,18 +156,19 @@ def validate_fundamentals(logger):
     The old pipeline would silently screen against a missing/empty file (the
     Selenium downloader never propagated failures). Catch that here.
     """
-    if not FUNDAMENTAL_FILE.exists():
-        logger.error(color(f"  ✗ fundamentals missing: {FUNDAMENTAL_FILE}", 'RED'))
+    fundamental_file = config.FUNDAMENTAL_FILE
+    if not fundamental_file.exists():
+        logger.error(color(f"  ✗ fundamentals missing: {fundamental_file}", 'RED'))
         logger.error(color("    Did the screener.in download fail? Aborting.", 'RED'))
         sys.exit(1)
 
-    size = FUNDAMENTAL_FILE.stat().st_size
+    size = fundamental_file.stat().st_size
     if size < 1000:
         logger.error(color(f"  ✗ fundamentals file too small ({size} bytes) — "
                            "likely an error page, not the export.", 'RED'))
         sys.exit(1)
 
-    with open(FUNDAMENTAL_FILE, 'r', encoding='utf-8', errors='replace') as f:
+    with open(fundamental_file, 'r', encoding='utf-8', errors='replace') as f:
         header = f.readline().strip()
     # Columns the priority-score helper depends on (see add_priority_score).
     expected_cols = [
@@ -182,9 +184,9 @@ def validate_fundamentals(logger):
         logger.error(f"    first line: {header[:120]}")
         sys.exit(1)
 
-    mtime = datetime.fromtimestamp(FUNDAMENTAL_FILE.stat().st_mtime)
+    mtime = datetime.fromtimestamp(fundamental_file.stat().st_mtime)
     age_min = (datetime.now() - mtime).total_seconds() / 60
-    logger.info(color(f"  ✓ {FUNDAMENTAL_FILE.name} OK "
+    logger.info(color(f"  ✓ {fundamental_file.name} OK "
                       f"({size/1024:.0f} KB, modified {mtime:%H:%M:%S}, "
                       f"{age_min:.0f} min ago)", 'GREEN'))
 
@@ -253,12 +255,68 @@ def run_all_screening(logger, include_sme=False, only_sme=False):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main():
+def build_argument_parser():
+    """Build the portable command-line interface used by every launcher."""
     import argparse
+
     parser = argparse.ArgumentParser(description="Unified Mark Screener Orchestrator")
-    parser.add_argument('--include-sme', action='store_true', help="Include SME stocks in screening")
-    parser.add_argument('--only-sme', action='store_true', help="Screen ONLY SME stocks")
-    args = parser.parse_args()
+    sme_group = parser.add_mutually_exclusive_group()
+    sme_group.add_argument(
+        '--include-sme',
+        action='store_true',
+        help="Include SME stocks in screening",
+    )
+    sme_group.add_argument(
+        '--only-sme',
+        action='store_true',
+        help="Screen ONLY SME stocks",
+    )
+    parser.add_argument(
+        '--data-root',
+        type=Path,
+        help="Override the default ~/Mark EMA and HTF data root",
+    )
+    parser.add_argument(
+        '--watchlist-root',
+        type=Path,
+        help="Override the default ~/.opentrader-pro root",
+    )
+    parser.add_argument(
+        '--watchlists',
+        action=argparse.BooleanOptionalAction,
+        default=config.WATCHLISTS_ENABLED,
+        help="Write OpenTrader Pro watchlists (default: enabled)",
+    )
+    parser.add_argument(
+        '--strip-sme-watchlist-suffix',
+        action='store_true',
+        default=config.STRIP_SME_WATCHLIST_SUFFIX,
+        help="Remove the internal _SME suffix from OpenTrader watchlist symbols",
+    )
+    parser.add_argument(
+        '--allow-stale-fundamentals',
+        action='store_true',
+        help="Use the newest older local fundamentals when today's file is absent",
+    )
+    return parser
+
+
+def main():
+    args = build_argument_parser().parse_args()
+
+    if args.data_root:
+        config.configure_data_root(args.data_root)
+    config.configure_watchlists(
+        args.watchlists,
+        args.watchlist_root,
+        strip_sme_suffix=args.strip_sme_watchlist_suffix,
+    )
+    config.FUNDAMENTAL_FILE = config.select_fundamental_file(
+        allow_stale=args.allow_stale_fundamentals
+    )
+    # Logging and result writers expect their parent directories to exist.
+    # Creating them here also makes the first run identical on every OS.
+    config.ensure_dirs()
 
     os.environ['MARK_SCREENER_TIMESTAMP'] = config.CURRENT_TIMESTAMP
     logger = setup_logging()
@@ -267,9 +325,18 @@ def main():
     width = 64
     logger.info(color('═' * width, 'CYAN'))
     logger.info(color('  Mark Screener — Unified Pipeline', 'BOLD'))
-    logger.info(color(f'  Mark Tight + Tight Flag   |   {EOD_RETAIN_CANDLES} candles retained   |   '
-                      f'run: {CURRENT_TIMESTAMP}   |   log: {config.LOG_FILE.name}',
-                      'CYAN'))
+    logger.info(color(
+        f'  Mark Tight + Tight Flag   |   full history retained   |   '
+        f'run: {CURRENT_TIMESTAMP}   |   log: {config.LOG_FILE.name}',
+        'CYAN',
+    ))
+    if config.WATCHLISTS_ENABLED:
+        logger.info(color(
+            f"  OpenTrader watchlists: {config.OPENTRADER_ROOT}",
+            'CYAN',
+        ))
+    else:
+        logger.info(color("  OpenTrader watchlists: disabled", 'CYAN'))
     logger.info(color('═' * width, 'CYAN'))
 
     # --- Step 1: EOD update only when a locally eligible session is missing
@@ -337,8 +404,8 @@ def main():
 
     # --- Step 2: fundamentals download ------------------------------------
     logger.info(color("▶ Step 2/4: Fundamental Data Download (screener.in)", 'BOLD'))
-    if FUNDAMENTAL_FILE.exists():
-        logger.info(color(f"  ✓ Using local fundamentals file: {FUNDAMENTAL_FILE.name}", 'GREEN'))
+    if config.FUNDAMENTAL_FILE.exists():
+        logger.info(color(f"  ✓ Using local fundamentals file: {config.FUNDAMENTAL_FILE.name}", 'GREEN'))
         logger.info(color("  Skipping browser download process.", 'CYAN'))
     else:
         logger.info(color("  Starting Selenium browser automation directly from Python...", 'CYAN'))
@@ -370,8 +437,8 @@ def main():
             try:
                 # Path.replace() atomically overwrites an existing target across
                 # platforms (unlike rename, which can fail on some OSes).
-                temp_file.replace(FUNDAMENTAL_FILE)
-                logger.info(color(f"  ✓ Renamed downloaded file to {FUNDAMENTAL_FILE.name}", 'GREEN'))
+                temp_file.replace(config.FUNDAMENTAL_FILE)
+                logger.info(color(f"  ✓ Renamed downloaded file to {config.FUNDAMENTAL_FILE.name}", 'GREEN'))
             except Exception as e:
                 logger.error(color(f"  ✗ Failed to rename downloaded file to date-based name: {e}", 'RED'))
                 sys.exit(1)
@@ -404,11 +471,22 @@ def main():
     logger.info(color(f"  Pipeline complete in {total:.1f}s", 'BOLD'))
 
     # Surface this run's CSVs (now timestamped + in per-suffix subfolders).
-    outputs = sorted(OUT_DIR.rglob(f"{CURRENT_TIMESTAMP}_*_qualified.csv"))
+    outputs = sorted(config.OUT_DIR.rglob(f"{CURRENT_TIMESTAMP}_*_qualified.csv"))
     if outputs:
         logger.info(color("  Qualified CSVs:", 'GREEN'))
         for p in outputs:
             logger.info(f"    {p.parent.name}/{p.name}  ({p.stat().st_size/1024:.1f} KB)")
+    if config.WATCHLISTS_ENABLED:
+        watchlist_base = config.OPENTRADER_ROOT / "databases"
+        watchlists = sorted(
+            watchlist_base.rglob(f"{CURRENT_TIMESTAMP}_*.txt")
+        )
+        if watchlists:
+            logger.info(color("  OpenTrader watchlists:", 'GREEN'))
+            for path in watchlists:
+                logger.info(
+                    f"    {path.relative_to(config.OPENTRADER_ROOT)}"
+                )
     logger.info(color(f"  Full log: {config.LOG_FILE}", 'CYAN'))
     logger.info(color('═' * width, 'CYAN'))
 

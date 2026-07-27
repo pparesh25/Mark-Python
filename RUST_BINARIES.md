@@ -1,11 +1,19 @@
 # Precompiled Rust engine
 
 Linux and Windows users do not need Rust, Cargo, CMake, or a C++ compiler.
-After setting up Python, run:
+The platform setup scripts install the Python runtime and then call the binary
+installer:
+
+```powershell
+.\setup_windows.ps1
+```
 
 ```bash
-python install_rust_binary.py
+./setup_linux.sh
 ```
+
+After setting up Python manually, `python install_rust_binary.py` remains
+available.
 
 The installer uses only the Python standard library. It downloads the newest
 `rust-v*` GitHub Release for the current x86_64 platform, verifies the

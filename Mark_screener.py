@@ -14,10 +14,6 @@ import duckdb
 
 import config
 from mark_screener.results import process_results
-from config import (
-    FUNDAMENTAL_FILE, AMIBROKER_WATCHLIST_DIR,
-    CURRENT_TIMESTAMP,
-)
 
 start_time = time.time()
 
@@ -25,9 +21,34 @@ start_time = time.time()
 parser = argparse.ArgumentParser()
 parser.add_argument('--exchange', type=str, default='NSE', choices=['NSE', 'BSE'])
 parser.add_argument('--max-date', type=str, default=None)
-parser.add_argument('--include-sme', action='store_true', help="Include SME stocks in screening")
-parser.add_argument('--only-sme', action='store_true', help="Screen ONLY SME stocks")
+sme_group = parser.add_mutually_exclusive_group()
+sme_group.add_argument('--include-sme', action='store_true', help="Include SME stocks in screening")
+sme_group.add_argument('--only-sme', action='store_true', help="Screen ONLY SME stocks")
+parser.add_argument('--data-root', type=Path, help="Override the Mark data root")
+parser.add_argument('--watchlist-root', type=Path, help="Override the .opentrader-pro root")
+parser.add_argument(
+    '--watchlists',
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="Write OpenTrader Pro watchlists",
+)
+parser.add_argument(
+    '--strip-sme-watchlist-suffix',
+    action='store_true',
+    default=None,
+    help="Remove the internal _SME suffix from watchlist symbols",
+)
 args = parser.parse_args()
+if args.data_root:
+    config.configure_data_root(args.data_root)
+watchlists_enabled = (
+    config.WATCHLISTS_ENABLED if args.watchlists is None else args.watchlists
+)
+config.configure_watchlists(
+    watchlists_enabled,
+    args.watchlist_root,
+    strip_sme_suffix=args.strip_sme_watchlist_suffix,
+)
 exchange = args.exchange.upper()
 max_date = args.max_date
 include_sme = args.include_sme
@@ -151,7 +172,7 @@ def main():
                 with open(json_path, 'r', encoding='utf-8') as f:
                     rust_dataset = json.load(f)
 
-                fundamental_df = pd.read_csv(FUNDAMENTAL_FILE)
+                fundamental_df = pd.read_csv(config.FUNDAMENTAL_FILE)
                 dirs = config.get_output_dirs(exchange)
 
                 # Mark is an internal setup only.  Export the final fixed-Donchian
@@ -169,9 +190,9 @@ def main():
     # Mode 2 & Mode 3: Python Calculation Mode
     # 1. Load fundamental list to screen only listed equity symbols
     try:
-        query_df = pd.read_csv(FUNDAMENTAL_FILE)
+        query_df = pd.read_csv(config.FUNDAMENTAL_FILE)
     except FileNotFoundError:
-        logging.error(f"Fundamental file not found: {FUNDAMENTAL_FILE}")
+        logging.error(f"Fundamental file not found: {config.FUNDAMENTAL_FILE}")
         return
         
     valid_isins = set(query_df['ISIN Code'].dropna().str.strip().str.upper())
@@ -285,11 +306,6 @@ def main():
         
     results_all = pd.concat(results_list, ignore_index=True)
     
-    watchlist_dir = config.AMIBROKER_WATCHLIST_DIR
-    if exchange == 'BSE':
-        watchlist_dir = Path('/Users/paresh/.opentrader-pro/databases/BSE_EOD/watchlists')
-    watchlist_dir.mkdir(parents=True, exist_ok=True)
-    
     # Mark Tight: today's close must clear the Donchian level frozen at the
     # start of the active Mark setup.  Mark's 20%/50% 52-week conditions are
     # already guaranteed by process_symbol_data for every result in results_all.
@@ -304,14 +320,6 @@ def main():
         logging.info(f"Found {len(results_stage2)} stocks matching Mark Tight criteria.")
         process_results(results_stage2, query_df, f"{exchange.lower()}_mark_tight", MARK_TIGHT_OUT_DIR,
                         MARK_TIGHT_CHART_DIR, "mark_tight_date", config.DATA_DIR, eod_data_dict=eod_data_dict)
-
-        tight_watchlist_filename = f"{CURRENT_TIMESTAMP}_{exchange.lower()}_mark_tight.txt"
-        tight_watchlist_filepath = watchlist_dir / tight_watchlist_filename
-        with open(tight_watchlist_filepath, 'w') as f:
-            for symbol in results_stage2['symbol']:
-                clean_symbol = symbol.replace('_SME', '').upper()
-                f.write(f"{clean_symbol}\n")
-        logging.info(f"Watchlist created: {tight_watchlist_filepath}")
     else:
         logging.info("No stocks matched the Mark Tight criteria.")
     logging.info(f"✓ Processed Mark Tight results in {time.time() - t_stage2_start:.2f}s")

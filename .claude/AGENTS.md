@@ -2,7 +2,9 @@
 
 ## Project Overview
 
-NSE India stock screening pipeline. Downloads EOD price data and fundamentals, then runs Mark Tight and Tight Flag screens with priority scoring, CSVs, charts, and AmiBroker watchlists.
+Cross-platform NSE/BSE stock screening pipeline. Downloads EOD price data and
+fundamentals, then runs Mark Tight and Tight Flag screens with priority
+scoring, CSVs, charts, and OpenTrader Pro watchlists.
 
 ## Team Workflow
 
@@ -52,10 +54,14 @@ NSE India stock screening pipeline. Downloads EOD price data and fundamentals, t
 
 ### Environment
 ```bash
-# Create venv (TA-Lib has prebuilt wheel for arm64 macOS):
-python3 -m venv .venv
-source .venv/bin/activate
-pip install pandas numpy TA-Lib matplotlib mplfinance selenium webdriver-manager tzlocal python-dateutil openpyxl nsetools
+# Linux x86_64:
+./setup_linux.sh
+
+# Windows x64 PowerShell:
+.\setup_windows.ps1
+
+# Optional legacy Python calculation/chart fallback:
+python -m pip install -r requirements-legacy.txt
 ```
 
 ### Running
@@ -75,7 +81,8 @@ python Mark_screener.py
 ```
 
 ### Credentials
-- File: `Screener login/screener.txt` (line 1: email, line 2: password)
+- File: `~/Mark EMA and HTF/Screener login/screener.txt`
+  (line 1: email, line 2: password)
 - Must exist for fundamentals download step
 
 ## Code Conventions
@@ -117,7 +124,9 @@ Internal candidate gate: a 90%+ run-up within 45 trading days.  Only candidates 
 
 ## Known Issues & Gotchas
 
-1. **nse-tools vs nsetools**: The import `from nse import NSE` tries the `nse` package first. If unavailable, `NSE_AVAILABLE=False` and `sync_database()` returns False gracefully. The nse package (nse-tools) is not on PyPI — it's a custom package from BennyThadikaran. Use `nsetools` as fallback but the API differs.
+1. **NSE package**: The downloader uses BennyThadikaran's `nse` package
+   with `server=True`; install the pinned `nse[server]` dependency through
+   `requirements.txt`. `nsetools` is a different API and is not a substitute.
 
 2. **TA-Lib on macOS**: Prebuilt wheel available for arm64 (ta_lib-0.7.1). No system TA-Lib library needed on Apple Silicon.
 

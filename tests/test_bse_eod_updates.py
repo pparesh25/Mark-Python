@@ -70,7 +70,7 @@ def test_bse_update_prefers_primary_ticker_and_updates_text(
     assert text.loc[0, "TOTAL_TRADES"] == 10
 
 
-def test_bse_update_retains_600_rows_in_duckdb_and_text(
+def test_bse_update_keeps_older_rows_beyond_600_in_duckdb_and_text(
     tmp_path, monkeypatch
 ):
     database = tmp_path / "prices.duckdb"
@@ -116,8 +116,8 @@ def test_bse_update_retains_600_rows_in_duckdb_and_text(
     ).fetchone()
     conn.close()
     text = pd.read_csv(text_dir / "keep600.csv")
-    assert count == 600
-    assert len(text) == 600
+    assert count == 601
+    assert len(text) == 601
     assert str(first_date) == text.iloc[0]["Date"]
     assert str(last_date) == text.iloc[-1]["Date"]
     assert text.iloc[-1]["Close"] == 120.0

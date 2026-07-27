@@ -36,7 +36,6 @@ def _write_text_frame(path: Path, frame: pd.DataFrame) -> None:
         frame.loc[:, TEXT_COLUMNS]
         .drop_duplicates(subset=["Date"], keep="last")
         .sort_values("Date")
-        .tail(config.EOD_RETAIN_CANDLES)
     )
     temporary = path.with_suffix(".csv.tmp")
     frame.to_csv(temporary, index=False)
@@ -128,7 +127,7 @@ def update_bse_eod(
     metadata_dir: Path,
     dates: Any,
 ) -> None:
-    """Update the dedicated DuckDB and its 600-candle BSE text backup."""
+    """Update the dedicated DuckDB and its complete BSE text backup."""
     isin_file = metadata_dir / "bse_isin.csv"
     if isin_file.is_file():
         isin = pd.read_csv(isin_file, index_col="ISIN")
