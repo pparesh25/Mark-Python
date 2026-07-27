@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 polars = { version = "0.36", features = ["lazy", "csv", "dtype-struct", "temporal", "strings", "random", "propagate_nans", "ewma", "rolling_window"] }
-plotters = { version = "0.3", features = ["chrono", "ab_glyph"] }
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "chrono", "ab_glyph", "line_series", "full_palette"] }
 rayon = "1.8"
 chrono = "=0.4.38"
 anyhow = "1.0"

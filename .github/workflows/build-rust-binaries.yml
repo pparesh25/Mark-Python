@@ -1,0 +1,129 @@
+name: Build precompiled Rust binaries
+
+on:
+  push:
+    branches: [main]
+    tags: ["rust-v*"]
+    paths:
+      - "stock_analysis/**"
+      - "config.py"
+      - "install_rust_binary.py"
+      - ".github/workflows/build-rust-binaries.yml"
+  pull_request:
+    paths:
+      - "stock_analysis/**"
+      - "config.py"
+      - "install_rust_binary.py"
+      - ".github/workflows/build-rust-binaries.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform_key: linux-x86_64
+            archive: stock-analysis-linux-x86_64.tar.gz
+            rustflags: ""
+          - label: Windows x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            platform_key: windows-x86_64
+            archive: stock-analysis-windows-x86_64.zip
+            rustflags: "-C target-feature=+crt-static"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: stock_analysis
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stock_analysis
+          key: ${{ matrix.target }}
+
+      - name: Build locked release binary
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked --bin stock_analysis --target ${{ matrix.target }}
+
+      - name: Smoke test Linux binary
+        if: runner.os == 'Linux'
+        run: ./target/${{ matrix.target }}/release/stock_analysis --version
+
+      - name: Smoke test Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\\target\\${{ matrix.target }}\\release\\stock_analysis.exe --version
+
+      - name: Package Linux binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          package_root="../dist/${{ matrix.platform_key }}/stock_analysis/bin/${{ matrix.platform_key }}"
+          mkdir -p "$package_root"
+          cp "target/${{ matrix.target }}/release/stock_analysis" "$package_root/stock_analysis"
+          cp "assets/fonts/LICENSE_DEJAVU" "../dist/${{ matrix.platform_key }}/stock_analysis/THIRD_PARTY_FONTS.txt"
+          chmod +x "$package_root/stock_analysis"
+          tar -C "../dist/${{ matrix.platform_key }}" -czf "../dist/${{ matrix.archive }}" stock_analysis
+          cd ../dist
+          sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $packageRoot = "..\\dist\\${{ matrix.platform_key }}\\stock_analysis\\bin\\${{ matrix.platform_key }}"
+          New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
+          Copy-Item "target\\${{ matrix.target }}\\release\\stock_analysis.exe" "$packageRoot\\stock_analysis.exe"
+          Copy-Item "assets\\fonts\\LICENSE_DEJAVU" "..\\dist\\${{ matrix.platform_key }}\\stock_analysis\\THIRD_PARTY_FONTS.txt"
+          Compress-Archive -Path "..\\dist\\${{ matrix.platform_key }}\\stock_analysis" -DestinationPath "..\\dist\\${{ matrix.archive }}"
+          $hash = (Get-FileHash "..\\dist\\${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.archive }}" | Set-Content -NoNewline "..\\dist\\${{ matrix.archive }}.sha256"
+
+      - name: Upload precompiled binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.platform_key }}
+          path: |
+            dist/${{ matrix.archive }}
+            dist/${{ matrix.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish tagged binaries
+    if: startsWith(github.ref, 'refs/tags/rust-v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Precompiled Rust binaries $GITHUB_REF_NAME" \
+            --generate-notes

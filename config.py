@@ -10,6 +10,7 @@ project is the git repo at ``Mark Python`` — we use that instead.
 
 from datetime import datetime
 from pathlib import Path
+import platform
 
 # ---------------------------------------------------------------------------
 # Runtime & Timestamps
@@ -43,7 +44,41 @@ BSE_ONLY_STOCKS = True
 # Mode 3 (Pure Python): USE_RUST_CALCULATION = False, USE_RUST_CHARTS = False
 USE_RUST_CALCULATION = True
 USE_RUST_CHARTS = True
-RUST_BINARY = BASE_DIR / 'stock_analysis' / 'target' / 'release' / 'stock_analysis'
+
+
+def _rust_platform_key(system_name=None, machine_name=None):
+    """Return the prebuilt-binary directory for this operating system."""
+    system = (system_name or platform.system()).strip().lower()
+    machine = (machine_name or platform.machine()).strip().lower()
+    architecture = {
+        'amd64': 'x86_64',
+        'x64': 'x86_64',
+        'x86_64': 'x86_64',
+        'aarch64': 'aarch64',
+        'arm64': 'aarch64',
+    }.get(machine, machine or 'unknown')
+    return f"{system}-{architecture}"
+
+
+def _resolve_rust_binary():
+    """Prefer an explicitly configured or downloaded prebuilt Rust engine."""
+    executable = 'stock_analysis.exe' if platform.system() == 'Windows' else 'stock_analysis'
+    override = os.environ.get('MARK_RUST_BINARY')
+    if override:
+        return Path(override).expanduser()
+
+    prebuilt = (
+        BASE_DIR / 'stock_analysis' / 'bin' /
+        _rust_platform_key() / executable
+    )
+    if prebuilt.is_file():
+        return prebuilt
+
+    # Preserve the local Cargo path for macOS development and source builds.
+    return BASE_DIR / 'stock_analysis' / 'target' / 'release' / executable
+
+
+RUST_BINARY = _resolve_rust_binary()
 
 # All strategies require a full year of daily price history.  The same values
 # are mirrored in the Rust screener so neither engine can qualify a newly
