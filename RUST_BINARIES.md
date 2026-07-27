@@ -22,6 +22,16 @@ used to select a different executable explicitly.
 The chart fonts are embedded in the binary from the redistributable DejaVu
 font files, so no operating-system font package is required.
 
+Because this repository is private, the installer needs repository read
+access. It automatically uses either `GITHUB_TOKEN`, `GH_TOKEN`, or an
+existing authenticated GitHub CLI session. On a Python-only machine, set a
+token with repository Contents read permission before running the installer:
+
+```bash
+export GITHUB_TOKEN="your-token"       # Linux
+set GITHUB_TOKEN=your-token            # Windows Command Prompt
+```
+
 ## GitHub Actions
 
 `.github/workflows/build-rust-binaries.yml` compiles and smoke-tests both

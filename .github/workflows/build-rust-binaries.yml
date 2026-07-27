@@ -6,14 +6,10 @@ on:
     tags: ["rust-v*"]
     paths:
       - "stock_analysis/**"
-      - "config.py"
-      - "install_rust_binary.py"
       - ".github/workflows/build-rust-binaries.yml"
   pull_request:
     paths:
       - "stock_analysis/**"
-      - "config.py"
-      - "install_rust_binary.py"
       - ".github/workflows/build-rust-binaries.yml"
   workflow_dispatch:
 
