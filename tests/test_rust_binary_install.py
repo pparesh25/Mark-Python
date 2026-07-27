@@ -40,3 +40,22 @@ def test_config_honors_explicit_binary_override(tmp_path, monkeypatch):
     monkeypatch.setenv("MARK_RUST_BINARY", str(override))
 
     assert config._resolve_rust_binary() == Path(override)
+
+
+def test_installer_uses_environment_token_before_cli(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "environment-token")
+    monkeypatch.setattr(
+        install_rust_binary.shutil,
+        "which",
+        lambda executable: "/usr/bin/gh",
+    )
+
+    assert install_rust_binary._github_token() == "environment-token"
+
+
+def test_installer_can_run_without_token_for_public_repository(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(install_rust_binary.shutil, "which", lambda executable: None)
+
+    assert install_rust_binary._github_token() is None

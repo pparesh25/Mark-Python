@@ -13,14 +13,37 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import stat
+import subprocess
 import tarfile
 import tempfile
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import (
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+)
 import zipfile
 
 DEFAULT_REPOSITORY = "pparesh25/Mark-Python"
 RELEASE_PREFIX = "rust-v"
+
+
+class _PrivateReleaseRedirectHandler(HTTPRedirectHandler):
+    """Do not forward a GitHub token to the signed asset-storage host."""
+
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        redirected = super().redirect_request(
+            request, fp, code, message, headers, new_url
+        )
+        if (
+            redirected is not None
+            and urlparse(request.full_url).netloc
+            != urlparse(new_url).netloc
+        ):
+            redirected.remove_header("Authorization")
+        return redirected
 
 
 def platform_key(system_name: str | None = None, machine_name: str | None = None) -> str:
@@ -39,27 +62,61 @@ def platform_key(system_name: str | None = None, machine_name: str | None = None
     return f"{system}-{architecture}"
 
 
-def _get_json(url: str):
+def _github_token() -> str | None:
+    """Use an environment token or an existing GitHub CLI login."""
+    for variable in ("GITHUB_TOKEN", "GH_TOKEN"):
+        token = os.environ.get(variable, "").strip()
+        if token:
+            return token
+    if shutil.which("gh"):
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    return None
+
+
+def _headers(token: str | None, accept: str | None = None) -> dict[str, str]:
+    headers = {"User-Agent": "Mark-Python-Rust-Installer"}
+    if accept:
+        headers["Accept"] = accept
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _open(request: Request, timeout: int):
+    opener = build_opener(_PrivateReleaseRedirectHandler)
+    return opener.open(request, timeout=timeout)
+
+
+def _get_json(url: str, token: str | None):
     request = Request(
         url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "Mark-Python-Rust-Installer",
-        },
+        headers=_headers(token, "application/vnd.github+json"),
     )
-    with urlopen(request, timeout=30) as response:
+    with _open(request, timeout=30) as response:
         return json.load(response)
 
 
-def _download(url: str, destination: Path) -> None:
-    request = Request(url, headers={"User-Agent": "Mark-Python-Rust-Installer"})
-    with urlopen(request, timeout=120) as response:
-        destination.write_bytes(response.read())
+def _download(url: str, destination: Path, token: str | None) -> None:
+    request = Request(url, headers=_headers(token, "application/octet-stream"))
+    with _open(request, timeout=120) as response, destination.open("wb") as output:
+        shutil.copyfileobj(response, output, length=1024 * 1024)
 
 
-def _select_release(repository: str, requested_tag: str | None):
+def _select_release(
+    repository: str,
+    requested_tag: str | None,
+    token: str | None,
+):
     releases = _get_json(
-        f"https://api.github.com/repos/{repository}/releases?per_page=30"
+        f"https://api.github.com/repos/{repository}/releases?per_page=30",
+        token,
     )
     for release in releases:
         tag = str(release.get("tag_name", ""))
@@ -78,7 +135,7 @@ def _asset_urls(release, key: str) -> tuple[str, str, str]:
     archive_name = f"stock-analysis-{key}.{extension}"
     checksum_name = f"{archive_name}.sha256"
     urls = {
-        asset["name"]: asset["browser_download_url"]
+        asset["name"]: asset["url"]
         for asset in release.get("assets", [])
     }
     if archive_name not in urls or checksum_name not in urls:
@@ -114,15 +171,16 @@ def install(
 ) -> Path:
     key = platform_key()
     root = (install_root or Path(__file__).resolve().parent).resolve()
-    release = _select_release(repository, requested_tag)
+    token = _github_token()
+    release = _select_release(repository, requested_tag, token)
     archive_name, archive_url, checksum_url = _asset_urls(release, key)
 
     with tempfile.TemporaryDirectory(prefix="mark-rust-install-") as temp_name:
         temp = Path(temp_name)
         archive = temp / archive_name
         checksum = temp / f"{archive_name}.sha256"
-        _download(archive_url, archive)
-        _download(checksum_url, checksum)
+        _download(archive_url, archive, token)
+        _download(checksum_url, checksum, token)
 
         expected = checksum.read_text(encoding="utf-8").split()[0].lower()
         actual = hashlib.sha256(archive.read_bytes()).hexdigest()
