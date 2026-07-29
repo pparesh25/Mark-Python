@@ -74,7 +74,7 @@ def sync_database(
                 logger.info("Updating pending delivery reports.")
                 for date_str in pending_list:
                     if deps.update_pending_delivery(
-                        nse, date_str, data_dir, logger, deps.tz_in
+                        nse, date_str, daily_bhavcopy_dir, logger, deps.tz_in
                     ):
                         meta["DLV_PENDING_DATES"].remove(date_str)
                         meta_updated = True
@@ -175,4 +175,3 @@ def sync_database(
         except Exception as error:
             logger.error(f"Error in sync_database: {error}")
             return False
-

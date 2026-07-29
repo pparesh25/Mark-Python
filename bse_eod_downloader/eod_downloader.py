@@ -129,14 +129,13 @@ def _get_bonus(sym: str, string: str, logger: logging.Logger) -> float | None:
 def _make_adjustment(
     symbol: str,
     adjustmentFactor: float,
-    data_dir: Path,
+    _data_dir: Path,
     dates: Dates,
     logger: logging.Logger,
     action_key: str,
 ) -> tuple[str, str | None, int]:
-    """Apply one action once and synchronize its text backup."""
+    """Apply one corporate action once in DuckDB."""
     import duckdb
-    from bse_eod_downloader.stock_data import sync_adjusted_text_prices
 
     conn = duckdb.connect(str(config.DUCKDB_FILE))
     conn.execute(
@@ -161,22 +160,9 @@ def _make_adjustment(
         [action_key],
     ).fetchone()
     if already_applied:
-        adjusted = conn.execute(
-            """
-            SELECT *
-            FROM eod_data
-            WHERE Symbol = ? AND Exchange = 'BSE'
-            ORDER BY Date
-            """,
-            [already_applied[0]],
-        ).fetchdf()
         conn.close()
-        if not adjusted.empty:
-            sync_adjusted_text_prices(
-                data_dir, already_applied[0], adjusted
-            )
         logger.info(
-            f"BSE Corporate Action already applied; synchronized text backup: "
+            f"BSE Corporate Action already applied: "
             f"{already_applied[0]} on {dates.pandasDt}"
         )
         return "already_applied", already_applied[0], int(already_applied[1])
@@ -232,7 +218,6 @@ def _make_adjustment(
                 ],
             )
             conn.execute("COMMIT")
-            sync_adjusted_text_prices(data_dir, sym, adjusted)
             return "applied", sym, rows_adjusted
     except Exception:
         try:

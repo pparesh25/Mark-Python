@@ -40,7 +40,7 @@ def _seed_database(database, rows):
     conn.close()
 
 
-def test_bse_update_prefers_primary_ticker_and_updates_text(
+def test_bse_update_prefers_primary_ticker_without_writing_text(
     tmp_path, monkeypatch
 ):
     database = tmp_path / "prices.duckdb"
@@ -64,13 +64,11 @@ def test_bse_update_prefers_primary_ticker_and_updates_text(
     conn = duckdb.connect(str(database), read_only=True)
     result = conn.execute("SELECT Symbol, Close FROM eod_data").fetchall()
     conn.close()
-    text = pd.read_csv(tmp_path / "text" / "primary.csv")
     assert result == [("PRIMARY", 105.0)]
-    assert text.loc[0, "Close"] == 105.0
-    assert text.loc[0, "TOTAL_TRADES"] == 10
+    assert not (tmp_path / "text").exists()
 
 
-def test_bse_update_keeps_older_rows_beyond_600_in_duckdb_and_text(
+def test_bse_update_keeps_older_rows_beyond_600_only_in_duckdb(
     tmp_path, monkeypatch
 ):
     database = tmp_path / "prices.duckdb"
@@ -90,12 +88,6 @@ def test_bse_update_keeps_older_rows_beyond_600_in_duckdb_and_text(
     _seed_database(database, seed)
     monkeypatch.setattr(config, "DUCKDB_FILE", database)
     text_dir = tmp_path / "text"
-    text_dir.mkdir()
-    seed.rename(columns={
-        "Total_Trades": "TOTAL_TRADES",
-        "Qty_Per_Trade": "QTY_PER_TRADE",
-        "Dlv_Qty": "DLV_QTY",
-    }).to_csv(text_dir / "keep600.csv", index=False)
     metadata = tmp_path / "metadata"
     metadata.mkdir()
 
@@ -115,15 +107,13 @@ def test_bse_update_keeps_older_rows_beyond_600_in_duckdb_and_text(
         """
     ).fetchone()
     conn.close()
-    text = pd.read_csv(text_dir / "keep600.csv")
     assert count == 601
-    assert len(text) == 601
-    assert str(first_date) == text.iloc[0]["Date"]
-    assert str(last_date) == text.iloc[-1]["Date"]
-    assert text.iloc[-1]["Close"] == 120.0
+    assert str(first_date) == "2024-01-01"
+    assert str(last_date) == "2025-08-23"
+    assert not text_dir.exists()
 
 
-def test_corporate_action_ledger_prevents_double_text_adjustment(
+def test_corporate_action_ledger_prevents_double_duckdb_adjustment(
     tmp_path, monkeypatch
 ):
     database = tmp_path / "prices.duckdb"
@@ -142,8 +132,6 @@ def test_corporate_action_ledger_prevents_double_text_adjustment(
     _seed_database(database, prices)
     monkeypatch.setattr(config, "DUCKDB_FILE", database)
     text_dir = tmp_path / "text"
-    text_dir.mkdir()
-    prices.to_csv(text_dir / "splitco.csv", index=False)
     dates = _dates("2026-07-03T00:00:00+05:30")
 
     first = eod_downloader._make_adjustment(
@@ -164,9 +152,8 @@ def test_corporate_action_ledger_prevents_double_text_adjustment(
         "SELECT COUNT(*) FROM bse_corporate_action_ledger"
     ).fetchone()[0]
     conn.close()
-    text_closes = pd.read_csv(text_dir / "splitco.csv")["Close"].tolist()
     assert first == ("applied", "SPLITCO", 2)
     assert second == ("already_applied", "SPLITCO", 2)
     assert closes == [50.0, 55.0]
-    assert text_closes == [50.0, 55.0]
     assert ledger_rows == 1
+    assert not text_dir.exists()

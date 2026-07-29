@@ -9,8 +9,11 @@ from pathlib import Path
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
+import duckdb
 import pandas as pd
 
+import config
+from eod_store import create_compact_schema, upsert_daily_prices
 from nse_eod_downloader import eod_downloader as eod
 from nse_eod_downloader.corporate_actions import (
     parse_bonus_factor,
@@ -93,53 +96,19 @@ def test_actions_are_fetched_then_cached():
     nse.actions.assert_not_called()
 
 
-def test_split_and_bonus_adjustment_only_change_history(tmp_path):
-    dates = _dates()
-    index = pd.date_range("2024-05-01", periods=3, freq="D")
-    prices = pd.DataFrame(
-        {"Open": [100] * 3, "High": [100] * 3, "Low": [100] * 3, "Close": [100] * 3},
-        index=index,
-    )
-    prices.index.name = "Date"
-    prices.to_csv(tmp_path / "abc.csv")
-
-    eod._adjust_nse_stocks(
-        {
-            "equityActions": [{
-                "symbol": "ABC",
-                "subject": "Face Value Split (Sub-Division) - From Rs 5/- Per Share To Rs 2/- Per Share",
-                "exDate": "02-May-2024",
-                "series": "EQ",
-            }]
-        },
-        tmp_path,
-        dates,
-        _logger(),
-    )
-    adjusted = pd.read_csv(tmp_path / "abc.csv", index_col="Date")
-    assert adjusted.loc["2024-05-01", "Close"] == 40
-    assert adjusted.loc["2024-05-02", "Close"] == 100
-
-    prices.to_csv(tmp_path / "bonus.csv")
-    eod._adjust_nse_stocks(
-        {
-            "equityActions": [{
-                "symbol": "BONUS",
-                "subject": "Bonus 1:1",
-                "exDate": "02-May-2024",
-                "series": "EQ",
-            }]
-        },
-        tmp_path,
-        dates,
-        _logger(),
-    )
-    bonus = pd.read_csv(tmp_path / "bonus.csv", index_col="Date")
-    assert bonus.loc["2024-05-01", "Close"] == 50
-    assert bonus.loc["2024-05-02", "Close"] == 100
-
-
-def test_symbol_rename_preserves_history(tmp_path):
+def test_symbol_rename_preserves_duckdb_history_without_text_copy(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "prices.duckdb"
+    conn = duckdb.connect(str(database))
+    create_compact_schema(conn)
+    upsert_daily_prices(conn, pd.DataFrame([{
+        "Date": "2024-05-01", "Symbol": "OLDBOB", "Exchange": "NSE",
+        "ISIN": "ISIN1", "Open": 100, "High": 100, "Low": 90,
+        "Close": 95, "Volume": 900, "Series": "EQ",
+    }]))
+    conn.close()
+    monkeypatch.setattr(config, "DUCKDB_FILE", database)
     bhav = tmp_path / "bhav.csv"
     delivery = tmp_path / "delivery.csv"
     metadata = tmp_path / "metadata"
@@ -153,24 +122,34 @@ def test_symbol_rename_preserves_history(tmp_path):
         "SYMBOL": "NEWBOB", " SERIES": " EQ", " NO_OF_TRADES": 100,
         " DELIV_QTY": 500,
     }]).to_csv(delivery, index=False)
-    (tmp_path / "oldbob.csv").write_text(
-        "Date,Open,High,Low,Close,Volume,Series,TOTAL_TRADES,QTY_PER_TRADE,DLV_QTY\n"
-        "2024-05-01,100,100,90,95,900,EQ,90,10,400\n"
-    )
     isin = pd.DataFrame({"SYMBOL": ["OLDBOB"]}, index=pd.Index(["ISIN1"], name="ISIN"))
+    text_dir = tmp_path / "text"
 
-    eod._update_nse_eod(bhav, delivery, tmp_path, metadata, isin, _dates("2024-05-03T00:00:00+05:30"), _logger())
+    eod._update_nse_eod(
+        bhav, delivery, text_dir, metadata, isin,
+        _dates("2024-05-03T00:00:00+05:30"), _logger(),
+    )
 
-    assert not (tmp_path / "oldbob.csv").exists()
-    assert (tmp_path / "newbob.csv").exists()
-    assert len(pd.read_csv(tmp_path / "newbob.csv")) == 2
-    assert isin.loc["ISIN1", "SYMBOL"] == "NEWBOB"
+    conn = duckdb.connect(str(database), read_only=True)
+    rows = conn.execute(
+        "SELECT Symbol, Date, Close FROM eod_data ORDER BY Date"
+    ).fetchall()
+    conn.close()
+    assert rows == [
+        ("NEWBOB", datetime(2024, 5, 1).date(), 95.0),
+        ("NEWBOB", datetime(2024, 5, 3).date(), 115.0),
+    ]
+    assert not text_dir.exists()
+    assert pd.read_csv(metadata / "isin.csv", index_col="ISIN").loc[
+        "ISIN1", "SYMBOL"
+    ] == "NEWBOB"
 
 
 def test_pending_delivery_updates_daily_file_and_cleans_download(tmp_path):
-    daily = tmp_path / "abc.csv"
+    daily = tmp_path / "20240502_BENNY_NSE_EOD.txt"
     pd.DataFrame([{
-        "Date": "2024-05-02", "Open": 100, "High": 100, "Low": 90,
+        "Symbol": "ABC", "Date": "2024-05-02",
+        "Open": 100, "High": 100, "Low": 90,
         "Close": 95, "Volume": 900, "Series": "EQ", "TOTAL_TRADES": "",
         "QTY_PER_TRADE": "", "DLV_QTY": "",
     }]).to_csv(daily, index=False)
@@ -191,7 +170,7 @@ def test_pending_delivery_updates_daily_file_and_cleans_download(tmp_path):
     assert not report.exists()
 
 
-def test_index_update_normalizes_symbol_and_prevents_duplicate(tmp_path):
+def test_index_update_only_adds_normalized_daily_bhavcopy_row(tmp_path):
     report = tmp_path / "indices.csv"
     pd.DataFrame([{
         "Index Name": "NIFTY 50/TEST",
@@ -206,12 +185,11 @@ def test_index_update_normalizes_symbol_and_prevents_duplicate(tmp_path):
     rows = []
 
     eod._update_index_eod(report, tmp_path, dates, _logger(), rows)
-    eod._update_index_eod(report, tmp_path, dates, _logger(), rows)
 
     daily = tmp_path / "nifty 50-test.csv"
-    assert daily.exists()
-    assert len(daily.read_text().splitlines()) == 2
-    assert len(rows) == 2
+    assert not daily.exists()
+    assert len(rows) == 1
+    assert rows[0].startswith("NIFTY 50-TEST,2024-05-02,")
 
 
 def test_sync_entrypoint_rejects_missing_metadata(tmp_path):

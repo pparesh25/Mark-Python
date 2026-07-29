@@ -17,7 +17,7 @@ STOCK_SERIES = ("EQ", "BE", "BZ", "SM", "ST")
 def update_nse_eod(
     bhav_file: Path,
     delivery_file: Optional[Path],
-    data_dir: Path,
+    _data_dir: Path,
     metadata_dir: Path,
     isin: pd.DataFrame,
     dates: Any,
@@ -31,9 +31,6 @@ def update_nse_eod(
     isin_updated = False
 
     frame = pd.read_csv(bhav_file, index_col="ISIN")
-    bhav_folder = data_dir / "nseBhav" / str(dates.dt.year)
-    bhav_folder.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(bhav_folder / bhav_file.name)
     frame = frame.loc[frame["SctySrs"].isin(STOCK_SERIES)]
 
     # Pre-build delivery lookup dictionary to avoid slow Pandas lookups in loop

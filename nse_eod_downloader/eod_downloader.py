@@ -27,7 +27,6 @@ from .holidays import (
     is_special_session,
 )
 from .indices import update_index_eod as persist_index_eod
-from .indices import update_indice as persist_indice
 from .stock_data import update_nse_eod as persist_stock_eod
 from .stock_data import update_nse_symbol as persist_stock_symbol
 from .sync import SyncDependencies, sync_database as run_sync_database
@@ -445,8 +444,16 @@ def _check_special_sessions(nse: NSE, meta: dict, dates: Dates, logger: logging.
     return updated
 
 
-def _update_pending_delivery_data(nse: NSE, date_str: str, data_dir: Path, logger: logging.Logger, tz_IN: ZoneInfo) -> bool:
-    return update_pending_delivery_data(nse, date_str, data_dir, logger, tz_IN)
+def _update_pending_delivery_data(
+    nse: NSE,
+    date_str: str,
+    daily_bhavcopy_dir: Optional[Path],
+    logger: logging.Logger,
+    tz_IN: ZoneInfo,
+) -> bool:
+    return update_pending_delivery_data(
+        nse, date_str, daily_bhavcopy_dir, logger, tz_IN
+    )
 
 
 # Compatibility entry points.  The implementation now lives in focused
@@ -462,10 +469,6 @@ def _update_nse_symbol(*args, **kwargs):
 
 def _update_index_eod(*args, **kwargs):
     return persist_index_eod(*args, **kwargs)
-
-
-def _update_indice(*args, **kwargs):
-    return persist_indice(*args, **kwargs)
 
 
 def sync_database(

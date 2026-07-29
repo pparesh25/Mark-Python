@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -12,11 +12,11 @@ import pandas as pd
 def update_pending_delivery_data(
     nse: Any,
     date_str: str,
-    data_dir: Path,
+    daily_bhavcopy_dir: Optional[Path],
     logger: Any,
     tz_in: Any,
 ) -> bool:
-    """Apply a previously unavailable delivery report to a daily file.
+    """Apply a late delivery report only to the consolidated daily bhavcopy.
 
     Returns ``True`` when the report is applied or when retrying should stop;
     returns ``False`` when the report should remain pending.
@@ -39,43 +39,51 @@ def update_pending_delivery_data(
         return False
 
     try:
-        delivery = pd.read_csv(report_file, index_col="SYMBOL")
-        delivery_folder = data_dir / "nseDelivery" / str(dt.year)
-        delivery_folder.mkdir(parents=True, exist_ok=True)
-        delivery.to_csv(delivery_folder / report_file.name)
+        if daily_bhavcopy_dir is None:
+            report_file.unlink()
+            return True
+        daily_file = daily_bhavcopy_dir / f"{dt:%Y%m%d}_BENNY_NSE_EOD.txt"
+        if not daily_file.exists():
+            logger.warning(
+                f"Consolidated daily bhavcopy missing for pending delivery date {dt:%Y-%m-%d}"
+            )
+            report_file.unlink()
+            return True
 
+        delivery = pd.read_csv(report_file)
+        delivery.columns = delivery.columns.str.strip()
         delivery = delivery[
-            delivery[" SERIES"].isin((" EQ", " BE", " BZ", " SM", " ST"))
-        ]
+            delivery["SERIES"].str.strip().isin(("EQ", "BE", "BZ", "SM", "ST"))
+        ].copy()
+        delivery["SYMBOL"] = delivery["SYMBOL"].astype(str).str.strip().str.upper()
+        delivery = delivery.set_index("SYMBOL")
 
-        for symbol in delivery.index:
-            daily_file = data_dir / f"{symbol.lower()}.csv"
-            if not daily_file.exists():
-                daily_file = data_dir / f"{symbol.lower()}_sme.csv"
-                if not daily_file.exists():
-                    continue
-
-            daily = pd.read_csv(daily_file, index_col="Date", parse_dates=["Date"])
-            if dt not in daily.index:
+        daily = pd.read_csv(daily_file)
+        for index, row in daily.iterrows():
+            symbol = str(row["Symbol"]).strip().upper()
+            lookup = symbol.removesuffix("_SME")
+            if lookup not in delivery.index:
                 continue
-
-            volume = daily.loc[dt, "Volume"]
-            trades, delivered_quantity = delivery.loc[
-                symbol, [" NO_OF_TRADES", " DELIV_QTY"]
-            ]
-            series = delivery.loc[symbol, " SERIES"].strip()
+            report_row = delivery.loc[lookup]
+            if isinstance(report_row, pd.DataFrame):
+                report_row = report_row.iloc[0]
+            trades = report_row["NO_OF_TRADES"]
+            series = str(report_row["SERIES"]).strip()
             delivered_quantity = (
-                volume if series in ("BE", "BZ") else int(delivered_quantity)
+                row["Volume"] if series in ("BE", "BZ") else report_row["DELIV_QTY"]
             )
             avg_trades = (
-                "" if trades == "" or pd.isna(trades) else round(volume / trades, 2)
+                "" if trades == "" or pd.isna(trades)
+                else round(float(row["Volume"]) / float(trades), 2)
             )
-            daily.loc[dt, ["TOTAL_TRADES", "QTY_PER_TRADE", "DLV_QTY"]] = [
+            daily.loc[index, ["TOTAL_TRADES", "QTY_PER_TRADE", "DLV_QTY"]] = [
                 trades,
                 avg_trades,
                 delivered_quantity,
             ]
-            daily.to_csv(daily_file)
+        temporary = daily_file.with_suffix(daily_file.suffix + ".tmp")
+        daily.to_csv(temporary, index=False)
+        temporary.replace(daily_file)
 
         report_file.unlink()
         return True
@@ -84,4 +92,3 @@ def update_pending_delivery_data(
         if report_file and report_file.exists():
             report_file.unlink()
         return False
-
