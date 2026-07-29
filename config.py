@@ -49,16 +49,6 @@ DATA_DIR = DATABASE_DIR / "NSE_EOD"
 BSE_DATA_DIR = DATABASE_DIR / "BSE_EOD"
 DUCKDB_FILE = DATABASE_DIR / "NSE_BSE_EOD.duckdb"
 
-# Pipeline Mode Flags:
-# USE_RUST_CALCULATION: If True, screening calculation is performed by the Rust engine.
-# USE_RUST_CHARTS: If True, chart image export is performed by the Rust engine.
-# Mode 1 (Full Rust): USE_RUST_CALCULATION = True, USE_RUST_CHARTS = True
-# Mode 2 (Hybrid R&D): USE_RUST_CALCULATION = False, USE_RUST_CHARTS = True
-# Mode 3 (Pure Python): USE_RUST_CALCULATION = False, USE_RUST_CHARTS = False
-USE_RUST_CALCULATION = True
-USE_RUST_CHARTS = True
-
-
 def _rust_platform_key(system_name=None, machine_name=None):
     """Return the prebuilt-binary directory for this operating system."""
     system = (system_name or platform.system()).strip().lower()

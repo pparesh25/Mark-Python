@@ -1,4 +1,5 @@
 mod chart;
+mod pipeline;
 mod screener;
 
 use chrono::NaiveDate;
@@ -129,6 +130,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.len() >= 2 && args[1] == "screen" {
         return screener::run_screener_cmd(&args[2..]);
     }
+    if args.len() >= 2 && args[1] == "pipeline" {
+        return pipeline::run_pipeline_cmd(&args[2..]);
+    }
 
     let (tasks_csv, duckdb_file, output_dir) = if args.len() >= 5 && args[1] == "chart" {
         (&args[3], &args[2], &args[4])
@@ -144,12 +148,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "   OR: {} screen <duckdb_file> <fundamental_csv> <NSE|BSE|ALL> <out_dir>",
             args[0]
         );
+        eprintln!(
+            "   OR: {} pipeline <duckdb_file> <fundamental_csv> <output_root> <chart_root> <timestamp> <opentrader_root>",
+            args[0]
+        );
         std::process::exit(1);
     };
 
     let start_time = std::time::Instant::now();
 
-    fs::create_dir_all(&output_dir)?;
+    fs::create_dir_all(output_dir)?;
 
     println!("Loading chart tasks list from: {}", tasks_csv);
     let mut rdr = csv::Reader::from_path(tasks_csv)?;

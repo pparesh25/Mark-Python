@@ -25,6 +25,7 @@ fn get_monospace_center_x(text: &str, font_size: i32) -> i32 {
     start_x.round() as i32
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_stock_chart(
     eod_data: &EodData,
     symbol: &str,

@@ -49,6 +49,7 @@ pub struct ScreenedDataset {
     pub tight_flag_qualified: Vec<FlagResult>,
 }
 
+#[derive(Debug, Clone)]
 pub struct SymbolData {
     pub exchange: String,
     pub symbol: String,
@@ -58,6 +59,35 @@ pub struct SymbolData {
     pub highs: Vec<f64>,
     pub lows: Vec<f64>,
     pub closes: Vec<f64>,
+    pub volumes: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScreenOptions {
+    pub include_sme: bool,
+    pub only_sme: bool,
+    pub flag_lookback: usize,
+    pub mark_tight_only: bool,
+    pub tight_flag_only: bool,
+    pub max_date: Option<String>,
+}
+
+impl Default for ScreenOptions {
+    fn default() -> Self {
+        Self {
+            include_sme: false,
+            only_sme: false,
+            flag_lookback: 90,
+            mark_tight_only: false,
+            tight_flag_only: false,
+            max_date: None,
+        }
+    }
+}
+
+pub struct ScreenRun {
+    pub symbol_datasets: Vec<SymbolData>,
+    pub datasets: HashMap<String, ScreenedDataset>,
 }
 
 struct EmaAccumulator {
@@ -329,9 +359,9 @@ fn process_flag_screener(
         // Find peak high index in range (i + 1)..=max_j
         let mut j_peak = i + 1;
         let mut max_h = highs[j_peak];
-        for candidate_j in (i + 1)..=max_j {
-            if highs[candidate_j] > max_h {
-                max_h = highs[candidate_j];
+        for (candidate_j, &candidate_high) in highs.iter().enumerate().take(max_j + 1).skip(i + 1) {
+            if candidate_high > max_h {
+                max_h = candidate_high;
                 j_peak = candidate_j;
             }
         }
@@ -361,8 +391,13 @@ fn process_flag_screener(
                         // 4. Tight Breakout Check (within 15 days of peak)
                         let mut breakout_k: Option<usize> = None;
                         let max_breakout_k = std::cmp::min(n, j_peak + 16);
-                        for k in (j_peak + 1)..max_breakout_k {
-                            if closes[k] > highs[j_peak] {
+                        for (k, &candidate_close) in closes
+                            .iter()
+                            .enumerate()
+                            .take(max_breakout_k)
+                            .skip(j_peak + 1)
+                        {
+                            if candidate_close > highs[j_peak] {
                                 breakout_k = Some(k);
                                 break;
                             }
@@ -370,14 +405,12 @@ fn process_flag_screener(
 
                         if let Some(k_idx) = breakout_k {
                             // 5. Breakout Holding Rule: Latest close > Pole Peak High
-                            if closes[n - 1] > highs[j_peak] {
-                                if !is_tight_flag {
-                                    is_tight_flag = true;
-                                    tight_flag_date = Some(dates[j_peak].clone());
-                                    tight_start_date = Some(dates[i].clone());
-                                    tight_peak_date = Some(dates[j_peak].clone());
-                                    breakout_date = Some(dates[k_idx].clone());
-                                }
+                            if closes[n - 1] > highs[j_peak] && !is_tight_flag {
+                                is_tight_flag = true;
+                                tight_flag_date = Some(dates[j_peak].clone());
+                                tight_start_date = Some(dates[i].clone());
+                                tight_peak_date = Some(dates[j_peak].clone());
+                                breakout_date = Some(dates[k_idx].clone());
                             }
                         }
                     }
@@ -422,7 +455,7 @@ fn load_valid_isins(fundamental_csv: &str) -> Result<HashSet<String>, Box<dyn st
     let isin_idx = headers
         .iter()
         .position(|h| h.trim() == "ISIN Code")
-        .ok_or_else(|| "ISIN Code column missing in fundamental CSV")?;
+        .ok_or("ISIN Code column missing in fundamental CSV")?;
 
     for result in rdr.records() {
         let record = result?;
@@ -436,85 +469,40 @@ fn load_valid_isins(fundamental_csv: &str) -> Result<HashSet<String>, Box<dyn st
     Ok(valid_isins)
 }
 
-pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut positional: Vec<&String> = Vec::new();
-    let mut include_sme = false;
-    let mut only_sme = false;
-    let mut flag_lookback = 90_usize;
-    let mut mark_tight_only = false;
-    let mut tight_flag_only = false;
-    let mut index = 0;
-
-    while index < args.len() {
-        match args[index].as_str() {
-            "--include-sme" => include_sme = true,
-            "--only-sme" => only_sme = true,
-            "--mark-tight-only" => mark_tight_only = true,
-            "--tight-flag-only" => tight_flag_only = true,
-            "--flag-lookback" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "--flag-lookback requires a positive integer",
-                    )
-                })?;
-                flag_lookback = value.parse::<usize>().map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "--flag-lookback requires a positive integer",
-                    )
-                })?;
-                if flag_lookback == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "--flag-lookback must be greater than zero",
-                    )
-                    .into());
-                }
-                index += 1;
-            }
-            value if value.starts_with("--") => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("unknown screen option: {value}"),
-                )
-                .into());
-            }
-            _ => positional.push(&args[index]),
-        }
-        index += 1;
-    }
-
-    if positional.len() < 4 {
-        eprintln!("Usage: stock_analysis screen <duckdb_file> <fundamental_csv> <NSE|BSE|ALL> <out_dir> [max_date] [--mark-tight-only|--tight-flag-only] [--include-sme|--only-sme] [--flag-lookback N]");
-        std::process::exit(1);
-    }
-    if mark_tight_only && tight_flag_only {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "--mark-tight-only and --tight-flag-only cannot be combined",
-        )
-        .into());
-    }
-
-    let duckdb_file = positional[0];
-    let fundamental_csv = positional[1];
-    let exchange_scope = positional[2].to_uppercase();
-    if !matches!(exchange_scope.as_str(), "NSE" | "BSE" | "ALL") {
+fn validate_exchange_scope(exchange_scope: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !matches!(exchange_scope, "NSE" | "BSE" | "ALL") {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "exchange must be NSE, BSE, or ALL",
         )
         .into());
     }
-    let out_dir = Path::new(positional[3]);
-    let max_date = positional
-        .get(4)
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+    Ok(())
+}
 
-    std::fs::create_dir_all(out_dir)?;
+pub fn screen_market(
+    duckdb_file: &str,
+    fundamental_csv: &str,
+    exchange_scope: &str,
+    options: &ScreenOptions,
+) -> Result<ScreenRun, Box<dyn std::error::Error>> {
+    let exchange_scope = exchange_scope.trim().to_uppercase();
+    validate_exchange_scope(&exchange_scope)?;
+    if options.mark_tight_only && options.tight_flag_only {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mark-tight-only and tight-flag-only cannot be combined",
+        )
+        .into());
+    }
+    if options.flag_lookback == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "flag lookback must be greater than zero",
+        )
+        .into());
+    }
+
     let total_started = std::time::Instant::now();
     let fetch_started = std::time::Instant::now();
     let valid_isins = load_valid_isins(fundamental_csv)?;
@@ -553,7 +541,9 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
              WHERE Exchange = 'NSE'
          )
          SELECT e.Exchange, CAST(e.Date AS VARCHAR), e.Symbol, e.ISIN, \
-         e.Open, e.High, e.Low, e.Close \
+         COALESCE(e.Open, 0.0), COALESCE(e.High, 0.0), \
+         COALESCE(e.Low, 0.0), COALESCE(e.Close, 0.0), \
+         COALESCE(e.Volume, 0.0) \
          FROM eod_data e
          INNER JOIN valid_isins f ON f.isin = TRIM(UPPER(e.ISIN))
          WHERE {exchange_predicate} \
@@ -571,6 +561,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
     let mut highs = Vec::new();
     let mut lows = Vec::new();
     let mut closes = Vec::new();
+    let mut volumes = Vec::new();
 
     let push_current = |target: &mut Vec<SymbolData>,
                         exchange: String,
@@ -580,7 +571,8 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
                         opens: Vec<f64>,
                         highs: Vec<f64>,
                         lows: Vec<f64>,
-                        closes: Vec<f64>| {
+                        closes: Vec<f64>,
+                        volumes: Vec<f64>| {
         if !symbol.is_empty() && !dates.is_empty() {
             target.push(SymbolData {
                 exchange,
@@ -591,6 +583,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
                 highs,
                 lows,
                 closes,
+                volumes,
             });
         }
     };
@@ -602,11 +595,15 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
         let isin: String = row.get(3)?;
         let isin_clean = isin.trim().to_uppercase();
         let is_sme = symbol.trim().to_uppercase().ends_with("_SME");
-        if (only_sme && !is_sme) || (!only_sme && !include_sme && is_sme) {
+        if (options.only_sme && !is_sme) || (!options.only_sme && !options.include_sme && is_sme) {
             continue;
         }
         let clean_date = date_raw.split('T').next().unwrap_or(&date_raw).to_string();
-        if max_date.as_ref().is_some_and(|limit| clean_date > *limit) {
+        if options
+            .max_date
+            .as_ref()
+            .is_some_and(|limit| clean_date > *limit)
+        {
             continue;
         }
 
@@ -621,6 +618,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
                 highs,
                 lows,
                 closes,
+                volumes,
             );
             current_exchange = exchange;
             current_symbol = symbol;
@@ -630,6 +628,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
             highs = Vec::new();
             lows = Vec::new();
             closes = Vec::new();
+            volumes = Vec::new();
         }
 
         dates.push(clean_date);
@@ -637,6 +636,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
         highs.push(row.get(5)?);
         lows.push(row.get(6)?);
         closes.push(row.get(7)?);
+        volumes.push(row.get(8)?);
     }
     push_current(
         &mut symbol_datasets,
@@ -648,6 +648,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
         highs,
         lows,
         closes,
+        volumes,
     );
     drop(rows);
     drop(stmt);
@@ -666,14 +667,14 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
             if data.closes.len() < 252 {
                 return (data.exchange.clone(), None, None);
             }
-            let indicators = (!tight_flag_only).then(|| calculate_mark_indicators(data));
+            let indicators = (!options.tight_flag_only).then(|| calculate_mark_indicators(data));
             let mark = indicators
                 .as_ref()
                 .and_then(|values| process_mark_screener(data, values));
-            let flag = if mark_tight_only {
+            let flag = if options.mark_tight_only {
                 None
             } else {
-                process_flag_screener(data, flag_lookback, indicators.as_ref())
+                process_flag_screener(data, options.flag_lookback, indicators.as_ref())
             };
             (data.exchange.clone(), mark, flag)
         })
@@ -705,7 +706,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
         screening_started.elapsed().as_secs_f64()
     );
 
-    let export_started = std::time::Instant::now();
+    let mut datasets = HashMap::new();
     for exchange in target_exchanges {
         let selected: Vec<&SymbolData> = symbol_datasets
             .iter()
@@ -729,8 +730,79 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
             mark_tight_qualified,
             tight_flag_qualified,
         };
-        let exchange_out_dir = if exchange_scope == "ALL" {
-            out_dir.join(exchange)
+        println!(
+            "   {}: {} Mark Tight | {} Tight Flag",
+            exchange,
+            dataset.mark_tight_qualified.len(),
+            dataset.tight_flag_qualified.len(),
+        );
+        datasets.insert(exchange.to_string(), dataset);
+    }
+    println!(
+        "🚀 RUST DATA + SCREENING TIME: {:.2}s",
+        total_started.elapsed().as_secs_f64()
+    );
+    Ok(ScreenRun {
+        symbol_datasets,
+        datasets,
+    })
+}
+
+pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut positional: Vec<&String> = Vec::new();
+    let mut options = ScreenOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--include-sme" => options.include_sme = true,
+            "--only-sme" => options.only_sme = true,
+            "--mark-tight-only" => options.mark_tight_only = true,
+            "--tight-flag-only" => options.tight_flag_only = true,
+            "--flag-lookback" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--flag-lookback requires a positive integer",
+                    )
+                })?;
+                options.flag_lookback = value.parse::<usize>().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--flag-lookback requires a positive integer",
+                    )
+                })?;
+                index += 1;
+            }
+            value if value.starts_with("--") => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown screen option: {value}"),
+                )
+                .into());
+            }
+            _ => positional.push(&args[index]),
+        }
+        index += 1;
+    }
+
+    if positional.len() < 4 {
+        eprintln!("Usage: stock_analysis screen <duckdb_file> <fundamental_csv> <NSE|BSE|ALL> <out_dir> [max_date] [--mark-tight-only|--tight-flag-only] [--include-sme|--only-sme] [--flag-lookback N]");
+        std::process::exit(1);
+    }
+    options.max_date = positional
+        .get(4)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let out_dir = Path::new(positional[3]);
+    std::fs::create_dir_all(out_dir)?;
+    let run = screen_market(positional[0], positional[1], positional[2], &options)?;
+    let export_started = std::time::Instant::now();
+    for (exchange, dataset) in run.datasets {
+        let exchange_out_dir = if positional[2].eq_ignore_ascii_case("ALL") {
+            out_dir.join(&exchange)
         } else {
             out_dir.to_path_buf()
         };
@@ -738,21 +810,11 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
         let out_file = exchange_out_dir.join(format!("{}_rust_screened.json", exchange));
         let writer = std::io::BufWriter::new(File::create(&out_file)?);
         serde_json::to_writer(writer, &dataset)?;
-        println!(
-            "   {}: {} Mark Tight | {} Tight Flag -> {}",
-            exchange,
-            dataset.mark_tight_qualified.len(),
-            dataset.tight_flag_qualified.len(),
-            out_file.display()
-        );
+        println!("   {} candidate JSON -> {}", exchange, out_file.display());
     }
     println!(
-        "⏱️ [3/3] Candidate JSON export: {:.3}s",
+        "⏱️ Candidate JSON export: {:.3}s",
         export_started.elapsed().as_secs_f64()
-    );
-    println!(
-        "🚀 TOTAL RUST SCREENING TIME: {:.2}s",
-        total_started.elapsed().as_secs_f64()
     );
     Ok(())
 }
@@ -772,6 +834,7 @@ mod tests {
             highs,
             lows: vec![100.0; len],
             closes,
+            volumes: vec![0.0; len],
         }
     }
 
@@ -796,8 +859,8 @@ mod tests {
     fn requires_the_latest_close_to_hold_the_breakout_level() {
         let mut closes = vec![100.0; 270];
         let mut highs = vec![100.0; 270];
-        for i in 191..251 {
-            highs[i] = 300.0;
+        for high in highs.iter_mut().take(251).skip(191) {
+            *high = 300.0;
         }
         closes[251] = 250.0;
         highs[251] = 250.0;

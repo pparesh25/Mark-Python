@@ -1,8 +1,10 @@
 # Mark Screener
 
-Cross-platform NSE/BSE Mark Tight and Tight Flag pipeline.  The normal runtime
-uses a precompiled Rust engine, so Windows and Linux machines need Python but
-do not need Rust, Cargo, CMake, or a C/C++ compiler.
+Cross-platform NSE/BSE Mark Tight and Tight Flag pipeline. Python is retained
+only for the three network downloaders (NSE EOD, BSE EOD and Screener.in
+fundamentals). After downloads finish, one precompiled Rust process performs
+all local screening, enrichment, ranking, CSV/watchlist output and charting.
+Windows and Linux machines do not need Rust, Cargo, CMake, or a C/C++ compiler.
 
 ## Supported runtime
 
@@ -155,8 +157,9 @@ optimized two-request HTTP flow.  An older local file is used only when
 2. Select or download validated fundamentals.
 3. Filter listed symbols by fundamental ISIN; remove NSE/BSE overlap from the
    BSE universe and apply the requested SME policy.
-4. Screen NSE and BSE in one parallel Rust process, export fundamental-enriched
-   CSVs, OpenTrader Pro watchlists, charts, and a timestamped log.
+4. Run one local Rust process that screens NSE/BSE, joins fundamentals, ranks
+   by latest breakout and exports all CSVs, OpenTrader Pro watchlists and
+   charts. Screening data is reused for charting, so DuckDB is not read again.
 
 Daily NSE/BSE updates retain full price history in DuckDB and the maintained
 BSE text backup; they do not delete an older candle when a new session is
@@ -182,11 +185,6 @@ logs/screening_log_YYYYMMDD_HHMMSS.txt
 CSV files are timestamped.  Strategy chart directories are regenerated on
 each run.
 
-## Optional legacy fallback
-
-The precompiled Rust engine is the supported fast path.  To install the larger
-Python calculation/chart fallback as well:
-
-```bash
-python -m pip install -r requirements-legacy.txt
-```
+There is no Python calculation or chart fallback. A missing or failed Rust
+binary stops local processing instead of silently switching to a second rule
+implementation.

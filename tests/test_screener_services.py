@@ -1,57 +1,9 @@
 """Tests for non-strategy screener services."""
 
 from pathlib import Path
-from datetime import date, timedelta
-
-import pandas as pd
 
 import config
 import run_screener
-from mark_screener import results
-
-
-def test_results_are_indexed_by_latest_breakout_first(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "WATCHLISTS_ENABLED", False)
-    monkeypatch.setattr(results, "CURRENT_TIMESTAMP", "20260730_120000")
-    out_dir = tmp_path / "csv"
-    out_dir.mkdir()
-    today = date.today()
-    technical = pd.DataFrame({
-        "symbol": ["OLDER", "LATEST"],
-        "isin": ["IN1", "IN2"],
-        "date": [today.isoformat(), today.isoformat()],
-        "breakout_date": [
-            (today - timedelta(days=5)).isoformat(),
-            (today - timedelta(days=1)).isoformat(),
-        ],
-    })
-    fundamentals = pd.DataFrame({
-        "ISIN Code": ["IN1", "IN2"],
-        "Name": ["Older Ltd", "Latest Ltd"],
-    })
-
-    ordered = results.process_results(
-        technical,
-        fundamentals,
-        "nse_tight_flag",
-        out_dir,
-        tmp_path / "charts",
-        "breakout_date",
-        tmp_path,
-        render_charts=False,
-    )
-
-    assert ordered["symbol"].tolist() == ["LATEST", "OLDER"]
-    assert ordered["Days_Since_Breakout"].tolist() == [1, 5]
-    exported = pd.read_csv(
-        out_dir / "20260730_120000_nse_tight_flag_qualified.csv"
-    )
-    assert exported[["Index", "symbol", "Days_Since_Breakout"]].to_dict(
-        "records"
-    ) == [
-        {"Index": 0, "symbol": "LATEST", "Days_Since_Breakout": 1},
-        {"Index": 1, "symbol": "OLDER", "Days_Since_Breakout": 5},
-    ]
 
 
 def test_opentrader_watchlist_paths_are_exchange_specific(tmp_path):
@@ -69,54 +21,40 @@ def test_screener_credentials_live_below_portable_data_root(tmp_path):
     )
 
 
-def test_shared_result_writer_preserves_database_symbol_suffix(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(config, "WATCHLISTS_ENABLED", True)
-    monkeypatch.setattr(config, "STRIP_SME_WATCHLIST_SUFFIX", False)
-    monkeypatch.setattr(config, "OPENTRADER_ROOT", tmp_path)
-    monkeypatch.setattr(results, "CURRENT_TIMESTAMP", "20260727_120000")
-    frame = pd.DataFrame({
-        "Exchange": ["BSE", "BSE", "BSE"],
-        "symbol": ["SECOND_SME", "FIRST", "FIRST"],
-    })
-
-    output = results.write_watchlist(frame, "bse_tight_flag")
-
-    assert output == (
-        tmp_path / "databases" / "BSE_EOD" / "watchlists"
-        / "20260727_120000_bse_tight_flag.txt"
-    )
-    assert output.read_text(encoding="utf-8") == "SECOND_SME\nFIRST\n"
-
-
-def test_watchlist_writer_can_strip_sme_suffix_explicitly(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(config, "WATCHLISTS_ENABLED", True)
-    monkeypatch.setattr(config, "STRIP_SME_WATCHLIST_SUFFIX", True)
-    monkeypatch.setattr(config, "OPENTRADER_ROOT", tmp_path)
-    monkeypatch.setattr(results, "CURRENT_TIMESTAMP", "20260727_120001")
-
-    output = results.write_watchlist(
-        pd.DataFrame({"Exchange": ["NSE"], "symbol": ["ABC_SME"]}),
-        "nse_mark_tight",
-    )
-
-    assert output.read_text(encoding="utf-8") == "ABC\n"
-
-
-def test_watchlist_writer_can_be_disabled(tmp_path, monkeypatch):
+def test_local_processing_invokes_one_rust_pipeline(tmp_path, monkeypatch):
+    rust_binary = tmp_path / "stock_analysis"
+    rust_binary.write_bytes(b"binary")
+    monkeypatch.setattr(config, "RUST_BINARY", rust_binary)
+    monkeypatch.setattr(config, "DUCKDB_FILE", tmp_path / "eod.duckdb")
+    monkeypatch.setattr(config, "FUNDAMENTAL_FILE", tmp_path / "fund.csv")
+    monkeypatch.setattr(config, "OUT_DIR", tmp_path / "qualified")
+    monkeypatch.setattr(config, "CHART_DIR", tmp_path / "charts")
+    monkeypatch.setattr(config, "OPENTRADER_ROOT", tmp_path / "opentrader")
+    monkeypatch.setattr(config, "CURRENT_TIMESTAMP", "20260730_120000")
+    monkeypatch.setattr(config, "FLAG_LOOKBACK_DAYS", 90)
     monkeypatch.setattr(config, "WATCHLISTS_ENABLED", False)
-    monkeypatch.setattr(config, "OPENTRADER_ROOT", tmp_path)
+    monkeypatch.setattr(config, "STRIP_SME_WATCHLIST_SUFFIX", True)
+    captured = {}
 
-    output = results.write_watchlist(
-        pd.DataFrame({"Exchange": ["NSE"], "symbol": ["ABC"]}),
-        "nse_mark_tight",
+    def fake_run_step(name, cmd, logger, cwd=None):
+        captured["name"] = name
+        captured["cmd"] = cmd
+        return 0.1
+
+    monkeypatch.setattr(run_screener, "run_step", fake_run_step)
+    run_screener.run_all_screening(
+        logger=None,
+        include_sme=True,
     )
 
-    assert output is None
-    assert not any(tmp_path.rglob("*"))
+    command = captured["cmd"]
+    assert command[:2] == [str(rust_binary), "pipeline"]
+    assert command.count("pipeline") == 1
+    assert str(config.DUCKDB_FILE) in command
+    assert str(config.FUNDAMENTAL_FILE) in command
+    assert "--include-sme" in command
+    assert "--no-watchlists" in command
+    assert "--strip-sme-suffix" in command
 
 
 def test_fundamental_selection_requires_explicit_stale_fallback(

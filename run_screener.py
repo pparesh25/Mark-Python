@@ -6,7 +6,8 @@ Python orchestrator that:
 
   Step 1 — updates the eod2 price database (via the existing run_eod2.sh).
   Step 2 — downloads fresh fundamentals from screener.in over HTTP.
-  Step 3 — runs the technical + fundamental screen (Mark_screener.py).
+  Steps 3-4 — launches one Rust process for every local operation: technical
+  screening, fundamental join, ranking, CSV/watchlist output and charts.
 
 Improvements over the legacy shell orchestrator:
   * Real error propagation — a non-zero exit from any step aborts the run.
@@ -22,7 +23,6 @@ Windows and Linux launchers create/use a project-local virtual environment;
 the normal precompiled-Rust path does not require TA-Lib.
 """
 
-import importlib.util
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -35,12 +35,7 @@ from zoneinfo import ZoneInfo
 
 import config
 from screening_readiness import LocalDataError, inspect_eod_readiness, rebase_sync_cursor
-from config import (
-    BASE_DIR, CURRENT_TIMESTAMP,
-)
-
-# Screener module executed in Step 3 (filename has a space — quoted via Path).
-SCREENER_MODULE = BASE_DIR / 'Mark_screener.py'
+from config import CURRENT_TIMESTAMP
 
 # ANSI colours for the console (log file gets plain text via strip).
 _C = {
@@ -188,65 +183,41 @@ def validate_fundamentals(logger):
                       f"{age_min:.0f} min ago)", 'GREEN'))
 
 
-# ---------------------------------------------------------------------------
-# Step 3 & 4 — run screeners as subprocesses
-# ---------------------------------------------------------------------------
-FLAG_SCREENER_MODULE = BASE_DIR / 'flag_screener.py'
-
-def run_screening(logger, include_sme=False, only_sme=False):
-    """Execute Mark_screener.py as a subprocess for NSE and BSE."""
-    cmd_nse = [sys.executable, "-u", str(SCREENER_MODULE), "--exchange", "NSE"]
-    cmd_bse = [sys.executable, "-u", str(SCREENER_MODULE), "--exchange", "BSE"]
-    if include_sme:
-        cmd_nse.append("--include-sme")
-        cmd_bse.append("--include-sme")
-    if only_sme:
-        cmd_nse.append("--only-sme")
-        cmd_bse.append("--only-sme")
-
-    success_nse = run_step("Step 3/4: NSE Stock Screening", cmd_nse, logger)
-    success_bse = run_step("Step 3/4: BSE Stock Screening", cmd_bse, logger)
-    return success_nse and success_bse
-
-
-def run_flag_screening(logger, include_sme=False, only_sme=False):
-    """Execute flag_screener.py as a subprocess for NSE and BSE."""
-    cmd_nse = [sys.executable, "-u", str(FLAG_SCREENER_MODULE), "--exchange", "NSE"]
-    cmd_bse = [sys.executable, "-u", str(FLAG_SCREENER_MODULE), "--exchange", "BSE"]
-    if include_sme:
-        cmd_nse.append("--include-sme")
-        cmd_bse.append("--include-sme")
-    if only_sme:
-        cmd_nse.append("--only-sme")
-        cmd_bse.append("--only-sme")
-
-    success_nse = run_step("Step 4/4: NSE Tight Flag Screening", cmd_nse, logger)
-    success_bse = run_step("Step 4/4: BSE Tight Flag Screening", cmd_bse, logger)
-    return success_nse and success_bse
-
-
 def run_all_screening(logger, include_sme=False, only_sme=False):
-    """Use the combined Rust fast path, retaining the legacy fallback."""
-    if getattr(config, "USE_RUST_CALCULATION", False) and config.RUST_BINARY.exists():
-        from mark_screener.fast_pipeline import run_fast_screening
-
-        logger.info(color(
-            "▶ Steps 3-4/4: Combined NSE/BSE Mark Tight + Tight Flag Screening",
-            "BOLD",
+    """Run every post-download operation in one Rust process."""
+    if not config.RUST_BINARY.exists():
+        logger.error(color(
+            f"  ✗ Rust pipeline binary not found: {config.RUST_BINARY}",
+            "RED",
         ))
-        try:
-            if run_fast_screening(
-                logger,
-                include_sme=include_sme,
-                only_sme=only_sme,
-            ):
-                return
-        except Exception as error:
-            logger.error(f"  Combined Rust screening failed: {error}")
-            logger.warning("  Falling back to the legacy per-screener pipeline.")
+        sys.exit(1)
 
-    run_screening(logger, include_sme=include_sme, only_sme=only_sme)
-    run_flag_screening(logger, include_sme=include_sme, only_sme=only_sme)
+    cmd = [
+        str(config.RUST_BINARY),
+        "pipeline",
+        str(config.DUCKDB_FILE),
+        str(config.FUNDAMENTAL_FILE),
+        str(config.OUT_DIR),
+        str(config.CHART_DIR),
+        config.CURRENT_TIMESTAMP,
+        str(config.OPENTRADER_ROOT),
+        "--flag-lookback",
+        str(config.FLAG_LOOKBACK_DAYS),
+    ]
+    if include_sme:
+        cmd.append("--include-sme")
+    if only_sme:
+        cmd.append("--only-sme")
+    if not config.WATCHLISTS_ENABLED:
+        cmd.append("--no-watchlists")
+    if config.STRIP_SME_WATCHLIST_SUFFIX:
+        cmd.append("--strip-sme-suffix")
+
+    run_step(
+        "Steps 3-4/4: Local Rust screening, outputs and charts",
+        cmd,
+        logger,
+    )
 
 
 # ---------------------------------------------------------------------------
