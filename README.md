@@ -46,9 +46,9 @@ On Windows the default resolves to:
 C:\Users\<username>\Mark EMA and HTF\Screener login\screener.txt
 ```
 
-Line 1 is the Screener.in email and line 2 is the password.  Google Chrome
-must also be installed for that download.  The credential file stays outside
-the downloaded repository/ZIP and must never be committed.
+Line 1 is the Screener.in email and line 2 is the password.  Fundamentals are
+downloaded directly over HTTP, so no browser is required.  The credential file
+stays outside the downloaded repository/ZIP and must never be committed.
 
 Because the repository and releases are private, set `GITHUB_TOKEN` or
 `GH_TOKEN` to a token with repository Contents read permission before setup.
@@ -135,8 +135,8 @@ NSE watchlists:    ~/.opentrader-pro/databases/NSE_EOD/watchlists
 BSE watchlists:    ~/.opentrader-pro/databases/BSE_EOD/watchlists
 ```
 
-Every qualified result set writes a ranked watchlist through the shared result
-pipeline, including the fast Rust path.  Symbols preserve their database
+Every qualified result set writes a deterministic, symbol-ordered watchlist
+through the shared result pipeline, including the fast Rust path. Symbols preserve their database
 names, including `_SME`, by default so OpenTrader Pro resolves the correct
 chart.  `--strip-sme-watchlist-suffix` is an explicit compatibility option
 for a database whose SME tickers do not use that suffix.
@@ -144,8 +144,9 @@ for a database whose SME tickers do not use that suffix.
 ## Fundamental freshness
 
 The normal run uses `all-company_YYYYMMDD.csv` for the current date.  If that
-file is absent, Selenium downloads it from Screener.in.  An older local file is
-used only when `--allow-stale-fundamentals` is explicitly supplied.
+file is absent, the app downloads it directly from Screener.in with an
+optimized two-request HTTP flow.  An older local file is used only when
+`--allow-stale-fundamentals` is explicitly supplied.
 
 ## Pipeline
 
@@ -154,8 +155,8 @@ used only when `--allow-stale-fundamentals` is explicitly supplied.
 2. Select or download validated fundamentals.
 3. Filter listed symbols by fundamental ISIN; remove NSE/BSE overlap from the
    BSE universe and apply the requested SME policy.
-4. Screen NSE and BSE in parallel with Rust, rank results, export CSVs,
-   OpenTrader Pro watchlists, charts, and a timestamped log.
+4. Screen NSE and BSE in one parallel Rust process, export fundamental-enriched
+   CSVs, OpenTrader Pro watchlists, charts, and a timestamped log.
 
 Daily NSE/BSE updates retain full price history in DuckDB and the maintained
 BSE text backup; they do not delete an older candle when a new session is

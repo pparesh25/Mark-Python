@@ -1,11 +1,10 @@
-use chrono::NaiveDate;
 use duckdb::{AccessMode, Config, Connection};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarkResult {
@@ -18,10 +17,7 @@ pub struct MarkResult {
     pub ema_200: f64,
     pub high_52w: f64,
     pub low_52w: f64,
-    pub mark_date: String,
-    pub mark_tight_date: Option<String>,
-    pub tight_breakout: bool,
-    pub donchian_60_base: f64,
+    pub mark_tight_date: String,
     pub down_52w_high: f64,
 }
 
@@ -45,11 +41,16 @@ pub struct FlagResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenedDataset {
     pub exchange: String,
+    pub fundamental_isins: usize,
+    pub selected_symbols: usize,
+    pub history_ready: usize,
+    pub max_history: usize,
     pub mark_tight_qualified: Vec<MarkResult>,
     pub tight_flag_qualified: Vec<FlagResult>,
 }
 
 pub struct SymbolData {
+    pub exchange: String,
     pub symbol: String,
     pub isin: String,
     pub dates: Vec<String>,
@@ -57,126 +58,197 @@ pub struct SymbolData {
     pub highs: Vec<f64>,
     pub lows: Vec<f64>,
     pub closes: Vec<f64>,
-    pub volumes: Vec<f64>,
 }
 
-fn calculate_ema(closes: &[f64], period: usize) -> Vec<f64> {
-    let n = closes.len();
-    let mut ema = vec![f64::NAN; n];
-    if n < period {
-        return ema;
-    }
-    let sma: f64 = closes[0..period].iter().sum::<f64>() / (period as f64);
-    ema[period - 1] = (sma * 100.0).round() / 100.0;
-    let k = 2.0 / (period as f64 + 1.0);
-    let mut prev = sma;
-    for i in period..n {
-        let val = closes[i] * k + prev * (1.0 - k);
-        prev = val;
-        ema[i] = (val * 100.0).round() / 100.0;
-    }
-    ema
+struct EmaAccumulator {
+    period: usize,
+    multiplier: f64,
+    sum: f64,
+    previous: f64,
+    values: Vec<f64>,
 }
 
-/// Mark is an internal trend setup.  Mark Tight qualifies when the latest close
-/// clears the 60-day Donchian level fixed at the start of that setup.
-fn process_mark_screener(data: &SymbolData) -> Option<MarkResult> {
+impl EmaAccumulator {
+    fn new(period: usize, capacity: usize) -> Self {
+        Self {
+            period,
+            multiplier: 2.0 / (period as f64 + 1.0),
+            sum: 0.0,
+            previous: f64::NAN,
+            values: vec![f64::NAN; capacity],
+        }
+    }
+
+    fn push(&mut self, index: usize, close: f64) {
+        if index < self.period {
+            self.sum += close;
+        }
+        if index + 1 == self.period {
+            self.previous = self.sum / self.period as f64;
+            self.values[index] = (self.previous * 100.0).round() / 100.0;
+        } else if index + 1 > self.period {
+            self.previous = close * self.multiplier + self.previous * (1.0 - self.multiplier);
+            self.values[index] = (self.previous * 100.0).round() / 100.0;
+        }
+    }
+}
+
+struct MarkIndicators {
+    ema_50: Vec<f64>,
+    ema_150: Vec<f64>,
+    ema_200: Vec<f64>,
+    high_52w: Vec<f64>,
+    low_52w: Vec<f64>,
+    donchian_60: Vec<f64>,
+}
+
+fn calculate_mark_indicators(data: &SymbolData) -> MarkIndicators {
     let n = data.closes.len();
-    if n < 252 {
-        return None;
+    let mut ema_50 = EmaAccumulator::new(50, n);
+    let mut ema_150 = EmaAccumulator::new(150, n);
+    let mut ema_200 = EmaAccumulator::new(200, n);
+    for (index, close) in data.closes.iter().copied().enumerate() {
+        ema_50.push(index, close);
+        ema_150.push(index, close);
+        ema_200.push(index, close);
     }
 
-    let ema_50 = calculate_ema(&data.closes, 50);
-    let ema_150 = calculate_ema(&data.closes, 150);
-    let ema_200 = calculate_ema(&data.closes, 200);
-
-    let period_52w = 252;
     let mut high_52w = vec![f64::NAN; n];
     let mut low_52w = vec![f64::NAN; n];
+    let mut donchian_60 = vec![f64::NAN; n];
+    let mut high_252_queue: VecDeque<usize> = VecDeque::new();
+    let mut low_252_queue: VecDeque<usize> = VecDeque::new();
+    let mut high_60_queue: VecDeque<usize> = VecDeque::new();
 
     for i in 0..n {
-        if i + 1 >= period_52w {
-            let start = i + 1 - period_52w;
-            let h_max = data.highs[start..=i]
-                .iter()
-                .cloned()
-                .fold(f64::NEG_INFINITY, f64::max);
-            let l_min = data.lows[start..=i]
-                .iter()
-                .cloned()
-                .fold(f64::INFINITY, f64::min);
-            high_52w[i] = h_max;
-            low_52w[i] = l_min;
+        if i >= 60 {
+            let start = i - 60;
+            while high_60_queue.front().is_some_and(|&index| index < start) {
+                high_60_queue.pop_front();
+            }
+            if let Some(&index) = high_60_queue.front() {
+                donchian_60[i] = data.highs[index];
+            }
         }
-    }
-
-    // --- STAGE 1: Mark Date Calculation ---
-    let mut first_match_index: Option<usize> = None;
-    for i in (0..n).rev() {
-        if ema_50[i].is_nan()
-            || ema_150[i].is_nan()
-            || ema_200[i].is_nan()
-            || high_52w[i].is_nan()
-            || low_52w[i].is_nan()
+        while high_60_queue
+            .back()
+            .is_some_and(|&index| data.highs[index] <= data.highs[i])
         {
-            break;
+            high_60_queue.pop_back();
         }
-        let ema_cond =
-            data.closes[i] > ema_50[i] && ema_50[i] > ema_150[i] && ema_150[i] > ema_200[i];
-        let high_cond = data.closes[i] >= high_52w[i] * 0.80;
-        let low_cond = data.closes[i] >= low_52w[i] * 1.50;
+        high_60_queue.push_back(i);
 
-        if ema_cond && high_cond && low_cond {
-            first_match_index = Some(i);
-        } else {
-            break;
+        let start_252 = (i + 1).saturating_sub(252);
+        while high_252_queue
+            .front()
+            .is_some_and(|&index| index < start_252)
+        {
+            high_252_queue.pop_front();
+        }
+        while low_252_queue
+            .front()
+            .is_some_and(|&index| index < start_252)
+        {
+            low_252_queue.pop_front();
+        }
+        while high_252_queue
+            .back()
+            .is_some_and(|&index| data.highs[index] <= data.highs[i])
+        {
+            high_252_queue.pop_back();
+        }
+        while low_252_queue
+            .back()
+            .is_some_and(|&index| data.lows[index] >= data.lows[i])
+        {
+            low_252_queue.pop_back();
+        }
+        high_252_queue.push_back(i);
+        low_252_queue.push_back(i);
+
+        if i + 1 >= 252 {
+            high_52w[i] = data.highs[*high_252_queue.front().unwrap()];
+            low_52w[i] = data.lows[*low_252_queue.front().unwrap()];
         }
     }
 
-    // The oldest valid day in the current Mark run is the fixed-base date.
-    let mark_index = match first_match_index {
-        Some(index) => index,
-        None => return None,
-    };
-    let mark_date = data.dates[mark_index].clone();
+    MarkIndicators {
+        ema_50: ema_50.values,
+        ema_150: ema_150.values,
+        ema_200: ema_200.values,
+        high_52w,
+        low_52w,
+        donchian_60,
+    }
+}
 
-    // Freeze the Donchian high from the 60 sessions *before* Mark starts.
-    // Excluding the Mark candle avoids putting that day's high into the level
-    // the close is expected to clear.
-    if mark_index < 60 {
+fn mark_condition(data: &SymbolData, indicators: &MarkIndicators, index: usize) -> bool {
+    let close = data.closes[index];
+    let ema_50 = indicators.ema_50[index];
+    let ema_150 = indicators.ema_150[index];
+    let ema_200 = indicators.ema_200[index];
+    let high_52w = indicators.high_52w[index];
+    let low_52w = indicators.low_52w[index];
+    [ema_50, ema_150, ema_200, high_52w, low_52w]
+        .iter()
+        .all(|value| value.is_finite())
+        && close > ema_50
+        && ema_50 > ema_150
+        && ema_150 > ema_200
+        && close >= high_52w * 0.80
+        && close >= low_52w * 1.50
+}
+
+/// Mark Tight is the first 60-session Donchian breakout inside the current
+/// uninterrupted Mark trend. The latest candle must still satisfy Mark and
+/// hold above the breakout level.
+fn process_mark_screener(data: &SymbolData, indicators: &MarkIndicators) -> Option<MarkResult> {
+    let n = data.closes.len();
+    if n < 252 || !mark_condition(data, indicators, n - 1) {
         return None;
     }
-    let base_last = data.highs[mark_index - 60..mark_index]
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max);
-    let tight_breakout = data.closes[n - 1] > base_last;
-    let first_match_date_tight = tight_breakout.then(|| data.dates[n - 1].clone());
 
-    let down_52w_high =
-        (((high_52w[n - 1] - data.closes[n - 1]) / high_52w[n - 1]) * 100.0 * 100.0).round()
-            / 100.0;
+    let mut mark_start = n - 1;
+    while mark_start > 0 && mark_condition(data, indicators, mark_start - 1) {
+        mark_start -= 1;
+    }
+
+    let (breakout_index, breakout_level) = (mark_start..n).find_map(|index| {
+        let level = indicators.donchian_60[index];
+        (level.is_finite() && data.closes[index] > level).then_some((index, level))
+    })?;
+    if data.closes[n - 1] <= breakout_level {
+        return None;
+    }
+
+    let down_52w_high = (((indicators.high_52w[n - 1] - data.closes[n - 1])
+        / indicators.high_52w[n - 1])
+        * 100.0
+        * 100.0)
+        .round()
+        / 100.0;
 
     Some(MarkResult {
         symbol: data.symbol.clone(),
         isin: data.isin.clone(),
         date: data.dates[n - 1].clone(),
         close: data.closes[n - 1],
-        ema_50: ema_50[n - 1],
-        ema_150: ema_150[n - 1],
-        ema_200: ema_200[n - 1],
-        high_52w: high_52w[n - 1],
-        low_52w: low_52w[n - 1],
-        mark_date,
-        mark_tight_date: first_match_date_tight,
-        tight_breakout,
-        donchian_60_base: base_last,
+        ema_50: indicators.ema_50[n - 1],
+        ema_150: indicators.ema_150[n - 1],
+        ema_200: indicators.ema_200[n - 1],
+        high_52w: indicators.high_52w[n - 1],
+        low_52w: indicators.low_52w[n - 1],
+        mark_tight_date: data.dates[breakout_index].clone(),
         down_52w_high,
     })
 }
 
 /// Stage 1 ("Flag") -> Stage 2 ("Tight Flag") Hierarchical Screening
-fn process_flag_screener(data: &SymbolData, flag_lookback: usize) -> Option<FlagResult> {
+fn process_flag_screener(
+    data: &SymbolData,
+    flag_lookback: usize,
+    shared_indicators: Option<&MarkIndicators>,
+) -> Option<FlagResult> {
     let n_total = data.closes.len();
     if n_total < 252 {
         return None;
@@ -204,21 +276,45 @@ fn process_flag_screener(data: &SymbolData, flag_lookback: usize) -> Option<Flag
     let mut tight_peak_date: Option<String> = None;
     let mut breakout_date: Option<String> = None;
 
-    // These full-history quality checks are invariant for the symbol, so
-    // calculate them once instead of for every 90%-run-up candidate.
     let last_close = data.closes[n_total - 1];
-    let last_ema200 = calculate_ema(&data.closes, 200)[n_total - 1];
-    let high_52w = data.highs[n_total - 252..n_total]
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max);
+    if last_close < 5.0 {
+        return None;
+    }
+    let (last_ema200, high_52w) = if let Some(indicators) = shared_indicators {
+        (
+            indicators.ema_200[n_total - 1],
+            indicators.high_52w[n_total - 1],
+        )
+    } else {
+        let mut ema_200 = EmaAccumulator::new(200, n_total);
+        for (index, close) in data.closes.iter().copied().enumerate() {
+            ema_200.push(index, close);
+        }
+        let high = data.highs[n_total - 252..]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        (ema_200.values[n_total - 1], high)
+    };
     let dist_52w = if high_52w > 0.0 {
         (high_52w - last_close) / high_52w * 100.0
     } else {
         f64::INFINITY
     };
-    let passes_quality =
-        last_close >= 5.0 && !last_ema200.is_nan() && last_close >= last_ema200 && dist_52w <= 45.0;
+    if last_ema200.is_nan() || last_close < last_ema200 || dist_52w > 45.0 {
+        return None;
+    }
+
+    let mut gap_prefix = vec![0_usize; n + 1];
+    let mut circuit_prefix = vec![0_usize; n + 1];
+    for index in 0..n {
+        let extreme_gap = index > 0
+            && closes[index - 1] > 0.0
+            && (opens[index] - closes[index - 1]).abs() / closes[index - 1] > 0.50;
+        gap_prefix[index + 1] = gap_prefix[index] + usize::from(extreme_gap);
+        circuit_prefix[index + 1] =
+            circuit_prefix[index] + usize::from((highs[index] - lows[index]).abs() < 1e-4);
+    }
 
     // --- STAGE 1: Flag Pattern Detection (90%+ gain in 45 days) ---
     for i in 0..(n - 1) {
@@ -253,29 +349,12 @@ fn process_flag_screener(data: &SymbolData, flag_lookback: usize) -> Option<Flag
             // 1. Minimum Pole Duration > 3 candles
             if j_peak - i > 3 {
                 // 2. Extreme Gap Check (No single-day gap > 50% in pole)
-                let mut has_extreme_gap = false;
-                for p_idx in (i + 1)..=j_peak {
-                    let prev_c = closes[p_idx - 1];
-                    let open_gap = if prev_c > 0.0 {
-                        (opens[p_idx] - prev_c).abs() / prev_c
-                    } else {
-                        0.0
-                    };
-                    if open_gap > 0.50 {
-                        has_extreme_gap = true;
-                        break;
-                    }
-                }
+                let has_extreme_gap = gap_prefix[j_peak + 1] > gap_prefix[i + 1];
 
                 if !has_extreme_gap {
                     // 3. Circuit Trap Check (Circuit candles <= 40% in pole)
-                    let mut circuit_count = 0;
                     let pole_candles = j_peak - i + 1;
-                    for p_idx in i..=j_peak {
-                        if (highs[p_idx] - lows[p_idx]).abs() < 1e-4 {
-                            circuit_count += 1;
-                        }
-                    }
+                    let circuit_count = circuit_prefix[j_peak + 1] - circuit_prefix[i];
                     let circuit_pct = (circuit_count as f64) / (pole_candles as f64) * 100.0;
 
                     if circuit_pct <= 40.0 {
@@ -291,7 +370,7 @@ fn process_flag_screener(data: &SymbolData, flag_lookback: usize) -> Option<Flag
 
                         if let Some(k_idx) = breakout_k {
                             // 5. Breakout Holding Rule: Latest close > Pole Peak High
-                            if closes[n - 1] > highs[j_peak] && passes_quality {
+                            if closes[n - 1] > highs[j_peak] {
                                 if !is_tight_flag {
                                     is_tight_flag = true;
                                     tight_flag_date = Some(dates[j_peak].clone());
@@ -357,151 +436,6 @@ fn load_valid_isins(fundamental_csv: &str) -> Result<HashSet<String>, Box<dyn st
     Ok(valid_isins)
 }
 
-fn export_qualified_csvs(
-    dataset: &ScreenedDataset,
-    base_out_dir: &Path,
-    timestamp: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let ex = &dataset.exchange;
-
-    if !dataset.mark_tight_qualified.is_empty() {
-        let mark_tight_dir = base_out_dir.join(ex).join("mark_tight");
-        std::fs::create_dir_all(&mark_tight_dir)?;
-        let mark_tight_file = mark_tight_dir.join(format!(
-            "{}_{}_mark_tight_qualified.csv",
-            timestamp,
-            ex.to_lowercase()
-        ));
-        let mut writer = csv::Writer::from_path(&mark_tight_file)?;
-        writer.write_record(&[
-            "symbol",
-            "isin",
-            "date",
-            "close",
-            "ema_50",
-            "ema_150",
-            "ema_200",
-            "high_52w",
-            "low_52w",
-            "mark_date",
-            "mark_tight_date",
-            "down_52w_high",
-        ])?;
-        for r in &dataset.mark_tight_qualified {
-            writer.write_record(&[
-                &r.symbol,
-                &r.isin,
-                &r.date,
-                &r.close.to_string(),
-                &r.ema_50.to_string(),
-                &r.ema_150.to_string(),
-                &r.ema_200.to_string(),
-                &r.high_52w.to_string(),
-                &r.low_52w.to_string(),
-                &r.mark_date,
-                r.mark_tight_date.as_deref().unwrap_or(""),
-                &r.down_52w_high.to_string(),
-            ])?;
-        }
-        writer.flush()?;
-    }
-
-    if !dataset.tight_flag_qualified.is_empty() {
-        let tight_flag_dir = base_out_dir.join(ex).join("Tight Flag");
-        std::fs::create_dir_all(&tight_flag_dir)?;
-        let tight_flag_file = tight_flag_dir.join(format!(
-            "{}_{}_tight_flag_qualified.csv",
-            timestamp,
-            ex.to_lowercase()
-        ));
-        let mut writer = csv::Writer::from_path(&tight_flag_file)?;
-        writer.write_record(&[
-            "symbol",
-            "isin",
-            "date",
-            "close",
-            "tight_flag_date",
-            "tight_start_date",
-            "tight_peak_date",
-            "breakout_date",
-        ])?;
-        for r in &dataset.tight_flag_qualified {
-            writer.write_record(&[
-                &r.symbol,
-                &r.isin,
-                &r.date,
-                &r.close.to_string(),
-                r.tight_flag_date.as_deref().unwrap_or(""),
-                r.tight_start_date.as_deref().unwrap_or(""),
-                r.tight_peak_date.as_deref().unwrap_or(""),
-                r.breakout_date.as_deref().unwrap_or(""),
-            ])?;
-        }
-        writer.flush()?;
-    }
-
-    Ok(())
-}
-
-fn render_symbol_chart(
-    dataset: &SymbolData,
-    out_dir: &Path,
-    plot_days: i64,
-    mark_date: Option<&str>,
-    tight_breakout_date: Option<&str>,
-    flag_start_date: Option<&str>,
-    flag_peak_date: Option<&str>,
-    tight_start_date: Option<&str>,
-    tight_peak_date: Option<&str>,
-    breakout_date: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let eod = crate::chart::EodData {
-        dates: dataset.dates.clone(),
-        opens: dataset.opens.clone(),
-        highs: dataset.highs.clone(),
-        lows: dataset.lows.clone(),
-        closes: dataset.closes.clone(),
-        volumes: dataset.volumes.clone(),
-    };
-
-    let n = dataset.dates.len();
-    if n == 0 {
-        return Ok(());
-    }
-
-    let parse_d = |s: Option<&str>| -> Option<NaiveDate> {
-        s.and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-    };
-
-    let last_d_str = &dataset.dates[n - 1];
-    let end_d = NaiveDate::parse_from_str(last_d_str, "%Y-%m-%d")
-        .unwrap_or_else(|_| chrono::Local::now().date_naive());
-    let start_d = end_d - chrono::Duration::days(plot_days);
-
-    let p_start = parse_d(flag_start_date).or_else(|| parse_d(tight_start_date));
-    let p_end = parse_d(flag_peak_date).or_else(|| parse_d(tight_peak_date));
-    let bo_d = parse_d(breakout_date).or_else(|| parse_d(tight_breakout_date));
-    let m_d = parse_d(mark_date);
-
-    let img_name = format!("{}.png", dataset.symbol);
-    let output_path = out_dir.join(img_name);
-
-    crate::chart::create_stock_chart(
-        &eod,
-        &dataset.symbol,
-        &output_path,
-        start_d,
-        end_d,
-        p_start,
-        p_end,
-        bo_d,
-        m_d,
-        "",
-        "",
-        "",
-    )
-}
-
 pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut positional: Vec<&String> = Vec::new();
     let mut include_sme = false;
@@ -552,7 +486,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
     }
 
     if positional.len() < 4 {
-        eprintln!("Usage: stock_analysis screen <duckdb_file> <fundamental_csv> <exchange> <out_dir> [max_date] [chart_out_base] [--mark-tight-only|--tight-flag-only] [--include-sme|--only-sme] [--flag-lookback N]");
+        eprintln!("Usage: stock_analysis screen <duckdb_file> <fundamental_csv> <NSE|BSE|ALL> <out_dir> [max_date] [--mark-tight-only|--tight-flag-only] [--include-sme|--only-sme] [--flag-lookback N]");
         std::process::exit(1);
     }
     if mark_tight_only && tight_flag_only {
@@ -565,293 +499,272 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
 
     let duckdb_file = positional[0];
     let fundamental_csv = positional[1];
-    let exchange = positional[2].to_uppercase();
-    let out_dir = positional[3];
-
+    let exchange_scope = positional[2].to_uppercase();
+    if !matches!(exchange_scope.as_str(), "NSE" | "BSE" | "ALL") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "exchange must be NSE, BSE, or ALL",
+        )
+        .into());
+    }
+    let out_dir = Path::new(positional[3]);
     let max_date = positional
         .get(4)
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let chart_out_base = positional
-        .get(5)
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
 
     std::fs::create_dir_all(out_dir)?;
-
-    let t_total = std::time::Instant::now();
-    let t0 = std::time::Instant::now();
+    let total_started = std::time::Instant::now();
+    let fetch_started = std::time::Instant::now();
     let valid_isins = load_valid_isins(fundamental_csv)?;
 
     let conn = Connection::open_with_flags(
         duckdb_file,
         Config::default().access_mode(AccessMode::ReadOnly)?,
     )?;
-
-    // --- STEP 1: BULK SINGLE-PASS DUCKDB QUERY ---
-    let bulk_eod_sql = if exchange == "NSE" {
-        "SELECT CAST(Date AS VARCHAR), Symbol, ISIN, Open, High, Low, Close, Volume FROM eod_data WHERE Exchange = 'NSE' ORDER BY Symbol, Date ASC"
-    } else {
-        "SELECT CAST(Date AS VARCHAR), Symbol, ISIN, Open, High, Low, Close, Volume FROM eod_data WHERE Exchange = 'BSE' AND ISIN NOT IN (SELECT DISTINCT ISIN FROM eod_data WHERE Exchange = 'NSE') ORDER BY Symbol, Date ASC"
+    let exchange_predicate = match exchange_scope.as_str() {
+        "NSE" => "e.Exchange = 'NSE'",
+        "BSE" => {
+            "e.Exchange = 'BSE' AND NOT EXISTS (
+            SELECT 1 FROM nse_isins n
+            WHERE n.isin = TRIM(UPPER(e.ISIN))
+        )"
+        }
+        _ => {
+            "(e.Exchange = 'NSE' OR (
+            e.Exchange = 'BSE' AND NOT EXISTS (
+                SELECT 1 FROM nse_isins n
+                WHERE n.isin = TRIM(UPPER(e.ISIN))
+            )
+        ))"
+        }
     };
-
-    let mut stmt = conn.prepare(bulk_eod_sql)?;
+    let escaped_fundamental_csv = fundamental_csv.replace('\'', "''");
+    let bulk_eod_sql = format!(
+        "WITH valid_isins AS (
+             SELECT DISTINCT TRIM(UPPER(\"ISIN Code\")) AS isin
+             FROM read_csv_auto('{escaped_fundamental_csv}', header=true, all_varchar=true)
+             WHERE NULLIF(TRIM(\"ISIN Code\"), '') IS NOT NULL
+         ),
+         nse_isins AS (
+             SELECT DISTINCT TRIM(UPPER(ISIN)) AS isin
+             FROM eod_data
+             WHERE Exchange = 'NSE'
+         )
+         SELECT e.Exchange, CAST(e.Date AS VARCHAR), e.Symbol, e.ISIN, \
+         e.Open, e.High, e.Low, e.Close \
+         FROM eod_data e
+         INNER JOIN valid_isins f ON f.isin = TRIM(UPPER(e.ISIN))
+         WHERE {exchange_predicate} \
+         ORDER BY e.Exchange, e.Symbol, e.Date ASC"
+    );
+    let mut stmt = conn.prepare(&bulk_eod_sql)?;
     let mut rows = stmt.query([])?;
 
     let mut symbol_datasets: Vec<SymbolData> = Vec::new();
-    let mut dataset_map: HashMap<String, usize> = HashMap::new();
+    let mut current_exchange = String::new();
+    let mut current_symbol = String::new();
+    let mut current_isin = String::new();
+    let mut dates = Vec::new();
+    let mut opens = Vec::new();
+    let mut highs = Vec::new();
+    let mut lows = Vec::new();
+    let mut closes = Vec::new();
 
-    let mut curr_sym = String::new();
-    let mut curr_isin = String::new();
-    let mut curr_dates = Vec::new();
-    let mut curr_opens = Vec::new();
-    let mut curr_highs = Vec::new();
-    let mut curr_lows = Vec::new();
-    let mut curr_closes = Vec::new();
-    let mut curr_vols = Vec::new();
+    let push_current = |target: &mut Vec<SymbolData>,
+                        exchange: String,
+                        symbol: String,
+                        isin: String,
+                        dates: Vec<String>,
+                        opens: Vec<f64>,
+                        highs: Vec<f64>,
+                        lows: Vec<f64>,
+                        closes: Vec<f64>| {
+        if !symbol.is_empty() && !dates.is_empty() {
+            target.push(SymbolData {
+                exchange,
+                symbol,
+                isin,
+                dates,
+                opens,
+                highs,
+                lows,
+                closes,
+            });
+        }
+    };
 
     while let Some(row) = rows.next()? {
-        let d_str: String = row.get(0)?;
-        let sym: String = row.get(1)?;
-        let is_sme = sym.trim().to_uppercase().ends_with("_SME");
-        if only_sme {
-            if !is_sme {
-                continue;
-            }
-        } else if !include_sme {
-            if is_sme {
-                continue;
-            }
-        }
-
-        let isin: String = row.get(2)?;
+        let exchange: String = row.get(0)?;
+        let date_raw: String = row.get(1)?;
+        let symbol: String = row.get(2)?;
+        let isin: String = row.get(3)?;
         let isin_clean = isin.trim().to_uppercase();
-
-        if !valid_isins.contains(&isin_clean) {
+        let is_sme = symbol.trim().to_uppercase().ends_with("_SME");
+        if (only_sme && !is_sme) || (!only_sme && !include_sme && is_sme) {
+            continue;
+        }
+        let clean_date = date_raw.split('T').next().unwrap_or(&date_raw).to_string();
+        if max_date.as_ref().is_some_and(|limit| clean_date > *limit) {
             continue;
         }
 
-        let clean_date = d_str.split('T').next().unwrap_or(&d_str).to_string();
-        if let Some(ref md) = max_date {
-            if clean_date > *md {
-                continue;
-            }
+        if exchange != current_exchange || symbol != current_symbol {
+            push_current(
+                &mut symbol_datasets,
+                current_exchange,
+                current_symbol,
+                current_isin,
+                dates,
+                opens,
+                highs,
+                lows,
+                closes,
+            );
+            current_exchange = exchange;
+            current_symbol = symbol;
+            current_isin = isin_clean;
+            dates = Vec::new();
+            opens = Vec::new();
+            highs = Vec::new();
+            lows = Vec::new();
+            closes = Vec::new();
         }
 
-        let open: f64 = row.get(3)?;
-        let high: f64 = row.get(4)?;
-        let low: f64 = row.get(5)?;
-        let close: f64 = row.get(6)?;
-        let vol: f64 = row.get(7)?;
-
-        if sym != curr_sym {
-            if !curr_sym.is_empty() && !curr_dates.is_empty() {
-                let idx = symbol_datasets.len();
-                dataset_map.insert(curr_sym.clone(), idx);
-                symbol_datasets.push(SymbolData {
-                    symbol: curr_sym,
-                    isin: curr_isin,
-                    dates: curr_dates,
-                    opens: curr_opens,
-                    highs: curr_highs,
-                    lows: curr_lows,
-                    closes: curr_closes,
-                    volumes: curr_vols,
-                });
-            }
-            curr_sym = sym;
-            curr_isin = isin_clean;
-            curr_dates = Vec::new();
-            curr_opens = Vec::new();
-            curr_highs = Vec::new();
-            curr_lows = Vec::new();
-            curr_closes = Vec::new();
-            curr_vols = Vec::new();
-        }
-
-        curr_dates.push(clean_date);
-        curr_opens.push(open);
-        curr_highs.push(high);
-        curr_lows.push(low);
-        curr_closes.push(close);
-        curr_vols.push(vol);
+        dates.push(clean_date);
+        opens.push(row.get(4)?);
+        highs.push(row.get(5)?);
+        lows.push(row.get(6)?);
+        closes.push(row.get(7)?);
     }
+    push_current(
+        &mut symbol_datasets,
+        current_exchange,
+        current_symbol,
+        current_isin,
+        dates,
+        opens,
+        highs,
+        lows,
+        closes,
+    );
+    drop(rows);
+    drop(stmt);
+    drop(conn);
 
-    if !curr_sym.is_empty() && !curr_dates.is_empty() {
-        let idx = symbol_datasets.len();
-        dataset_map.insert(curr_sym.clone(), idx);
-        symbol_datasets.push(SymbolData {
-            symbol: curr_sym,
-            isin: curr_isin,
-            dates: curr_dates,
-            opens: curr_opens,
-            highs: curr_highs,
-            lows: curr_lows,
-            closes: curr_closes,
-            volumes: curr_vols,
-        });
-    }
-
-    let elapsed_db = t0.elapsed().as_secs_f64();
     println!(
-        "⏱️ [1/4] Bulk DuckDB EOD Fetch: {:.2}s (Loaded {} valid {} symbols)",
-        elapsed_db,
-        symbol_datasets.len(),
-        exchange
+        "⏱️ [1/3] One-pass DuckDB fetch: {:.2}s ({} eligible symbols)",
+        fetch_started.elapsed().as_secs_f64(),
+        symbol_datasets.len()
     );
 
-    // --- STEP 2: PARALLEL HIERARCHICAL TA SCREENING ---
-    let t1 = std::time::Instant::now();
-
-    let mark_results: Vec<MarkResult> = if tight_flag_only {
-        Vec::new()
-    } else {
-        symbol_datasets
-            .par_iter()
-            .filter_map(process_mark_screener)
-            .collect()
-    };
-
-    let flag_results: Vec<FlagResult> = if mark_tight_only {
-        Vec::new()
-    } else {
-        symbol_datasets
-            .par_iter()
-            .filter_map(|d| process_flag_screener(d, flag_lookback))
-            .collect()
-    };
-
-    let mark_tight: Vec<MarkResult> = mark_results
-        .iter()
-        .filter(|m| m.tight_breakout)
-        .cloned()
+    let screening_started = std::time::Instant::now();
+    let screened: Vec<(String, Option<MarkResult>, Option<FlagResult>)> = symbol_datasets
+        .par_iter()
+        .map(|data| {
+            if data.closes.len() < 252 {
+                return (data.exchange.clone(), None, None);
+            }
+            let indicators = (!tight_flag_only).then(|| calculate_mark_indicators(data));
+            let mark = indicators
+                .as_ref()
+                .and_then(|values| process_mark_screener(data, values));
+            let flag = if mark_tight_only {
+                None
+            } else {
+                process_flag_screener(data, flag_lookback, indicators.as_ref())
+            };
+            (data.exchange.clone(), mark, flag)
+        })
         .collect();
 
-    let tight_flag_qualified: Vec<FlagResult> = flag_results
-        .iter()
-        .filter(|f| f.is_tight_flag)
-        .cloned()
-        .collect();
-
-    let elapsed_calc = t1.elapsed().as_secs_f64();
-    println!("⏱️ [2/4] Hierarchical TA Screening: {:.4}s", elapsed_calc);
-    println!(
-        "   └─ Mark Tight: {} | Tight Flag: {}",
-        mark_tight.len(),
-        tight_flag_qualified.len()
-    );
-
-    // --- STEP 3: CANDIDATE DATASET JSON & CSV EXPORT ---
-    let t2 = std::time::Instant::now();
-    let dataset = ScreenedDataset {
-        exchange: exchange.clone(),
-        mark_tight_qualified: mark_tight.clone(),
-        tight_flag_qualified: tight_flag_qualified.clone(),
+    let target_exchanges: &[&str] = if exchange_scope == "ALL" {
+        &["NSE", "BSE"]
+    } else if exchange_scope == "NSE" {
+        &["NSE"]
+    } else {
+        &["BSE"]
     };
-
-    let now_ts = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
-
-    let out_file = Path::new(out_dir).join(format!("{}_rust_screened.json", exchange));
-    let f = File::create(&out_file)?;
-    serde_json::to_writer_pretty(f, &dataset)?;
-
-    // Also export qualified CSVs to base output dir if available
-    let base_qualified_dir = Path::new(duckdb_file)
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("qualified_stocks"))
-        .unwrap_or_else(|| PathBuf::from(out_dir));
-
-    let _ = export_qualified_csvs(&dataset, &base_qualified_dir, &now_ts);
-
+    let mut results: HashMap<String, (Vec<MarkResult>, Vec<FlagResult>)> = target_exchanges
+        .iter()
+        .map(|exchange| (exchange.to_string(), (Vec::new(), Vec::new())))
+        .collect();
+    for (exchange, mark, flag) in screened {
+        if let Some((marks, flags)) = results.get_mut(&exchange) {
+            if let Some(value) = mark {
+                marks.push(value);
+            }
+            if let Some(value) = flag {
+                flags.push(value);
+            }
+        }
+    }
     println!(
-        "⏱️ [3/4] Candidate Dataset Export: {:.3}s -> {}",
-        t2.elapsed().as_secs_f64(),
-        out_file.display()
+        "⏱️ [2/3] Shared parallel TA screening: {:.4}s",
+        screening_started.elapsed().as_secs_f64()
     );
 
-    // --- STEP 4: PARALLEL RAM CHART RENDERING (EXACT FOLDER PATH ALIGNMENT) ---
-    if let Some(ref base_chart_dir) = chart_out_base {
-        let t_render = std::time::Instant::now();
-
-        let mark_tight_chart_dir = base_chart_dir.join(&exchange).join("mark_tight");
-        let tight_flag_chart_dir = base_chart_dir.join(&exchange).join("Tight Flag");
-
-        if mark_tight_chart_dir.exists() {
-            let _ = std::fs::remove_dir_all(&mark_tight_chart_dir);
-        }
-        if tight_flag_chart_dir.exists() {
-            let _ = std::fs::remove_dir_all(&tight_flag_chart_dir);
-        }
-
-        std::fs::create_dir_all(&mark_tight_chart_dir)?;
-        std::fs::create_dir_all(&tight_flag_chart_dir)?;
-
-        // Render Mark Tight Charts
-        mark_tight.par_iter().for_each(|res| {
-            if let Some(&idx) = dataset_map.get(&res.symbol) {
-                let data = &symbol_datasets[idx];
-                let _ = render_symbol_chart(
-                    data,
-                    &mark_tight_chart_dir,
-                    500,
-                    Some(&res.mark_date),
-                    res.mark_tight_date.as_deref(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                );
-            }
-        });
-
-        // Render Tight Flag Charts
-        tight_flag_qualified.par_iter().for_each(|res| {
-            if let Some(&idx) = dataset_map.get(&res.symbol) {
-                let data = &symbol_datasets[idx];
-                let _ = render_symbol_chart(
-                    data,
-                    &tight_flag_chart_dir,
-                    200,
-                    None,
-                    None,
-                    res.flag_start_date.as_deref(),
-                    res.flag_peak_date.as_deref(),
-                    res.tight_start_date.as_deref(),
-                    res.tight_peak_date.as_deref(),
-                    res.breakout_date.as_deref(),
-                );
-            }
-        });
-
-        let total_charts = mark_tight.len() + tight_flag_qualified.len();
+    let export_started = std::time::Instant::now();
+    for exchange in target_exchanges {
+        let selected: Vec<&SymbolData> = symbol_datasets
+            .iter()
+            .filter(|data| data.exchange == *exchange)
+            .collect();
+        let (mark_tight_qualified, tight_flag_qualified) =
+            results.remove(*exchange).unwrap_or_default();
+        let dataset = ScreenedDataset {
+            exchange: exchange.to_string(),
+            fundamental_isins: valid_isins.len(),
+            selected_symbols: selected.len(),
+            history_ready: selected
+                .iter()
+                .filter(|data| data.closes.len() >= 252)
+                .count(),
+            max_history: selected
+                .iter()
+                .map(|data| data.closes.len())
+                .max()
+                .unwrap_or(0),
+            mark_tight_qualified,
+            tight_flag_qualified,
+        };
+        let exchange_out_dir = if exchange_scope == "ALL" {
+            out_dir.join(exchange)
+        } else {
+            out_dir.to_path_buf()
+        };
+        std::fs::create_dir_all(&exchange_out_dir)?;
+        let out_file = exchange_out_dir.join(format!("{}_rust_screened.json", exchange));
+        let writer = std::io::BufWriter::new(File::create(&out_file)?);
+        serde_json::to_writer(writer, &dataset)?;
         println!(
-            "⏱️ [4/4] Parallel RAM Chart Rendering: {:.2}s (Created {} charts)",
-            t_render.elapsed().as_secs_f64(),
-            total_charts
+            "   {}: {} Mark Tight | {} Tight Flag -> {}",
+            exchange,
+            dataset.mark_tight_qualified.len(),
+            dataset.tight_flag_qualified.len(),
+            out_file.display()
         );
     }
-
-    println!("----------------------------------------------------------------------");
     println!(
-        "🚀 TOTAL RUST SINGLE-PASS PIPELINE TIME: {:.2}s",
-        t_total.elapsed().as_secs_f64()
+        "⏱️ [3/3] Candidate JSON export: {:.3}s",
+        export_started.elapsed().as_secs_f64()
     );
-    println!("----------------------------------------------------------------------");
-
+    println!(
+        "🚀 TOTAL RUST SCREENING TIME: {:.2}s",
+        total_started.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{process_mark_screener, SymbolData};
+    use super::{calculate_mark_indicators, process_mark_screener, SymbolData};
 
     fn symbol_data(closes: Vec<f64>, highs: Vec<f64>) -> SymbolData {
         let len = closes.len();
         SymbolData {
+            exchange: "NSE".to_string(),
             symbol: "TEST".to_string(),
             isin: "INE000TEST".to_string(),
             dates: (0..len).map(|i| format!("2024-{:03}", i)).collect(),
@@ -859,12 +772,11 @@ mod tests {
             highs,
             lows: vec![100.0; len],
             closes,
-            volumes: vec![1_000.0; len],
         }
     }
 
     #[test]
-    fn freezes_the_donchian_level_when_mark_starts() {
+    fn records_the_first_real_donchian_breakout_in_the_active_mark_run() {
         let mut closes = vec![100.0; 270];
         let mut highs = vec![100.0; 270];
         for i in 251..270 {
@@ -873,16 +785,15 @@ mod tests {
         }
         highs[252] = 220.0;
 
-        let result = process_mark_screener(&symbol_data(closes, highs)).unwrap();
+        let data = symbol_data(closes, highs);
+        let indicators = calculate_mark_indicators(&data);
+        let result = process_mark_screener(&data, &indicators).unwrap();
 
-        assert_eq!(result.mark_date, "2024-251");
-        assert_eq!(result.donchian_60_base, 100.0);
-        assert!(result.tight_breakout);
-        assert_eq!(result.mark_tight_date.as_deref(), Some("2024-269"));
+        assert_eq!(result.mark_tight_date, "2024-251");
     }
 
     #[test]
-    fn requires_the_latest_close_to_clear_the_fixed_donchian_level() {
+    fn requires_the_latest_close_to_hold_the_breakout_level() {
         let mut closes = vec![100.0; 270];
         let mut highs = vec![100.0; 270];
         for i in 191..251 {
@@ -897,11 +808,9 @@ mod tests {
             highs[i] = 260.0;
         }
 
-        let result = process_mark_screener(&symbol_data(closes, highs)).unwrap();
+        let data = symbol_data(closes, highs);
+        let indicators = calculate_mark_indicators(&data);
 
-        assert_eq!(result.mark_date, "2024-251");
-        assert_eq!(result.donchian_60_base, 300.0);
-        assert!(!result.tight_breakout);
-        assert_eq!(result.mark_tight_date, None);
+        assert!(process_mark_screener(&data, &indicators).is_none());
     }
 }

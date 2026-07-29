@@ -34,7 +34,6 @@ pub fn create_stock_chart(
     p_start: Option<NaiveDate>,
     p_end: Option<NaiveDate>,
     breakout: Option<NaiveDate>,
-    mark: Option<NaiveDate>,
     info_line1: &str,
     info_line2: &str,
     info_line3: &str,
@@ -118,8 +117,14 @@ pub fn create_stock_chart(
         .collect();
 
     // Find indices of plot start and end
-    let start_idx = all_dates.iter().position(|&d| d >= plot_start_date).unwrap_or(0);
-    let end_idx = all_dates.iter().position(|&d| d >= plot_end_date).unwrap_or(all_dates.len() - 1);
+    let start_idx = all_dates
+        .iter()
+        .position(|&d| d >= plot_start_date)
+        .unwrap_or(0);
+    let end_idx = all_dates
+        .iter()
+        .position(|&d| d >= plot_end_date)
+        .unwrap_or(all_dates.len() - 1);
 
     if start_idx >= end_idx || start_idx >= all_dates.len() {
         return Ok(());
@@ -137,14 +142,42 @@ pub fn create_stock_chart(
             NaiveDate::from_ymd_opt(1970, 1, 1).unwrap() + Duration::days(opt.unwrap() as i64)
         })
         .collect();
-    let opens: Vec<f64> = df_slice.column("Open")?.f64()?.into_no_null_iter().collect();
-    let highs: Vec<f64> = df_slice.column("High")?.f64()?.into_no_null_iter().collect();
+    let opens: Vec<f64> = df_slice
+        .column("Open")?
+        .f64()?
+        .into_no_null_iter()
+        .collect();
+    let highs: Vec<f64> = df_slice
+        .column("High")?
+        .f64()?
+        .into_no_null_iter()
+        .collect();
     let lows: Vec<f64> = df_slice.column("Low")?.f64()?.into_no_null_iter().collect();
-    let closes: Vec<f64> = df_slice.column("Close")?.f64()?.into_no_null_iter().collect();
-    let ema50: Vec<f64> = df_slice.column("ema50")?.f64()?.into_no_null_iter().collect();
-    let ema150: Vec<f64> = df_slice.column("ema150")?.f64()?.into_no_null_iter().collect();
-    let ema200: Vec<f64> = df_slice.column("ema200")?.f64()?.into_no_null_iter().collect();
-    let volumes: Vec<f64> = df_slice.column("Volume")?.f64()?.into_no_null_iter().collect();
+    let closes: Vec<f64> = df_slice
+        .column("Close")?
+        .f64()?
+        .into_no_null_iter()
+        .collect();
+    let ema50: Vec<f64> = df_slice
+        .column("ema50")?
+        .f64()?
+        .into_no_null_iter()
+        .collect();
+    let ema150: Vec<f64> = df_slice
+        .column("ema150")?
+        .f64()?
+        .into_no_null_iter()
+        .collect();
+    let ema200: Vec<f64> = df_slice
+        .column("ema200")?
+        .f64()?
+        .into_no_null_iter()
+        .collect();
+    let volumes: Vec<f64> = df_slice
+        .column("Volume")?
+        .f64()?
+        .into_no_null_iter()
+        .collect();
 
     let num_points = dates.len();
     if num_points == 0 {
@@ -168,7 +201,9 @@ pub fn create_stock_chart(
     let (upper, lower) = chart_area.split_vertically(744);
 
     // --- Render Title ---
-    let title_font = ("sans-serif", 40).into_text_style(&title_area).color(&BLACK);
+    let title_font = ("sans-serif", 40)
+        .into_text_style(&title_area)
+        .color(&BLACK);
     // Center title manually
     let title_x = 960 - ((symbol.len() * 22) / 2);
     title_area.draw_text(symbol, &title_font, (title_x as i32, 5))?;
@@ -300,16 +335,6 @@ pub fn create_stock_chart(
         }
     }
 
-    // 4. Mark Date (Blue)
-    if let Some(d) = mark {
-        if let Some(idx) = dates.iter().position(|&date| date == d) {
-            chart.draw_series(std::iter::once(PathElement::new(
-                vec![(idx, min_price * 0.95), (idx, max_price * 1.05)],
-                BLUE.mix(0.7).stroke_width(1),
-            )))?;
-        }
-    }
-
     // --- Lower Chart (Volume) ---
     let mut vol_chart = ChartBuilder::on(&lower)
         .margin(15)
@@ -350,7 +375,11 @@ pub fn create_stock_chart(
     vol_chart.draw_series((0..num_points).map(|i| {
         let x = i;
         let v = volumes[i];
-        let color = if closes[i] >= opens[i] { dark_green } else { RED };
+        let color = if closes[i] >= opens[i] {
+            dark_green
+        } else {
+            RED
+        };
         PathElement::new(vec![(x, 0.0), (x, v)], color.stroke_width(2))
     }))?;
 

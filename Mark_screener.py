@@ -82,6 +82,9 @@ def process_symbol_data(args_tuple):
         period_52w = config.MIN_HISTORY_DAYS
         df['52 week high'] = ta.MAX(df['high'], timeperiod=period_52w)
         df['52 week low'] = ta.MIN(df['low'], timeperiod=period_52w)
+        df['Donchian_60_High'] = (
+            df['high'].shift(1).rolling(window=60, min_periods=60).max()
+        )
         
         df['Down from 52w high'] = (((df['52 week high'] - df['close'])
                                      / df['52 week high']) * 100).round(2)
@@ -106,21 +109,29 @@ def process_symbol_data(args_tuple):
             else:
                 break
                     
-        if mark_index is None or mark_index < 60:
+        if mark_index is None:
             return None
 
-        # Freeze the high of the 60 sessions immediately before Mark starts.
-        # The Mark candle itself is excluded so its high cannot raise the level
-        # that the latest close is expected to clear.
-        base_last = df['high'].iloc[mark_index - 60:mark_index].max()
-        tight_breakout = bool(df['close'].iloc[-1] > base_last)
-        first_match_date_tight = df['date'].iloc[-1] if tight_breakout else pd.NaT
+        # The true Mark Tight date is the first rolling 60-session Donchian
+        # breakout inside the current uninterrupted Mark trend.
+        breakout_index = next(
+            (
+                position
+                for position in range(mark_index, len(df))
+                if pd.notna(df['Donchian_60_High'].iloc[position])
+                and df['close'].iloc[position]
+                > df['Donchian_60_High'].iloc[position]
+            ),
+            None,
+        )
+        if breakout_index is None:
+            return None
+        breakout_level = df['Donchian_60_High'].iloc[breakout_index]
+        if df['close'].iloc[-1] <= breakout_level:
+            return None
 
         last_row = df.iloc[[-1]].copy()
-        last_row['Donchian_60_Base'] = base_last
-        last_row['mark_date'] = df['date'].iloc[mark_index]
-        last_row['mark_tight_date'] = first_match_date_tight
-        last_row['tight_breakout'] = tight_breakout
+        last_row['mark_tight_date'] = df['date'].iloc[breakout_index]
         
         return last_row
     except Exception as e:
@@ -180,7 +191,7 @@ def main():
                 df_mark_tight = pd.DataFrame(rust_dataset['mark_tight_qualified'])
                 if not df_mark_tight.empty:
                     df_mark_tight['Exchange'] = exchange
-                    df_mark_tight = df_mark_tight.rename(columns={'ema_50': 'EMA_50', 'ema_150': 'EMA_150', 'ema_200': 'EMA_200', 'high_52w': '52 week high', 'low_52w': '52 week low', 'mark_date': 'Mark_Date', 'mark_tight_date': 'Mark_Tight_Date', 'down_52w_high': 'Down from 52w high'})
+                    df_mark_tight = df_mark_tight.rename(columns={'ema_50': 'EMA_50', 'ema_150': 'EMA_150', 'ema_200': 'EMA_200', 'high_52w': '52 week high', 'low_52w': '52 week low', 'mark_tight_date': 'Mark_Tight_Date', 'down_52w_high': 'Down from 52w high'})
                     process_results(df_mark_tight, fundamental_df, f"{exchange.lower()}_mark_tight", dirs['mark_tight_out'], dirs['mark_tight_chart'], 'Mark_Tight_Date', config.DATA_DIR if exchange == 'NSE' else config.BSE_DATA_DIR, plot_days=500)
 
                 return
@@ -306,14 +317,11 @@ def main():
         
     results_all = pd.concat(results_list, ignore_index=True)
     
-    # Mark Tight: today's close must clear the Donchian level frozen at the
-    # start of the active Mark setup.  Mark's 20%/50% 52-week conditions are
-    # already guaranteed by process_symbol_data for every result in results_all.
-    logging.info("Running fixed-Donchian Mark Tight screening...")
+    # Every returned row already contains a confirmed, held Mark Tight breakout.
+    logging.info("Exporting rolling-Donchian Mark Tight matches...")
     t_stage2_start = time.time()
     results_stage2 = results_all[
-        (results_all['tight_breakout']) &
-        (~results_all['mark_tight_date'].isna())
+        ~results_all['mark_tight_date'].isna()
     ].copy()
 
     if not results_stage2.empty:

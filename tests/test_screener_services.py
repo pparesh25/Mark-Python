@@ -1,39 +1,57 @@
 """Tests for non-strategy screener services."""
 
 from pathlib import Path
+from datetime import date, timedelta
 
 import pandas as pd
 
 import config
 import run_screener
 from mark_screener import results
-from mark_screener.scoring import add_priority_score
 
 
-def test_priority_score_service_adds_shared_output_columns():
-    frame = pd.DataFrame({
-        "Current Price": [100, 200],
-        "Debt to equity": [0.5, 1.5],
-        "Volume 1month average": [1_000_000, 2_000_000],
-        "Return over 1year": [20, 10],
-        "Return over 3months": [8, 4],
-        "Return on capital employed": [18, 10],
-        "Return on equity": [16, 8],
-        "Piotroski score": [8, 5],
-        "Altman Z Score": [3, 1],
-        "YOY Quarterly sales growth": [20, 5],
-        "YOY Quarterly profit growth": [25, 3],
-        "Change in FII holding": [2, -1],
-        "Change in DII holding": [1, -2],
-        "Pledged percentage": [5, 20],
+def test_results_are_indexed_by_latest_breakout_first(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "WATCHLISTS_ENABLED", False)
+    monkeypatch.setattr(results, "CURRENT_TIMESTAMP", "20260730_120000")
+    out_dir = tmp_path / "csv"
+    out_dir.mkdir()
+    today = date.today()
+    technical = pd.DataFrame({
+        "symbol": ["OLDER", "LATEST"],
+        "isin": ["IN1", "IN2"],
+        "date": [today.isoformat(), today.isoformat()],
+        "breakout_date": [
+            (today - timedelta(days=5)).isoformat(),
+            (today - timedelta(days=1)).isoformat(),
+        ],
+    })
+    fundamentals = pd.DataFrame({
+        "ISIN Code": ["IN1", "IN2"],
+        "Name": ["Older Ltd", "Latest Ltd"],
     })
 
-    result = add_priority_score(frame)
+    ordered = results.process_results(
+        technical,
+        fundamentals,
+        "nse_tight_flag",
+        out_dir,
+        tmp_path / "charts",
+        "breakout_date",
+        tmp_path,
+        render_charts=False,
+    )
 
-    assert {"Priority_Score", "Turnover_cr", "Tradeable"}.issubset(result.columns)
-    assert result.loc[0, "Tradeable"] == "Y"
-    assert result.loc[1, "Tradeable"] == "N"
-    assert result["Priority_Score"].notna().all()
+    assert ordered["symbol"].tolist() == ["LATEST", "OLDER"]
+    assert ordered["Days_Since_Breakout"].tolist() == [1, 5]
+    exported = pd.read_csv(
+        out_dir / "20260730_120000_nse_tight_flag_qualified.csv"
+    )
+    assert exported[["Index", "symbol", "Days_Since_Breakout"]].to_dict(
+        "records"
+    ) == [
+        {"Index": 0, "symbol": "LATEST", "Days_Since_Breakout": 1},
+        {"Index": 1, "symbol": "OLDER", "Days_Since_Breakout": 5},
+    ]
 
 
 def test_opentrader_watchlist_paths_are_exchange_specific(tmp_path):

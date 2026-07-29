@@ -8,6 +8,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import talib as ta
 import duckdb
 import polars as pl
@@ -159,7 +160,6 @@ def process_symbol_data(args_tuple):
             lows = df['low'].to_numpy()
             dates = df['date'].cast(pl.String).to_numpy()
             last_close = closes[-1]
-            last_low = lows[-1]
         else:
             df.columns = df.columns.str.lower()
             closes = df['close'].values
@@ -167,15 +167,19 @@ def process_symbol_data(args_tuple):
             lows = df['low'].values
             dates = df['date'].values
             last_close = closes[-1]
-            last_low = lows[-1]
-
-        # Tight Flag indicators use full, non-shortened windows.
-        n = len(closes)
-        ema_200 = ta.EMA(closes, timeperiod=config.EMA_PERIOD)
-        high_52w = ta.MAX(highs, timeperiod=config.MIN_HISTORY_DAYS)
-
-        last_ema200 = ema_200[-1]
-        last_52w_high = high_52w[-1]
+        # Apply invariant quality gates before the more expensive pattern scan.
+        if last_close < 5.0:
+            return None
+        last_52w_high = float(np.max(highs[-config.MIN_HISTORY_DAYS:]))
+        dist_52w = ((last_52w_high - last_close) / last_52w_high * 100
+                     if last_52w_high > 0 else float('inf'))
+        if dist_52w > 45.0:
+            return None
+        last_ema200 = ta.EMA(closes, timeperiod=config.EMA_PERIOD)[-1]
+        if (np.isnan(last_ema200)
+                or last_close < last_ema200
+        ):
+            return None
 
         df_screening = df.tail(config.FLAG_LOOKBACK_DAYS)
         if not isinstance(df_screening, pl.DataFrame):
@@ -183,18 +187,7 @@ def process_symbol_data(args_tuple):
         (is_flag, flag_date, flag_start_date, flag_peak_date,
          is_tight_flag, tight_flag_date, tight_start_date,
          tight_peak_date, breakout_date) = check_flag_patterns(df_screening)
-        
-        # The 90%-in-45-days Flag condition is an internal candidate gate.
-        # Only complete Tight Flag matches continue to result processing.
         if not is_tight_flag:
-            return None
-
-        dist_52w = ((last_52w_high - last_close) / last_52w_high * 100
-                     if last_52w_high > 0 else float('inf'))
-        if (last_close < 5.0
-                or np.isnan(last_ema200)
-                or last_close < last_ema200
-                or dist_52w > 45.0):
             return None
 
         res_dict = {
@@ -282,7 +275,7 @@ def main():
             df_tight_flag = pd.DataFrame(rust_dataset['tight_flag_qualified'])
             if not df_tight_flag.empty:
                 df_tight_flag['Exchange'] = exchange
-                process_results(df_tight_flag, fundamental_df, f"{exchange.lower()}_tight_flag", dirs['tight_flag_out'], dirs['tight_flag_chart'], 'tight_flag_date', config.DATA_DIR if exchange == 'NSE' else config.BSE_DATA_DIR, plot_days=200)
+                process_results(df_tight_flag, fundamental_df, f"{exchange.lower()}_tight_flag", dirs['tight_flag_out'], dirs['tight_flag_chart'], 'breakout_date', config.DATA_DIR if exchange == 'NSE' else config.BSE_DATA_DIR, plot_days=200)
 
             return
 
@@ -415,7 +408,7 @@ def main():
         t_tight_start = time.time()
         process_results(
             results_tight, query_df, f"{exchange.lower()}_tight_flag", TIGHT_FLAG_OUT_DIR,
-            TIGHT_FLAG_CHART_DIR, "tight_flag_date", config.DATA_DIR, plot_days=200, eod_data_dict=eod_data_dict
+            TIGHT_FLAG_CHART_DIR, "breakout_date", config.DATA_DIR, plot_days=200, eod_data_dict=eod_data_dict
         )
         logging.info(f"✓ Processed Tight Flag results in {time.time() - t_tight_start:.2f}s")
         

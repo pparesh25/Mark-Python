@@ -11,7 +11,6 @@ import pandas as pd
 
 import config
 from config import CURRENT_TIMESTAMP
-from .scoring import add_priority_score
 
 
 def write_watchlist(frame: pd.DataFrame, suffix: str) -> Path | None:
@@ -51,7 +50,19 @@ def write_watchlist(frame: pd.DataFrame, suffix: str) -> Path | None:
     return watchlist_path
 
 
-def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date_col, data_dir, plot_days=500, eod_data_dict=None):
+def process_results(
+    df_results,
+    fundamental_df,
+    suffix,
+    out_dir,
+    chart_dir,
+    date_col,
+    data_dir,
+    plot_days=500,
+    eod_data_dict=None,
+    *,
+    render_charts=True,
+):
     df_results['isin'] = df_results['isin'].astype(str).str.strip().str.upper()
     fundamental_df['ISIN Code'] = fundamental_df['ISIN Code'].astype(str).str.strip().str.upper()
     
@@ -61,26 +72,29 @@ def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date
         logging.info(f"No stocks matched for {suffix}.")
         return None
  
-    merged_df = add_priority_score(merged_df)
-    merged_df = merged_df[~merged_df[date_col].isna()]
-    df_sorted = merged_df.sort_values(by="Priority_Score", ascending=False)
-    df_sorted["Plot Start"] = pd.to_datetime(df_sorted[date_col]) - pd.to_timedelta(plot_days, unit="D")
+    merged_df["_Breakout_Date"] = pd.to_datetime(
+        merged_df[date_col], errors="coerce"
+    )
+    merged_df = merged_df.dropna(subset=["_Breakout_Date"])
+    merged_df["Days_Since_Breakout"] = (
+        pd.Timestamp(date.today()) - merged_df["_Breakout_Date"].dt.normalize()
+    ).dt.days
+    df_sorted = merged_df.sort_values(
+        by=["Days_Since_Breakout", "_Breakout_Date", "symbol"],
+        ascending=[True, False, True],
+        kind="stable",
+    )
+    df_sorted["Plot Start"] = df_sorted["_Breakout_Date"] - pd.to_timedelta(plot_days, unit="D")
     df_sorted["Plot End"] = pd.to_datetime(date.today())
-    df_sorted["Days_In_Trend"] = (pd.to_datetime(df_sorted["date"]) - pd.to_datetime(df_sorted[date_col])).dt.days
-    if "EMA_50" in df_sorted.columns and "EMA_200" in df_sorted.columns:
-        df_sorted["Trend_Strength"] = ((df_sorted["EMA_50"] - df_sorted["EMA_200"]) / df_sorted["EMA_200"] * 100).round(2)
-    else:
-        df_sorted["Trend_Strength"] = 0.0
     df_sorted = df_sorted.reset_index(drop=True)
     df_sorted["Index"] = df_sorted.index
  
-    csv_columns = ["Index", "symbol", "Priority_Score", "Tradeable", "Turnover_cr", "Days_In_Trend", "Trend_Strength"]
+    csv_columns = ["Index", "symbol", "Days_Since_Breakout"]
     excluded = {
         "Index", "symbol", "date", "close", "EMA_50", "EMA_150", "EMA_200",
         "52 week high", "52 week low",
-        "Down from 52w high_x", "Donchian_60_High", "Donchian_60_Base", "Tight_Breakout",
-        "Plot Start", "Plot End", "Days_In_Trend", "Trend_Strength",
-        "Priority_Score", "Tradeable", "Turnover_cr",
+        "Down from 52w high_x", "Donchian_60_High",
+        "Plot Start", "Plot End", "_Breakout_Date", "Days_Since_Breakout",
         "flag_start_date", "flag_peak_date", "tight_start_date", "tight_peak_date", "breakout_date",
     }
     csv_columns.extend(col for col in df_sorted.columns if col not in excluded)
@@ -88,6 +102,9 @@ def process_results(df_results, fundamental_df, suffix, out_dir, chart_dir, date
     df_sorted[csv_columns].to_csv(csv_filepath, index=False)
     logging.info(f"CSV exported: {csv_filepath} ({len(df_sorted)} stocks)")
     write_watchlist(df_sorted, suffix)
+
+    if not render_charts:
+        return df_sorted
  
     logging.info(f"Generating charts for {suffix} in {chart_dir}...")
     try:

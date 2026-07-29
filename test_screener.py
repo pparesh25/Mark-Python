@@ -6,7 +6,10 @@ import config
 def test_get_output_dirs():
     # Test NSE output directory structures
     nse_dirs = config.get_output_dirs("NSE")
-    assert nse_dirs['mark_out'] == config.OUT_DIR / "NSE" / "mark"
+    assert set(nse_dirs) == {
+        "mark_tight_out", "tight_flag_out",
+        "mark_tight_chart", "tight_flag_chart",
+    }
     assert nse_dirs['tight_flag_chart'] == config.CHART_DIR / "NSE" / "Tight Flag"
     
     # Test BSE output directory structures

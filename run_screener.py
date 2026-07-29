@@ -5,7 +5,7 @@ Replaces ``run_complete_screening.sh`` + the three ``.sh`` wrappers with one
 Python orchestrator that:
 
   Step 1 — updates the eod2 price database (via the existing run_eod2.sh).
-  Step 2 — downloads fresh fundamentals from screener.in (Selenium downloader).
+  Step 2 — downloads fresh fundamentals from screener.in over HTTP.
   Step 3 — runs the technical + fundamental screen (Mark_screener.py).
 
 Improvements over the legacy shell orchestrator:
@@ -56,10 +56,10 @@ _C = {
 def setup_logging():
     """Configure concise application logging for both console and file.
 
-    The previous DEBUG root logger also captured low-level HTTP/HPACK and
-    Selenium transport traces, making an ordinary run produce thousands of
-    mostly useless lines.  Keep operational messages at INFO and suppress
-    dependency internals unless a dependency reports a warning or error.
+    The previous DEBUG root logger also captured low-level HTTP/HPACK transport
+    traces, making an ordinary run produce thousands of mostly useless lines.
+    Keep operational messages at INFO and suppress dependency internals unless
+    a dependency reports a warning or error.
     """
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -87,8 +87,7 @@ def setup_logging():
     logger.addHandler(fh)
 
     for noisy_logger in (
-        'httpx', 'httpcore', 'hpack', 'selenium', 'urllib3',
-        'webdriver_manager', 'websocket', 'websockets',
+        'httpx', 'httpcore', 'hpack', 'urllib3', 'websocket', 'websockets',
     ):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
@@ -153,8 +152,8 @@ def run_step(name, cmd, logger, cwd=None):
 def validate_fundamentals(logger):
     """Sanity-check all-company.csv before the screener reads it.
 
-    The old pipeline would silently screen against a missing/empty file (the
-    Selenium downloader never propagated failures). Catch that here.
+    The old pipeline would silently screen against a missing/empty file.
+    Catch that here.
     """
     fundamental_file = config.FUNDAMENTAL_FILE
     if not fundamental_file.exists():
@@ -170,13 +169,11 @@ def validate_fundamentals(logger):
 
     with open(fundamental_file, 'r', encoding='utf-8', errors='replace') as f:
         header = f.readline().strip()
-    # Columns the priority-score helper depends on (see add_priority_score).
+    # Columns required for ISIN joining and the chart information panel.
     expected_cols = [
-        'NSE Code', 'Current Price', 'Debt to equity', 'Volume 1month average',
-        'Return over 1year', 'Return over 3months', 'Return on capital employed',
-        'Return on equity', 'Piotroski score', 'Altman Z Score',
-        'YOY Quarterly sales growth', 'YOY Quarterly profit growth',
-        'Change in FII holding', 'Change in DII holding', 'Pledged percentage',
+        'ISIN Code', 'Name', 'Industry', 'Current Price',
+        'Market Capitalization', 'Return on capital employed',
+        'Return on equity',
     ]
     missing = [c for c in expected_cols if c not in header]
     if missing:
@@ -406,9 +403,9 @@ def main():
     logger.info(color("▶ Step 2/4: Fundamental Data Download (screener.in)", 'BOLD'))
     if config.FUNDAMENTAL_FILE.exists():
         logger.info(color(f"  ✓ Using local fundamentals file: {config.FUNDAMENTAL_FILE.name}", 'GREEN'))
-        logger.info(color("  Skipping browser download process.", 'CYAN'))
+        logger.info(color("  Skipping HTTP download.", 'CYAN'))
     else:
-        logger.info(color("  Starting Selenium browser automation directly from Python...", 'CYAN'))
+        logger.info(color("  Starting optimized direct HTTP download...", 'CYAN'))
         t0 = time.time()
         
         try:
@@ -417,8 +414,7 @@ def main():
             config.ensure_dirs()
             
             success = fundamental_downloader.download_screener_csv(
-                output_dir=config.FUNDAMENTAL_DIR,
-                headless=True
+                output_dir=config.FUNDAMENTAL_DIR
             )
         except Exception as e:
             logger.error(color(f"  ✗ Failed to execute fundamental download in Python: {e}", 'RED'))

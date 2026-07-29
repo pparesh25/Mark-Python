@@ -17,6 +17,9 @@ struct ChartTask {
     plot_start: String,
     #[serde(rename = "Plot End")]
     plot_end: String,
+    #[serde(default)]
+    #[serde(rename = "Chart Output")]
+    chart_output: String,
 
     // Pattern dates (optional)
     #[serde(rename = "flag_start_date")]
@@ -31,16 +34,8 @@ struct ChartTask {
     breakout_date: Option<String>,
 
     // Screener dates (optional)
-    #[serde(rename = "date")]
-    date: Option<String>,
-    #[serde(rename = "mark_date", alias = "Mark_Date")]
-    mark_date: Option<String>,
     #[serde(rename = "mark_tight_date", alias = "Mark_Tight_Date")]
     mark_tight_date: Option<String>,
-    #[serde(rename = "flag_date")]
-    flag_date: Option<String>,
-    #[serde(rename = "tight_flag_date")]
-    tight_flag_date: Option<String>,
 
     // Exchange (optional, default to NSE)
     #[serde(default)]
@@ -123,6 +118,10 @@ fn clean_opt_date(opt: &Option<String>) -> Option<&str> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+    // One global Rayon pool owns the machine for screening or charting.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .stack_size(8 * 1024 * 1024)
+        .build_global();
     if args.len() == 2 && matches!(args[1].as_str(), "--version" | "-V") {
         println!("stock_analysis {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -142,16 +141,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args[0]
         );
         eprintln!(
-            "   OR: {} screen <duckdb_file> <fundamental_csv> <exchange> <out_dir>",
+            "   OR: {} screen <duckdb_file> <fundamental_csv> <NSE|BSE|ALL> <out_dir>",
             args[0]
         );
         std::process::exit(1);
     };
-
-    // Initialize Rayon ThreadPoolBuilder with 8MB stack size to prevent stack overflow
-    let _ = rayon::ThreadPoolBuilder::new()
-        .stack_size(8 * 1024 * 1024)
-        .build_global();
 
     let start_time = std::time::Instant::now();
 
@@ -239,7 +233,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let symbol = &task.symbol;
         let index_val = &task.index;
         let file_name = format!("{}_{}.png", index_val, symbol);
-        let out_path = Path::new(&output_dir).join(file_name);
+        let task_output = if task.chart_output.trim().is_empty() {
+            Path::new(&output_dir)
+        } else {
+            Path::new(task.chart_output.trim())
+        };
+        if let Err(error) = fs::create_dir_all(task_output) {
+            eprintln!("Failed to create chart directory for {}: {}", symbol, error);
+            return;
+        }
+        let out_path = task_output.join(file_name);
 
         // Determine Exchange (NSE/BSE)
         let mut exchange = "NSE";
@@ -273,8 +276,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .or_else(|| clean_opt_date(&task.tight_peak_date))
             .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
         let breakout = clean_opt_date(&task.breakout_date)
-            .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
-        let mark = clean_opt_date(&task.mark_date)
             .or_else(|| clean_opt_date(&task.mark_tight_date))
             .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
 
@@ -311,7 +312,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             p_start,
             p_end,
             breakout,
-            mark,
             &info_line1,
             &info_line2,
             &info_line3,

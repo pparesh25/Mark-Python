@@ -109,9 +109,8 @@ FLAG_LOOKBACK_DAYS = 90
 
 # Fundamentals (all-company.csv) are downloaded fresh into the project's own
 # fundamental_files/ folder, timestamped per run.
-# The downloader first writes a fixed-name all-company.csv there (Chrome saves
-# whatever name the server returns), then the orchestrator renames it to
-# all-company_{timestamp}.csv.
+# The downloader first writes a fixed-name all-company.csv there, then the
+# orchestrator renames it to all-company_{timestamp}.csv.
 FUNDAMENTAL_DIR = DATABASE_DIR / "fundamental_files"
 _today_fund_file = FUNDAMENTAL_DIR / f"all-company_{CURRENT_DATE}.csv"
 # The ordinary pipeline targets today's file.  Reusing an older file is an
@@ -154,11 +153,8 @@ def get_output_dirs(exchange: str):
     chart_base = CHART_DIR / ex_upper
     
     return {
-        'mark_out': out_base / 'mark',
         'mark_tight_out': out_base / 'mark_tight',
         'tight_flag_out': out_base / 'Tight Flag',
-        
-        'mark_chart': chart_base / 'mark',
         'mark_tight_chart': chart_base / 'mark_tight',
         'tight_flag_chart': chart_base / 'Tight Flag',
     }

@@ -23,7 +23,7 @@ def plot_save_chart(args):
     try:
         stock = row["symbol"]
         idx_val = str(row["Index"]) if "Index" in row else "0"
-        mark_date = row[date_col]
+        signal_date = row[date_col]
         exchange = row.get("Exchange", row.get("exchange", "NSE"))
         
         if eod_df is None or eod_df.empty:
@@ -141,9 +141,9 @@ def plot_save_chart(args):
             # Add legend to ax_price so the user knows what colors mean
             ax_price.legend(loc="upper left", fontsize=8)
         else:
-            # Default single line for Mark screener
+            # Mark Tight charts contain only the true breakout-date line.
             try:
-                ax_price.axvline(x=stock_data.index.get_loc(mark_date), color="blue", linestyle=":", linewidth=0.8, alpha=0.7)
+                ax_price.axvline(x=stock_data.index.get_loc(signal_date), color="green", linestyle="-.", linewidth=1.5, alpha=0.9)
             except (KeyError, ValueError):
                 pass
         plt.setp(ax_volume.xaxis.get_majorticklabels(), rotation=0, ha="center")
@@ -151,4 +151,3 @@ def plot_save_chart(args):
         plt.close()
     except Exception as error:
         logging.error(f"Error plotting {row.get('symbol', 'unknown')}: {error}")
-

@@ -2,13 +2,12 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import duckdb
 import pandas as pd
 
 from mark_screener import fast_pipeline
 
 
-def test_screen_exchange_requests_both_strategies_in_one_rust_call(
+def test_screen_all_requests_both_exchanges_and_strategies_in_one_rust_call(
     tmp_path, monkeypatch
 ):
     captured = {}
@@ -19,26 +18,32 @@ def test_screen_exchange_requests_both_strategies_in_one_rust_call(
         fast_pipeline.config, "FUNDAMENTAL_FILE", Path("/fake/fundamentals.csv")
     )
 
-    def fake_run(cmd, capture_output, text):
+    def fake_run(cmd, capture_output, text, encoding, errors):
         captured["cmd"] = cmd
-        output = tmp_path / "NSE" / "NSE_rust_screened.json"
-        output.write_text(
-            json.dumps(
-                {
-                    "mark_tight_qualified": [],
-                    "tight_flag_qualified": [],
-                }
+        for exchange in ("NSE", "BSE"):
+            output_dir = tmp_path / exchange
+            output_dir.mkdir(exist_ok=True)
+            output = output_dir / f"{exchange}_rust_screened.json"
+            output.write_text(
+                json.dumps(
+                    {
+                        "selected_symbols": 0,
+                        "history_ready": 0,
+                        "max_history": 0,
+                        "mark_tight_qualified": [],
+                        "tight_flag_qualified": [],
+                    }
+                )
             )
-        )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(fast_pipeline.subprocess, "run", fake_run)
 
-    exchange, dataset, _ = fast_pipeline._screen_exchange("NSE")
+    datasets, _ = fast_pipeline._screen_all_exchanges()
 
-    assert exchange == "NSE"
-    assert dataset["mark_tight_qualified"] == []
-    assert dataset["tight_flag_qualified"] == []
+    assert datasets["NSE"]["mark_tight_qualified"] == []
+    assert datasets["BSE"]["tight_flag_qualified"] == []
+    assert "ALL" in captured["cmd"]
     assert "--mark-tight-only" not in captured["cmd"]
     assert "--tight-flag-only" not in captured["cmd"]
     assert captured["cmd"].count("screen") == 1
@@ -68,51 +73,18 @@ def test_result_jobs_prepare_both_output_categories():
     assert [job[2] for job in jobs] == ["nse_mark_tight", "nse_tight_flag"]
     assert jobs[0][5] == "Mark_Tight_Date"
     assert {"EMA_50", "EMA_150", "EMA_200"}.issubset(jobs[0][0].columns)
-    assert jobs[1][5] == "tight_flag_date"
+    assert jobs[1][5] == "breakout_date"
 
 
-def test_filter_stats_apply_fundamental_and_bse_unique_isin_rules(
-    tmp_path, monkeypatch
-):
-    fundamental_file = tmp_path / "fundamentals.csv"
-    pd.DataFrame(
-        {"ISIN Code": ["IN_SHARED", "IN_NSE", "IN_BSE", "IN_BSE_SME"]}
-    ).to_csv(fundamental_file, index=False)
+def test_chart_reset_removes_legacy_mark_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(fast_pipeline.config, "CHART_DIR", tmp_path)
+    legacy = tmp_path / "NSE" / "mark"
+    legacy.mkdir(parents=True)
+    (legacy / "old.png").write_bytes(b"old")
 
-    database = tmp_path / "eod.duckdb"
-    conn = duckdb.connect(str(database))
-    conn.execute(
-        """
-        CREATE TABLE eod_data (
-            Exchange VARCHAR, Symbol VARCHAR, ISIN VARCHAR
-        )
-        """
-    )
-    conn.executemany(
-        "INSERT INTO eod_data VALUES (?, ?, ?)",
-        [
-            ("NSE", "SHARED", "IN_SHARED"),
-            ("NSE", "NSEONLY", "IN_NSE"),
-            ("NSE", "ETF", "NOT_IN_FUNDAMENTALS"),
-            ("BSE", "SHARED_BSE", "IN_SHARED"),
-            ("BSE", "BSEONLY", "IN_BSE"),
-            ("BSE", "BSEONLY", "IN_BSE"),
-            ("BSE", "BSEONLY_SME", "IN_BSE_SME"),
-        ],
-    )
-    conn.close()
+    fast_pipeline._reset_chart_dirs()
 
-    monkeypatch.setattr(fast_pipeline.config, "FUNDAMENTAL_FILE", fundamental_file)
-    monkeypatch.setattr(fast_pipeline.config, "DUCKDB_FILE", database)
-    monkeypatch.setattr(fast_pipeline.config, "MIN_HISTORY_DAYS", 2)
-
-    stats = fast_pipeline._load_filter_stats()
-
-    assert stats["fundamental_isins"] == 4
-    assert stats["nse_matching"] == 2
-    assert stats["bse_matching"] == 3
-    assert stats["bse_overlap"] == 1
-    assert stats["bse_unique"] == 2
-    assert stats["NSE"]["selected"] == 2
-    assert stats["BSE"]["selected"] == 1
-    assert stats["BSE"]["history_ready"] == 1
+    assert not legacy.exists()
+    for exchange in ("NSE", "BSE"):
+        assert (tmp_path / exchange / "mark_tight").is_dir()
+        assert (tmp_path / exchange / "Tight Flag").is_dir()
