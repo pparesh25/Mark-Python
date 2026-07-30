@@ -1,8 +1,9 @@
 """Install the latest prebuilt stock_analysis binary from GitHub Releases.
 
 This script uses only the Python standard library. It selects the correct
-Windows/Linux x86_64 asset, verifies its SHA-256 checksum, and extracts it into
-the location automatically discovered by ``config.RUST_BINARY``.
+Windows/Linux x86_64 or Apple Silicon asset, verifies its SHA-256 checksum,
+and extracts it into the location automatically discovered by
+``config.RUST_BINARY``.
 """
 
 from __future__ import annotations
@@ -53,11 +54,19 @@ def platform_key(system_name: str | None = None, machine_name: str | None = None
         "amd64": "x86_64",
         "x64": "x86_64",
         "x86_64": "x86_64",
+        "aarch64": "aarch64",
+        "arm64": "aarch64",
     }.get(machine)
-    if system not in {"linux", "windows"} or architecture is None:
+    supported = {
+        ("linux", "x86_64"),
+        ("windows", "x86_64"),
+        ("darwin", "aarch64"),
+    }
+    if architecture is None or (system, architecture) not in supported:
         raise RuntimeError(
             f"No prebuilt Rust binary is published for {system}/{machine}. "
-            "Supported platforms: Linux x86_64 and Windows x86_64."
+            "Supported platforms: Linux x86_64, Windows x86_64, and "
+            "macOS Apple Silicon."
         )
     return f"{system}-{architecture}"
 

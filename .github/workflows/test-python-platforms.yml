@@ -8,6 +8,8 @@ on:
       - "requirements*.txt"
       - "setup_linux.sh"
       - "run_linux.sh"
+      - "setup_macos.sh"
+      - "run_macos.sh"
       - "setup_windows.ps1"
       - "run_windows.cmd"
       - ".github/workflows/test-python-platforms.yml"
@@ -17,6 +19,8 @@ on:
       - "requirements*.txt"
       - "setup_linux.sh"
       - "run_linux.sh"
+      - "setup_macos.sh"
+      - "run_macos.sh"
       - "setup_windows.ps1"
       - "run_windows.cmd"
       - ".github/workflows/test-python-platforms.yml"
@@ -36,6 +40,8 @@ jobs:
             os: ubuntu-22.04
           - label: Windows Python 3.11
             os: windows-2022
+          - label: macOS Apple Silicon Python 3.11
+            os: macos-15
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
 
@@ -53,20 +59,15 @@ jobs:
           python -m pip install -r requirements.txt pytest
 
       - name: Run cross-platform service tests
-        run: >-
-          python -m pytest -q
-          tests/test_screener_services.py
-          tests/test_fast_pipeline.py
-          tests/test_rust_binary_install.py
-          tests/test_screening_readiness.py
-          tests/test_eod_store.py
-          tests/test_bse_eod_updates.py
-          tests/test_eod_downloader.py
-          -k "not test_split_and_bonus_adjustment_only_change_history and not test_symbol_rename_preserves_history"
+        run: python -m pytest -q
 
       - name: Validate Linux launchers
         if: runner.os == 'Linux'
         run: bash -n setup_linux.sh run_linux.sh
+
+      - name: Validate macOS launchers
+        if: runner.os == 'macOS'
+        run: bash -n setup_macos.sh run_macos.sh
 
       - name: Validate Windows setup script
         if: runner.os == 'Windows'

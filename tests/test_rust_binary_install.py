@@ -7,11 +7,13 @@ import install_rust_binary
 def test_installer_selects_supported_platform_keys():
     assert install_rust_binary.platform_key("Linux", "x86_64") == "linux-x86_64"
     assert install_rust_binary.platform_key("Windows", "AMD64") == "windows-x86_64"
+    assert install_rust_binary.platform_key("Darwin", "arm64") == "darwin-aarch64"
+    assert install_rust_binary.platform_key("Darwin", "aarch64") == "darwin-aarch64"
 
 
 def test_installer_rejects_unpublished_platform():
     try:
-        install_rust_binary.platform_key("Darwin", "arm64")
+        install_rust_binary.platform_key("Darwin", "x86_64")
     except RuntimeError as error:
         assert "Supported platforms" in str(error)
     else:
@@ -33,6 +35,43 @@ def test_config_prefers_downloaded_prebuilt_binary(tmp_path, monkeypatch):
     binary.write_bytes(b"binary")
 
     assert config._resolve_rust_binary() == binary
+
+
+def test_config_prefers_apple_silicon_prebuilt_binary(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(config.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(config.platform, "machine", lambda: "arm64")
+    binary = (
+        tmp_path
+        / "stock_analysis"
+        / "bin"
+        / "darwin-aarch64"
+        / "stock_analysis"
+    )
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"binary")
+
+    assert config._resolve_rust_binary() == binary
+
+
+def test_apple_silicon_release_asset_names():
+    archive = "stock-analysis-darwin-aarch64.tar.gz"
+    release = {
+        "tag_name": "rust-v1.0.0",
+        "assets": [
+            {"name": archive, "url": "https://example.test/archive"},
+            {
+                "name": f"{archive}.sha256",
+                "url": "https://example.test/checksum",
+            },
+        ],
+    }
+
+    assert install_rust_binary._asset_urls(release, "darwin-aarch64") == (
+        archive,
+        "https://example.test/archive",
+        "https://example.test/checksum",
+    )
 
 
 def test_config_honors_explicit_binary_override(tmp_path, monkeypatch):

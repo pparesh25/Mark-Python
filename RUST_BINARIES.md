@@ -1,6 +1,7 @@
 # Precompiled Rust engine
 
-Linux and Windows users do not need Rust, Cargo, CMake, or a C++ compiler.
+Linux, Windows, and Apple Silicon macOS users do not need Rust, Cargo, CMake,
+or a C++ compiler.
 The platform setup scripts install the Python runtime and then call the binary
 installer:
 
@@ -12,16 +13,21 @@ installer:
 ./setup_linux.sh
 ```
 
+```bash
+./setup_macos.sh
+```
+
 After setting up Python manually, `python install_rust_binary.py` remains
 available.
 
 The installer uses only the Python standard library. It downloads the newest
-`rust-v*` GitHub Release for the current x86_64 platform, verifies the
+`rust-v*` GitHub Release for the current supported platform, verifies the
 published SHA-256 checksum, and installs the executable under:
 
 ```text
 stock_analysis/bin/linux-x86_64/stock_analysis
 stock_analysis/bin/windows-x86_64/stock_analysis.exe
+stock_analysis/bin/darwin-aarch64/stock_analysis
 ```
 
 `config.py` discovers that path automatically. `MARK_RUST_BINARY` can still be
@@ -42,15 +48,17 @@ set GITHUB_TOKEN=your-token            # Windows Command Prompt
 
 ## GitHub Actions
 
-`.github/workflows/build-rust-binaries.yml` compiles and smoke-tests both
+`.github/workflows/build-rust-binaries.yml` compiles and smoke-tests all three
 native targets:
 
 - Ubuntu 22.04: `x86_64-unknown-linux-gnu`
 - Windows Server 2022: `x86_64-pc-windows-msvc`
+- macOS 15 Apple Silicon: `aarch64-apple-darwin` (macOS 11+ deployment target)
 
 The Windows build statically links its C runtime, avoiding a separate Visual
-C++ Redistributable installation.
+C++ Redistributable installation. The macOS binary receives an ad-hoc code
+signature before packaging.
 
 Pull requests and relevant pushes receive downloadable 30-day workflow
 artifacts. Pushing a `rust-v*` tag additionally creates a durable GitHub
-Release containing both archives and their checksum files.
+Release containing all three archives and their checksum files.

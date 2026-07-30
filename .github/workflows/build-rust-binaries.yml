@@ -6,10 +6,18 @@ on:
     tags: ["rust-v*"]
     paths:
       - "stock_analysis/**"
+      - "install_rust_binary.py"
+      - "tests/test_rust_binary_install.py"
+      - "setup_macos.sh"
+      - "run_macos.sh"
       - ".github/workflows/build-rust-binaries.yml"
   pull_request:
     paths:
       - "stock_analysis/**"
+      - "install_rust_binary.py"
+      - "tests/test_rust_binary_install.py"
+      - "setup_macos.sh"
+      - "run_macos.sh"
       - ".github/workflows/build-rust-binaries.yml"
   workflow_dispatch:
 
@@ -29,12 +37,21 @@ jobs:
             platform_key: linux-x86_64
             archive: stock-analysis-linux-x86_64.tar.gz
             rustflags: ""
+            deployment_target: ""
           - label: Windows x86_64
             os: windows-2022
             target: x86_64-pc-windows-msvc
             platform_key: windows-x86_64
             archive: stock-analysis-windows-x86_64.zip
             rustflags: "-C target-feature=+crt-static"
+            deployment_target: ""
+          - label: macOS Apple Silicon
+            os: macos-15
+            target: aarch64-apple-darwin
+            platform_key: darwin-aarch64
+            archive: stock-analysis-darwin-aarch64.tar.gz
+            rustflags: ""
+            deployment_target: "11.0"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     defaults:
@@ -56,10 +73,17 @@ jobs:
       - name: Build locked release binary
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
         run: cargo build --release --locked --bin stock_analysis --target ${{ matrix.target }}
 
-      - name: Smoke test Linux binary
-        if: runner.os == 'Linux'
+      - name: Ad-hoc sign macOS binary
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - "target/${{ matrix.target }}/release/stock_analysis"
+          codesign --verify --verbose "target/${{ matrix.target }}/release/stock_analysis"
+
+      - name: Smoke test Unix binary
+        if: runner.os != 'Windows'
         run: ./target/${{ matrix.target }}/release/stock_analysis --version
 
       - name: Smoke test Windows binary
@@ -67,8 +91,8 @@ jobs:
         shell: pwsh
         run: .\\target\\${{ matrix.target }}\\release\\stock_analysis.exe --version
 
-      - name: Package Linux binary
-        if: runner.os == 'Linux'
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           package_root="../dist/${{ matrix.platform_key }}/stock_analysis/bin/${{ matrix.platform_key }}"
@@ -78,7 +102,7 @@ jobs:
           chmod +x "$package_root/stock_analysis"
           tar -C "../dist/${{ matrix.platform_key }}" -czf "../dist/${{ matrix.archive }}" stock_analysis
           cd ../dist
-          sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
 
       - name: Package Windows binary
         if: runner.os == 'Windows'

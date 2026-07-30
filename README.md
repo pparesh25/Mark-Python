@@ -4,14 +4,17 @@ Cross-platform NSE/BSE Mark Tight and Tight Flag pipeline. Python is retained
 only for the three network downloaders (NSE EOD, BSE EOD and Screener.in
 fundamentals). After downloads finish, one precompiled Rust process performs
 all local screening, enrichment, ranking, CSV/watchlist output and charting.
-Windows and Linux machines do not need Rust, Cargo, CMake, or a C/C++ compiler.
+Windows, Linux, and Apple Silicon Macs do not need Rust, Cargo, CMake, or a
+C/C++ compiler.
 
 ## Supported runtime
 
 - Windows x64 with 64-bit Python 3.10 or newer (Python 3.11 recommended)
 - Linux x86_64 with Python 3.10 or newer (Ubuntu 22.04+ recommended)
+- Apple Silicon macOS with Python 3.10 or newer (Python 3.11 recommended)
 
-The published Rust executable does not currently support ARM64 or Alpine/musl.
+The published Rust executable does not currently support Windows/Linux ARM64,
+Intel macOS, or Alpine/musl.
 
 ## One-time setup
 
@@ -74,7 +77,16 @@ unset GITHUB_TOKEN
 ./run_linux.sh
 ```
 
-Pass `--skip-rust` to either setup script only when the correct prebuilt
+### Apple Silicon macOS
+
+```bash
+export GITHUB_TOKEN="github-token"
+./setup_macos.sh
+unset GITHUB_TOKEN
+./run_macos.sh
+```
+
+Pass `--skip-rust` to a setup script only when the correct prebuilt
 binary was already installed manually.
 
 ## Daily commands
@@ -82,6 +94,7 @@ binary was already installed manually.
 ```text
 run_windows.cmd
 ./run_linux.sh
+./run_macos.sh
 ```
 
 Both launchers pass extra arguments to `run_screener.py`:
@@ -161,10 +174,10 @@ optimized two-request HTTP flow.  An older local file is used only when
    by latest breakout and exports all CSVs, OpenTrader Pro watchlists and
    charts. Screening data is reused for charting, so DuckDB is not read again.
 
-Daily NSE/BSE updates retain full price history in DuckDB and the maintained
-BSE text backup; they do not delete an older candle when a new session is
-added.  The current production store starts with its previously compacted 600
-rows and will grow to 601, 602, and onward.  The manual
+Daily NSE/BSE updates retain full price history in DuckDB; they do not maintain
+separate per-symbol text backups or delete an older candle when a new session
+is added. The current production store starts with its previously compacted
+600 rows and will grow to 601, 602, and onward. The manual
 `compact_price_database.py --retain-candles 600` utility remains available
 only for an explicitly requested future compaction.
 
