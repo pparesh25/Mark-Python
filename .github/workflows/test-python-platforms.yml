@@ -59,7 +59,7 @@ jobs:
           python -m pip install -r requirements.txt pytest
 
       - name: Run cross-platform service tests
-        run: python -m pytest -q
+        run: python -m pytest -q tests
 
       - name: Validate Linux launchers
         if: runner.os == 'Linux'
