@@ -2,9 +2,10 @@
 
 ## Project Overview
 
-Cross-platform NSE/BSE stock screening pipeline. Downloads EOD price data and
-fundamentals, then runs Mark Tight and Tight Flag screens with priority
-scoring, CSVs, charts, and OpenTrader Pro watchlists.
+Cross-platform NSE/BSE stock screening pipeline. Python downloads EOD price
+data (DuckDB) and Screener.in fundamentals; one precompiled Rust process then
+runs the Mark Tight and Tight Flag screens and writes CSVs, charts, and
+OpenTrader Pro watchlists.
 
 ## Team Workflow
 
@@ -26,9 +27,14 @@ scoring, CSVs, charts, and OpenTrader Pro watchlists.
 ## Project Architecture
 
 ### Core Pipeline (run_screener.py)
-1. **Step 1** — `nse_eod_downloader/eod_downloader.py`: Syncs NSE EOD database (daily OHLCV from NSE India)
-2. **Step 2** — `fundamental_downloader.py`: Selenium download from screener.in (screen 3427564)
-3. **Step 3** — `Mark_screener.py`: Technical + fundamental screening
+1. **Step 1** — `screening_readiness.py` decides whether an EOD session is
+   missing; if so `nse_eod_downloader/` and `bse_eod_downloader/` update the
+   DuckDB store through `eod_store.py`.  Missing recent sessions are logged.
+2. **Step 2** — `fundamental_downloader.py`: two-request HTTP export from
+   screener.in (screen 3427564) into `all-company_YYYYMMDD.csv`.
+3. **Steps 3-4** — `stock_analysis` (Rust) `pipeline` subcommand: ISIN join
+   with fundamentals, NSE/BSE overlap removal, stale-series filter, screens,
+   ranking, CSVs, watchlists, and charts.
 
 ### Key Files
 
@@ -36,19 +42,25 @@ scoring, CSVs, charts, and OpenTrader Pro watchlists.
 |------|---------|
 | `run_screener.py` | Unified pipeline orchestrator |
 | `config.py` | Centralized paths, parameters, strategy settings |
-| `nse_eod_downloader/` | NSE EOD downloader and database maintenance modules |
-| `fundamental_downloader.py` | Screener.in CSV download (Selenium) |
-| `Mark_screener.py` | Main screener: Mark Tight + Priority Score |
-| `clean_nse_eod.py` | Cleans NSE_EOD CSVs to Date,Open,High,Low,Close,Volume |
+| `eod_store.py` | DuckDB schema (`securities`, `eod_prices`, `eod_data` view) and upserts |
+| `screening_readiness.py` | EOD freshness, sync-cursor rebase, retry/gap bookkeeping |
+| `nse_eod_downloader/`, `bse_eod_downloader/` | Exchange downloaders and corporate-action adjustments |
+| `fundamental_downloader.py` | Screener.in CSV download (HTTP) |
+| `stock_analysis/src/screener.rs` | Mark Tight and Tight Flag rules |
+| `stock_analysis/src/pipeline.rs` | Fundamentals join, ranking, CSV/watchlist/chart output |
+| `stock_analysis/src/chart.rs` | PNG charts (plotters, embedded DejaVu fonts) |
+| `install_rust_binary.py` | Installs the prebuilt engine from a `rust-v*` release |
 
 ### Config Details (config.py)
-- `BASE_DIR` = dynamic to project root
-- `DATA_DIR` = NSE_EOD/
+- `DATA_ROOT` = `~/Mark EMA and HTF` (or `MARK_DATA_ROOT` / `--data-root`)
+- `DUCKDB_FILE` = `Database/NSE_BSE_EOD.duckdb`
+- Run timestamp and dates use `MARKET_TIMEZONE` (Asia/Kolkata), not the machine clock
+- `FLAG_LOOKBACK_DAYS` and `MAX_STALE_SESSIONS` are passed to the Rust engine
 - Screener screen ID = 3427564
-- Output: qualified_stocks/mark_tight/ and qualified_stocks/Tight Flag/
-- Charts: chart_images/mark_tight/ and chart_images/Tight Flag/
-- Logs: logs/screening_log_{timestamp}.txt
-- AmiBroker watchlists in ~/.opentrader-pro/databases/NSE_EOD/watchlists/
+- Output: `qualified_stocks/<NSE|BSE>/<mark_tight|Tight Flag>/`
+- Charts: `chart_images/<NSE|BSE>/<mark_tight|Tight Flag>/`
+- Logs: `logs/screening_log_{timestamp}.txt`
+- OpenTrader Pro watchlists in `~/.opentrader-pro/databases/<NSE|BSE>_EOD/watchlists/`
 
 ## Setup & Running
 
@@ -57,27 +69,24 @@ scoring, CSVs, charts, and OpenTrader Pro watchlists.
 # Linux x86_64:
 ./setup_linux.sh
 
+# Apple Silicon macOS:
+./setup_macos.sh
+
 # Windows x64 PowerShell:
 .\setup_windows.ps1
-
-# Optional legacy Python calculation/chart fallback:
-python -m pip install -r requirements-legacy.txt
 ```
 
 ### Running
 ```bash
 # Full pipeline:
-source .venv/bin/activate && python run_screener.py
+./run_linux.sh        # or ./run_macos.sh, run_windows.cmd
 
-# Or individual steps:
-# EOD sync:
-python -c "from nse_eod_downloader.eod_downloader import sync_database; import config, logging; logging.basicConfig(level=logging.INFO); sync_database(config.DATA_DIR, logging.getLogger(), metadata_dir=config.EOD_METADATA_DIR, daily_bhavcopy_dir=config.DAILY_BHAVCOPY_DIR)"
+# Tests:
+python -m pytest -q tests
+(cd stock_analysis && cargo test --release)
 
-# Fundamentals download (needs screener.in credentials in Screener login/screener.txt):
-python fundamental_downloader.py --headless
-
-# Screener only:
-python Mark_screener.py
+# Fundamentals download only (needs Screener login/screener.txt):
+python fundamental_downloader.py
 ```
 
 ### Credentials
@@ -91,36 +100,47 @@ python Mark_screener.py
 - **Logging**: Use `logging.getLogger(__name__)` or pass logger parameter
 - **Config**: NEVER hardcode paths — always use config.py
 - **Paths**: Use `pathlib.Path` exclusively
-- **DataFrames**: Column names lowercase after initial read (screener normalizes)
-- **Charts**: matplotlib Agg backend (non-interactive), mplfinance candlesticks
+- **Symbols vs ISIN**: Price history is keyed by ticker; ISIN is the stable
+  identity used for fundamentals and renames. A ticker handed to another
+  issuer never keeps the previous owner's candles.
+- **Charts**: Rust `plotters`; chart EMAs reuse `screener::ema_series`
 - **Threading**: `sync_lock = threading.Lock()` for EOD sync
-- **Retries**: `@retry()` decorator with exponential backoff in eod_downloader
-- **Subprocess**: Subprocess for screener module (avoids ProcessPoolExecutor PicklingError on macOS)
+- **Retries**: `@retry()` decorator with exponential backoff in eod_downloader;
+  a failed EOD file keeps the sync cursor on that session (see
+  `presume_session_closed`)
 - **Safety**: Always check `chart_dir.relative_to(BASE_DIR)` before `shutil.rmtree`
 - **Dirs**: `config.ensure_dirs()` creates all output directories
 
 ## Screening Strategy Details
 
+### Universe
+Rows are joined to fundamentals by ISIN (ETFs and indices drop out).  A BSE
+symbol is removed when its ISIN is actively trading on NSE.  A series whose
+last candle is more than `MAX_STALE_SESSIONS` sessions behind its exchange is
+skipped.  SME tickers (`_SME`) are excluded unless `--include-sme`/`--only-sme`.
+
 ### Mark setup (internal)
-Conditions: EMA 50 > EMA 150 > EMA 200 (stack) AND close >= 80% of 52w high AND close >= 150% of 52w low
-Reverse-walk through history to find the start of the active setup → Mark_Date
+Conditions: close > EMA 50 > EMA 150 > EMA 200 AND close >= 80% of 52w high
+AND close >= 150% of 52w low.  EMAs are SMA-seeded and rounded to 2 decimals.
+Walk back from the latest candle to find the start of the active setup.
 
 ### Mark Tight
-Frozen base: Donchian 60-day high of highs immediately before Mark starts.
-Breakout: latest close > frozen base; the 20%/50% Mark conditions remain active.
-Latest breakout day = Mark_Tight_Date.
+First candle inside the active Mark run whose close exceeds the prior
+60-session Donchian high; the latest close must still be above that level.
+That candle's date = `Mark_Tight_Date`.
 
 ### Tight Flag
-Internal candidate gate: a 90%+ run-up within 45 trading days.  Only candidates passing pole quality, breakout, holding, EMA200, and 52-week-distance filters are exported.
+Within the last `FLAG_LOOKBACK_DAYS` candles: a 90%+ run-up within 45
+candles (pole longer than 3 candles, no >50% gap, <=40% circuit candles), a
+close above the pole high within 15 candles of the peak, and the latest close
+still above it.  Latest close >= 5, >= EMA 200 and within 45% of the 52w high.
+`flag_*` columns describe the first 90% pole; `tight_*`/`breakout_date` (and
+the chart lines) describe the qualifying pole.
 
-### Priority Score (add_priority_score in process_results)
-- 30% Momentum (1y + 3m return percentiles)
-- 28% Quality (ROCE + ROE + Piotroski - Debt/Equity + Altman Z)
-- 22% Fuel (sales + profit growth YoY)
-- 12% Sponsorship (FII + DII change)
-- 8% Liquidity (log turnover)
-- Tradeable flag: turnover >= 2cr AND D/E <= 1 AND pledge <= 15% AND Altman Z >= 1.8
-- Sorted by Priority_Score descending within each output set
+### Ranking
+Each output is sorted by `Days_Since_Breakout` (calendar days from the run
+date), then newer breakout, then symbol.  CSVs add `Last_Date` and all
+Screener.in columns; `EOD_Down_From_52w_High` is computed from EOD data.
 
 ## Known Issues & Gotchas
 
@@ -128,19 +148,18 @@ Internal candidate gate: a 90%+ run-up within 45 trading days.  Only candidates 
    with `server=True`; install the pinned `nse[server]` dependency through
    `requirements.txt`. `nsetools` is a different API and is not a substitute.
 
-2. **TA-Lib on macOS**: Prebuilt wheel available for arm64 (ta_lib-0.7.1). No system TA-Lib library needed on Apple Silicon.
+2. **Rust engine version**: users run the binary from the newest `rust-v*`
+   GitHub Release, so Rust changes reach them only after a new tag.  Bump
+   `stock_analysis/Cargo.toml` with each release; the run log prints the
+   engine version and sha256 so machines can be compared.
 
-3. **Selenium ChromeDriver**: `webdriver-manager` auto-manages ChromeDriver. Headless mode enabled with `--headless=new`.
+3. **pathlib.Path.replace()**: Used atomically instead of `os.rename()` for portability.
 
-4. **ProcessPoolExecutor**: Screener runs as subprocess to avoid PicklingError on macOS.
+4. **Saturday bhavcopy fix**: Weekend check added to skip Saturday (original code only skipped Sunday, causing 404 on Saturday and aborting entire sync loop).
 
-5. **pathlib.Path.replace()**: Used atomically instead of `os.rename()` for portability.
-
-6. **Saturday bhavcopy fix**: Weekend check added to skip Saturday (original code only skipped Sunday, causing 404 on Saturday and aborting entire sync loop).
-
-7. **validate_fundamentals()**: Checks columns required by `add_priority_score()` before screening begins.
-
-8. **Conda vs venv**: `Mark_Python.sh` uses conda env `mark_screener` from miniforge3. For new setups, the .venv approach works with standard pip.
+5. **Existing data is not repaired automatically**: gaps from older syncs and
+   pre-fix corporate-action or ticker-reuse damage stay in an existing DuckDB
+   until repaired or rebuilt.
 
 ## Git Workflow
 
@@ -158,7 +177,6 @@ When reviewing code (alice's role):
 - [ ] No bare `except:` without logging
 - [ ] `shutil.rmtree` preceded by `relative_to(BASE_DIR)` check
 - [ ] DataFrames use `pd.to_numeric(errors='coerce')` for safety
-- [ ] NaN handling in scoring functions
+- [ ] NaN handling in indicator and screening code
 - [ ] No stale imports or unused variables
-- [ ] Features match the changes_guide.md spec
-- [ ] Tests not required (no test framework in project)
+- [ ] `python -m pytest -q tests` and `cargo test --release` pass

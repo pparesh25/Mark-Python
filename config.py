@@ -11,17 +11,23 @@ project is the git repo at ``Mark Python`` — we use that instead.
 from datetime import datetime
 from pathlib import Path
 import platform
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Runtime & Timestamps
 # ---------------------------------------------------------------------------
 import os
 
+# Run dates follow the exchange calendar, not the machine's clock setting, so
+# Windows, Linux and macOS machines agree on "today" (fundamentals file name,
+# Days_Since_Breakout and chart end date) whatever their local time zone.
+MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
+
 # Capture timestamp: check if an environment variable is set first, so child
 # processes launched by the orchestrator share the exact same timestamp.
 CURRENT_TIMESTAMP = os.environ.get('MARK_SCREENER_TIMESTAMP')
 if not CURRENT_TIMESTAMP:
-    _NOW = datetime.now()
+    _NOW = datetime.now(MARKET_TIMEZONE)
     CURRENT_TIMESTAMP = _NOW.strftime('%Y%m%d_%H%M%S')
     CURRENT_DATE = _NOW.strftime('%Y%m%d')
 else:
@@ -96,6 +102,11 @@ EOD_COMPACT_CANDLES = 600
 # Number of most-recent daily candles searched for a Flag pole.  This value is
 # passed to the Rust engine on every run so both implementations use it.
 FLAG_LOOKBACK_DAYS = 90
+# A symbol is screened only when its latest candle is within this many
+# sessions of its exchange's latest session.  Suspended or delisted series are
+# skipped, and an NSE ISIN that stopped trading no longer hides the company's
+# active BSE listing.  Passed to the Rust engine on every run.
+MAX_STALE_SESSIONS = 5
 
 # Fundamentals (all-company.csv) are downloaded fresh into the project's own
 # fundamental_files/ folder, timestamped per run.

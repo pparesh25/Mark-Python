@@ -23,6 +23,7 @@ Windows and Linux launchers create/use a project-local virtual environment;
 the normal precompiled-Rust path does not require TA-Lib.
 """
 
+import hashlib
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -31,10 +32,14 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import config
-from screening_readiness import LocalDataError, inspect_eod_readiness, rebase_sync_cursor
+from screening_readiness import (
+    LocalDataError,
+    find_missing_sessions,
+    inspect_eod_readiness,
+    rebase_sync_cursor,
+)
 from config import CURRENT_TIMESTAMP
 
 # ANSI colours for the console (log file gets plain text via strip).
@@ -185,6 +190,43 @@ def validate_fundamentals(logger):
                       f"{age_min:.0f} min ago)", 'GREEN'))
 
 
+def describe_rust_binary(binary: Path) -> str:
+    """Identify the Rust engine so runs on different machines can be compared."""
+    digest = hashlib.sha256()
+    with open(binary, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    try:
+        version = subprocess.run(
+            [str(binary), "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        version = f"version unavailable ({error})"
+    return f"{version or 'version unavailable'} | sha256 {digest.hexdigest()[:16]} | {binary}"
+
+
+def report_missing_sessions(logger):
+    """Warn about trading sessions that are absent from the local database."""
+    try:
+        missing = find_missing_sessions(config.DUCKDB_FILE, config.EOD_METADATA_DIR)
+    except LocalDataError as error:
+        logger.warning(f"  Missing-session check skipped: {error}")
+        return
+    for exchange, days in missing.items():
+        shown = ", ".join(f"{day:%Y-%m-%d}" for day in days[:10])
+        more = f" (+{len(days) - 10} more)" if len(days) > 10 else ""
+        logger.warning(color(
+            f"  {exchange} price data is missing {len(days)} recent session(s): "
+            f"{shown}{more}. Results can differ from a machine that has them.",
+            'YELLOW',
+        ))
+
+
 def run_all_screening(logger, include_sme=False, only_sme=False):
     """Run every post-download operation in one Rust process."""
     if not config.RUST_BINARY.exists():
@@ -205,6 +247,8 @@ def run_all_screening(logger, include_sme=False, only_sme=False):
         str(config.OPENTRADER_ROOT),
         "--flag-lookback",
         str(config.FLAG_LOOKBACK_DAYS),
+        "--max-stale-sessions",
+        str(config.MAX_STALE_SESSIONS),
     ]
     if include_sme:
         cmd.append("--include-sme")
@@ -315,7 +359,7 @@ def main():
         readiness = inspect_eod_readiness(
             config.DUCKDB_FILE,
             config.EOD_METADATA_DIR,
-            datetime.now(ZoneInfo("Asia/Kolkata")),
+            datetime.now(config.MARKET_TIMEZONE),
         )
     except LocalDataError as error:
         logger.error(color(f"  ✗ Local EOD data is not usable: {error}", 'RED'))
@@ -353,7 +397,7 @@ def main():
             after_update = inspect_eod_readiness(
                 config.DUCKDB_FILE,
                 config.EOD_METADATA_DIR,
-                datetime.now(ZoneInfo("Asia/Kolkata")),
+                datetime.now(config.MARKET_TIMEZONE),
             )
         except LocalDataError as error:
             logger.error(color(f"  ✗ Local EOD data became unusable: {error}", 'RED'))
@@ -371,6 +415,7 @@ def main():
             logger.info(color(f"  ✓ EOD update completed in {time.time() - t0:.1f}s", 'GREEN'))
     else:
         logger.info(color("  ✓ Local EOD is current for this run; network update skipped.", 'GREEN'))
+    report_missing_sessions(logger)
 
     # --- Step 2: fundamentals download ------------------------------------
     logger.info(color("▶ Step 2/4: Fundamental Data Download (screener.in)", 'BOLD'))
@@ -428,6 +473,8 @@ def main():
     )
 
     # --- Steps 3 & 4: screening -------------------------------------------
+    if config.RUST_BINARY.exists():
+        logger.info(f"  Rust engine: {describe_rust_binary(config.RUST_BINARY)}")
     run_all_screening(
         logger,
         include_sme=args.include_sme,

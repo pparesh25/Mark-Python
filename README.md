@@ -169,7 +169,9 @@ optimized two-request HTTP flow.  An older local file is used only when
    session is missing.
 2. Select or download validated fundamentals.
 3. Filter listed symbols by fundamental ISIN; remove NSE/BSE overlap from the
-   BSE universe and apply the requested SME policy.
+   BSE universe (only NSE listings that are still trading count), skip series
+   whose last candle is more than `MAX_STALE_SESSIONS` (default 5) sessions
+   old, and apply the requested SME policy.
 4. Run one local Rust process that screens NSE/BSE, joins fundamentals, ranks
    by latest breakout and exports all CSVs, OpenTrader Pro watchlists and
    charts. Screening data is reused for charting, so DuckDB is not read again.
@@ -182,8 +184,13 @@ is added. The current production store starts with its previously compacted
 only for an explicitly requested future compaction.
 
 An EOD network failure is logged and screening may continue against local
-data.  Always check the run log for `EOD update incomplete/unavailable` before
-treating the database as current.
+data.  A session whose file could not be downloaded is retried on the next run
+instead of being skipped; it is treated as an unlisted holiday only after
+three failed runs and three days.  Always check the run log for
+`EOD update incomplete/unavailable` and for `price data is missing ... recent
+session(s)` before treating the database as current.  The log also prints the
+Rust engine version and sha256, so two machines can confirm they run the same
+engine.
 
 ## Outputs
 

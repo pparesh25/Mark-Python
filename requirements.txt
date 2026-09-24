@@ -7,3 +7,5 @@ pandas>=2.2,<3
 python-dateutil>=2.9,<3
 requests>=2.31,<3
 tzlocal>=5.2,<6
+# IANA time-zone data for zoneinfo("Asia/Kolkata"); Windows does not ship it.
+tzdata>=2024.1; platform_system == "Windows"

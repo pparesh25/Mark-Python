@@ -55,6 +55,24 @@ def test_local_processing_invokes_one_rust_pipeline(tmp_path, monkeypatch):
     assert "--include-sme" in command
     assert "--no-watchlists" in command
     assert "--strip-sme-suffix" in command
+    stale_flag = command.index("--max-stale-sessions")
+    assert command[stale_flag + 1] == str(config.MAX_STALE_SESSIONS)
+
+
+def test_rust_binary_description_includes_checksum(tmp_path):
+    binary = tmp_path / "stock_analysis"
+    binary.write_bytes(b"binary")
+
+    description = run_screener.describe_rust_binary(binary)
+
+    # sha256(b"binary") starts with 9a3a45d0; a non-executable file still
+    # gets a checksum instead of aborting the run.
+    assert "sha256 9a3a45d01531a20e" in description
+    assert str(binary) in description
+
+
+def test_run_timestamp_uses_the_exchange_time_zone():
+    assert str(config.MARKET_TIMEZONE) == "Asia/Kolkata"
 
 
 def test_fundamental_selection_requires_explicit_stale_fallback(
