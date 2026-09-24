@@ -56,6 +56,10 @@ def update_pending_delivery_data(
             delivery["SERIES"].str.strip().isin(("EQ", "BE", "BZ", "SM", "ST"))
         ].copy()
         delivery["SYMBOL"] = delivery["SYMBOL"].astype(str).str.strip().str.upper()
+        # NSE writes " -" where a figure is not published; read it as missing
+        for column in ("NO_OF_TRADES", "DELIV_QTY"):
+            if column in delivery.columns:
+                delivery[column] = pd.to_numeric(delivery[column], errors="coerce")
         delivery = delivery.set_index("SYMBOL")
 
         daily = pd.read_csv(daily_file)
@@ -73,7 +77,7 @@ def update_pending_delivery_data(
                 row["Volume"] if series in ("BE", "BZ") else report_row["DELIV_QTY"]
             )
             avg_trades = (
-                "" if trades == "" or pd.isna(trades)
+                float("nan") if pd.isna(trades)
                 else round(float(row["Volume"]) / float(trades), 2)
             )
             daily.loc[index, ["TOTAL_TRADES", "QTY_PER_TRADE", "DLV_QTY"]] = [

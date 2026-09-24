@@ -224,6 +224,44 @@ def test_pending_delivery_updates_daily_file_and_cleans_download(tmp_path):
     assert not report.exists()
 
 
+def test_pending_delivery_keeps_an_unpublished_figure_empty(tmp_path):
+    # NSE writes " -" where a figure is not published; float() on that string
+    # used to abort the whole late-delivery update for the day.
+    daily = tmp_path / "20240502_BENNY_NSE_EOD.txt"
+    pd.DataFrame([
+        {
+            "Symbol": "ABC", "Date": "2024-05-02", "Open": 100, "High": 100,
+            "Low": 90, "Close": 95, "Volume": 900, "Series": "EQ",
+            "TOTAL_TRADES": "", "QTY_PER_TRADE": "", "DLV_QTY": "",
+        },
+        {
+            "Symbol": "NODLV", "Date": "2024-05-02", "Open": 10, "High": 12,
+            "Low": 9, "Close": 11, "Volume": 400, "Series": "EQ",
+            "TOTAL_TRADES": "", "QTY_PER_TRADE": "", "DLV_QTY": "",
+        },
+    ]).to_csv(daily, index=False)
+    report = tmp_path / "delivery.csv"
+    pd.DataFrame([
+        {"SYMBOL": "ABC", " SERIES": " EQ", " NO_OF_TRADES": 100, " DELIV_QTY": 500},
+        {"SYMBOL": "NODLV", " SERIES": " EQ", " NO_OF_TRADES": " -", " DELIV_QTY": " -"},
+    ]).to_csv(report, index=False)
+    nse = Mock()
+    nse.deliveryBhavcopy.return_value = report
+
+    assert eod._update_pending_delivery_data(
+        nse, "2024-05-02T00:00:00+05:30", tmp_path, _logger(), TZ_IN
+    ) is True
+
+    result = pd.read_csv(daily).set_index("Symbol")
+    assert int(result.loc["ABC", "TOTAL_TRADES"]) == 100
+    assert int(result.loc["ABC", "DLV_QTY"]) == 500
+    # The unpublished row is recorded as missing instead of losing the day.
+    assert pd.isna(result.loc["NODLV", "TOTAL_TRADES"])
+    assert pd.isna(result.loc["NODLV", "QTY_PER_TRADE"])
+    assert pd.isna(result.loc["NODLV", "DLV_QTY"])
+    assert not report.exists()
+
+
 def test_index_update_only_adds_normalized_daily_bhavcopy_row(tmp_path):
     report = tmp_path / "indices.csv"
     pd.DataFrame([{
