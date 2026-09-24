@@ -3,6 +3,15 @@ name = "stock_analysis"
 version = "0.3.0"
 edition = "2021"
 
+[features]
+default = []
+# The interactive chart workspace is optional, so the released CLI binary
+# keeps building without the UI stack.
+gui = ["dep:eframe", "dep:egui", "dep:egui_plot"]
+# Keeps the interactive screenshot export out of ordinary GUI builds.  The
+# batch `chart` command is deliberately unaffected by both features.
+image-export = ["gui"]
+
 [dependencies]
 polars = { version = "0.36", features = ["lazy", "csv", "dtype-struct", "temporal", "strings", "random", "propagate_nans", "ewma", "rolling_window"] }
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "chrono", "ab_glyph", "line_series", "full_palette"] }
@@ -14,6 +23,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 image = "0.24"
 duckdb = { version = "1.1", features = ["bundled"] }
+# egui_plot 0.34.x is built against egui 0.33.x, so all three UI crates must
+# remain on this compatible pair.
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow"], optional = true }
+egui = { version = "0.33.3", optional = true }
+egui_plot = { version = "0.34.1", optional = true }
 
 [profile.release]
 lto = "thin"

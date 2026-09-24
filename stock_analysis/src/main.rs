@@ -1,4 +1,6 @@
 mod chart;
+#[cfg(feature = "gui")]
+mod gui;
 mod pipeline;
 mod screener;
 
@@ -127,6 +129,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("stock_analysis {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    #[cfg(feature = "gui")]
+    {
+        if args.len() >= 3 && args[1] == "gui" {
+            let exchange = args.get(3).map(String::as_str).unwrap_or("NSE");
+            return gui::run_gui(&args[2], exchange);
+        }
+    }
     if args.len() >= 2 && args[1] == "screen" {
         return screener::run_screener_cmd(&args[2..]);
     }
@@ -152,6 +161,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "   OR: {} pipeline <duckdb_file> <fundamental_csv> <output_root> <chart_root> <timestamp> <opentrader_root>",
             args[0]
         );
+        #[cfg(feature = "gui")]
+        eprintln!("   OR: {} gui <duckdb_file> [NSE|BSE]", args[0]);
         std::process::exit(1);
     };
 
