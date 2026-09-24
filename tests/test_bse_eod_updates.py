@@ -1,4 +1,5 @@
-from datetime import datetime
+import json
+from datetime import date, datetime, timedelta
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
@@ -157,3 +158,107 @@ def test_corporate_action_ledger_prevents_double_duckdb_adjustment(
     assert closes == [50.0, 55.0]
     assert ledger_rows == 1
     assert not text_dir.exists()
+
+
+class _OneSessionDates(eod_downloader.Dates):
+    """Walk exactly one BSE session (Wednesday 2026-07-01)."""
+
+    def nextDate(self):
+        self.dt = self.dt + timedelta(1)
+        if self.dt.date() > date(2026, 7, 1):
+            return False
+        self.pandasDt = self.dt.strftime("%Y-%m-%d")
+        return True
+
+
+class _Response:
+    def __init__(self, status_code, content=b""):
+        self.status_code = status_code
+        self.content = content
+
+
+def _bhavcopy_bytes():
+    return pd.DataFrame({
+        "FinInstrmId": ["500001"], "TckrSymb": ["BSEONLY"], "ISIN": ["INE777B01010"],
+        "SctySrs": ["A"], "OpnPric": [100.0], "HghPric": [110.0], "LwPric": [90.0],
+        "ClsPric": [105.0], "TtlTradgVol": [1000], "TtlNbOfTxsExctd": [50],
+    }).to_csv(index=False).encode("utf-8")
+
+
+def _run_bse_sync(tmp_path, monkeypatch, responses):
+    database = tmp_path / "prices.duckdb"
+    _seed_database(database, pd.DataFrame(columns=[
+        "Date", "Symbol", "Exchange", "ISIN", "Open", "High", "Low",
+        "Close", "Volume", "Series",
+    ]))
+    monkeypatch.setattr(config, "DUCKDB_FILE", database)
+    monkeypatch.setattr(eod_downloader, "Dates", _OneSessionDates)
+    monkeypatch.setattr(eod_downloader, "_download_corporate_actions", lambda **kwargs: pd.DataFrame())
+
+    class _Session:
+        headers = {}
+
+        def get(self, url, timeout):
+            key = "deliverables" if "SCBSEALL" in url else "bhavcopy"
+            return responses[key]
+
+    monkeypatch.setattr(eod_downloader.requests, "Session", _Session)
+    metadata = tmp_path / "metadata"
+    metadata.mkdir(exist_ok=True)
+    (metadata / "bse_meta.json").write_text(
+        json.dumps({"lastUpdate": "2026-06-30T00:00:00+05:30"}), encoding="utf-8"
+    )
+    result = eod_downloader.sync_database(tmp_path / "text", Mock(), metadata, tmp_path / "daily")
+    meta = json.loads((metadata / "bse_meta.json").read_text(encoding="utf-8"))
+    conn = duckdb.connect(str(database), read_only=True)
+    rows = conn.execute("SELECT Symbol, Date, Close FROM eod_data").fetchall()
+    conn.close()
+    return result, meta, rows
+
+
+def test_missing_bse_bhavcopy_is_retried_instead_of_skipped(tmp_path, monkeypatch):
+    result, meta, rows = _run_bse_sync(tmp_path, monkeypatch, {
+        "bhavcopy": _Response(404),
+        "deliverables": _Response(404),
+    })
+
+    assert result is False
+    assert meta["lastUpdate"] == "2026-06-30T00:00:00+05:30"
+    assert meta["missingSessionAttempts"] == {"2026-07-01": 1}
+    assert rows == []
+
+
+def test_missing_bse_deliverables_still_store_prices(tmp_path, monkeypatch):
+    result, meta, rows = _run_bse_sync(tmp_path, monkeypatch, {
+        "bhavcopy": _Response(200, _bhavcopy_bytes()),
+        "deliverables": _Response(404),
+    })
+
+    assert result is True
+    assert meta["lastUpdate"].startswith("2026-07-01")
+    assert rows == [("BSEONLY", date(2026, 7, 1), 105.0)]
+
+
+def test_bse_consolidation_raises_prior_prices(tmp_path, monkeypatch):
+    database = tmp_path / "prices.duckdb"
+    _seed_database(database, pd.DataFrame({
+        "Date": pd.to_datetime(["2026-07-01", "2026-07-02"]),
+        "Symbol": "CONSOL", "Exchange": "BSE", "ISIN": "INE888C01012",
+        "Open": 2.0, "High": 2.0, "Low": 2.0, "Close": 2.0,
+        "Volume": 100, "Series": "A",
+    }))
+    monkeypatch.setattr(config, "DUCKDB_FILE", database)
+    dates = _dates("2026-07-03T00:00:00+05:30")
+    actions = pd.DataFrame({
+        "Security Code": ["500002"], "Security Name": ["CONSOL"],
+        "Purpose": ["Consolidation of Shares from Rs 1/- to Rs 10/-"],
+        "Detail/Remarks": [""],
+        "Ex_Date_Parsed": [dates.dt.replace(tzinfo=None)],
+    })
+
+    eod_downloader._adjust_bse_stocks(actions, tmp_path, dates, Mock())
+
+    conn = duckdb.connect(str(database), read_only=True)
+    closes = conn.execute("SELECT Close FROM eod_data ORDER BY Date").fetchall()
+    conn.close()
+    assert closes == [(20.0,), (20.0,)]

@@ -7,8 +7,11 @@ import pytest
 from eod_store import create_compact_schema
 from screening_readiness import (
     LocalDataError,
+    clear_session_attempts,
+    find_missing_sessions,
     inspect_eod_readiness,
     latest_eligible_eod_date,
+    presume_session_closed,
     rebase_sync_cursor,
 )
 
@@ -80,3 +83,49 @@ def test_rebase_sync_cursor_uses_actual_database_date(tmp_path):
     assert rebase_sync_cursor(meta_file, datetime(2026, 7, 23).date()) is True
     assert "2026-07-23T00:00:00+05:30" in meta_file.read_text(encoding="utf-8")
     assert rebase_sync_cursor(meta_file, datetime(2026, 7, 23).date()) is False
+
+
+def test_failed_session_is_retried_before_it_is_presumed_closed():
+    meta = {}
+    session = datetime(2026, 7, 1).date()
+    today = datetime(2026, 7, 6).date()
+
+    assert presume_session_closed(meta, session, today) is False
+    assert presume_session_closed(meta, session, today) is False
+    assert meta["missingSessionAttempts"] == {"2026-07-01": 2}
+    assert presume_session_closed(meta, session, today) is True
+    assert meta["missingSessionAttempts"] == {}
+    assert meta["skippedSessions"] == ["2026-07-01"]
+
+
+def test_recent_failed_session_is_never_presumed_closed():
+    meta = {}
+    session = datetime(2026, 7, 1).date()
+    for _ in range(5):
+        assert presume_session_closed(meta, session, session) is False
+    clear_session_attempts(meta, session)
+    assert meta["missingSessionAttempts"] == {}
+
+
+def test_missing_sessions_are_reported_per_exchange(tmp_path):
+    metadata = _metadata(tmp_path, {"29-Jul-2026": "Market Holiday"})
+    database = tmp_path / "prices.duckdb"
+    conn = duckdb.connect(str(database))
+    try:
+        create_compact_schema(conn)
+        conn.execute("INSERT INTO securities VALUES ('NSE', 'NSETEST', 'INE000A', 'EQ'), ('BSE', 'BSETEST', 'INE000B', 'A')")
+        # Mon 27 .. Fri 31 July; Wednesday 29 is a holiday.  NSE lost the
+        # 28th, BSE lost the 30th, and both lost nothing else.
+        for day in ("2026-07-27", "2026-07-30", "2026-07-31"):
+            conn.execute("INSERT INTO eod_prices VALUES (?, 'NSETEST', 'NSE', 1, 1, 1, 1, 1)", [day])
+        for day in ("2026-07-27", "2026-07-28", "2026-07-31"):
+            conn.execute("INSERT INTO eod_prices VALUES (?, 'BSETEST', 'BSE', 1, 1, 1, 1, 1)", [day])
+    finally:
+        conn.close()
+
+    missing = find_missing_sessions(database, metadata)
+
+    assert {exchange: [day.isoformat() for day in days] for exchange, days in missing.items()} == {
+        "NSE": ["2026-07-28"],
+        "BSE": ["2026-07-30"],
+    }

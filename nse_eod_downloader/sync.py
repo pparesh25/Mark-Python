@@ -14,6 +14,8 @@ from typing import Any, Callable, Optional
 
 import pandas as pd
 
+from screening_readiness import clear_session_attempts, presume_session_closed
+
 
 @dataclass(frozen=True)
 class SyncDependencies:
@@ -111,12 +113,21 @@ def sync_database(
                     bhav_file = nse.equityBhavcopy(dates.dt)
                     index_file = nse.indicesBhavcopy(dates.dt)
                 except Exception as error:
-                    logger.warning(
-                        f"Failed to download bhavcopy/indices for {dates.pandasDt}: {error}. Skipping to next date."
-                    )
-                    meta["lastUpdate"] = dates.lastUpdate = dates.dt
                     meta_updated = True
-                    continue
+                    if presume_session_closed(meta, dates.dt.date(), dates.today.date()):
+                        logger.warning(
+                            f"NSE bhavcopy/indices for {dates.pandasDt} are still unavailable "
+                            f"after repeated runs ({error}); treating it as a market holiday."
+                        )
+                        meta["lastUpdate"] = dates.lastUpdate = dates.dt
+                        continue
+                    # Keep the cursor on this session so the next run retries
+                    # it; skipping ahead would leave a permanent price gap.
+                    logger.warning(
+                        f"Failed to download bhavcopy/indices for {dates.pandasDt}: {error}. "
+                        "Sync stopped; this date will be retried on the next run."
+                    )
+                    break
 
                 delivery_file = None
                 if report_status is None or report_status.get("CM-BHAVDATA-FULL"):
@@ -159,6 +170,7 @@ def sync_database(
                             file.unlink()
                     break
 
+                clear_session_attempts(meta, dates.dt.date())
                 meta["lastUpdate"] = dates.lastUpdate = dates.dt
                 meta_updated = True
                 logger.info(f"{dates.pandasDt}: Sync complete")

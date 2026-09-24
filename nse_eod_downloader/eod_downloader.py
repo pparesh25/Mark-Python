@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import pandas as pd
 import tzlocal
 import config
+from screening_readiness import EOD_READY_TIME
 
 from .corporate_actions import parse_bonus_factor, parse_split_factor
 from .delivery import update_pending_delivery_data
@@ -73,10 +74,14 @@ class Dates:
         if self.dt > curTime:
             return False
 
-        if self.dt.day == curTime.day and curTime.hour < 16:
+        # Use the same 6 PM IST cut-off as the readiness check and the BSE
+        # downloader so one catch-up run cannot leave NSE a session ahead.
+        if self.dt.date() == curTime.date() and curTime.time() < EOD_READY_TIME:
             # Display the users local time
-            local_time = curTime.replace(hour=19, minute=0).astimezone(tz_local)
-            t_str = local_time.strftime("%I:%M%p")  # 07:00PM
+            local_time = curTime.replace(
+                hour=EOD_READY_TIME.hour, minute=EOD_READY_TIME.minute
+            ).astimezone(tz_local)
+            t_str = local_time.strftime("%I:%M%p")  # 06:00PM
             logging.info(
                 f"All Up To Date. Check again after {t_str} for today's EOD data"
             )
@@ -179,8 +184,10 @@ def _adjust_nse_stocks(meta: dict, data_dir: Path, dates: Dates, logger: logging
                 if series not in ("EQ", "BE", "BZ", "SM", "ST"):
                     continue
 
+                # Must match stock_data.update_nse_eod, which stores SME
+                # tickers upper-cased (``ABC_SME``); DuckDB compares case-sensitively.
                 if series in ("SM", "ST"):
-                    sym += "_sme"
+                    sym += "_SME"
 
                 if (
                     "split" in purpose

@@ -15,6 +15,7 @@ import pandas as pd
 import requests
 import tzlocal
 import config
+from screening_readiness import clear_session_attempts, presume_session_closed
 
 from .corporate_actions import parse_bonus_factor, parse_split_factor
 from .holidays import load_holidays_from_meta, load_special_sessions_from_meta, is_special_session
@@ -259,9 +260,15 @@ def _adjust_bse_stocks(
         action_type = None
         adjustmentFactor = None
 
-        # BSE lists splits and bonuses in Purpose
+        # BSE lists splits, consolidations and bonuses in Purpose.  A
+        # consolidation ratio ("from Rs 1/- to Rs 10/-") parses to a factor
+        # below one, which raises the older prices as required.
         if "split" in purpose or "sub-division" in purpose:
             action_type = "split"
+            adjustmentFactor = _get_split(symbol, purpose + " " + remarks, logger)
+
+        elif "consolidation" in purpose:
+            action_type = "consolidation"
             adjustmentFactor = _get_split(symbol, purpose + " " + remarks, logger)
 
         elif "bonus" in purpose:
@@ -295,6 +302,10 @@ def _adjust_bse_stocks(
         )
 
 
+def _write_meta(meta_file: Path, meta: dict) -> None:
+    meta_file.write_text(json.dumps(meta, indent=4), encoding="utf-8")
+
+
 def sync_database(
     data_dir: Path,
     logger: logging.Logger,
@@ -307,8 +318,7 @@ def sync_database(
 
     meta_file = metadata_dir / "bse_meta.json"
     if meta_file.is_file():
-        with open(meta_file, "r") as f:
-            meta = json.load(f)
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
     else:
         # Default to 15 days ago for initial sync range
         init_date = (datetime.now(tz_IN) - timedelta(15)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -350,14 +360,14 @@ def sync_database(
                 logger=logger
             )
             relevant_actions = actions_df["Purpose"].astype(str).str.contains(
-                "split|sub-division|bonus",
+                "split|sub-division|consolidation|bonus",
                 case=False,
                 regex=True,
                 na=False,
             ).sum() if not actions_df.empty else 0
             logger.info(
                 f"BSE Corporate Action download summary: {len(actions_df)} total, "
-                f"{relevant_actions} split/bonus actions"
+                f"{relevant_actions} split/consolidation/bonus actions"
             )
         except Exception as e:
             logger.error(
@@ -378,15 +388,13 @@ def sync_database(
 
         if is_weekend and not is_special:
             meta["lastUpdate"] = dates.dt.isoformat()
-            with open(meta_file, "w") as f:
-                json.dump(meta, f, indent=4)
+            _write_meta(meta_file, meta)
             continue
 
         if is_holiday and not is_special:
             logger.info(f"BSE EOD: {curDt} Market Holiday: {holidays[curDt]}")
             meta["lastUpdate"] = dates.dt.isoformat()
-            with open(meta_file, "w") as f:
-                json.dump(meta, f, indent=4)
+            _write_meta(meta_file, meta)
             continue
 
         logger.info(f"▶ BSE Processing Date: {dates.pandasDt}")
@@ -409,26 +417,40 @@ def sync_database(
         logger.info(f"Downloading BSE Bhavcopy for {dates.pandasDt}...")
         r_bhav = session.get(bhavcopy_url, timeout=15)
         if r_bhav.status_code == 404:
-            logger.warning(f"BSE Bhavcopy not found for {dates.pandasDt}. Skipping day (likely a market holiday).")
-            meta["lastUpdate"] = dates.dt.isoformat()
-            with open(meta_file, "w") as f:
-                json.dump(meta, f, indent=4)
-            continue
+            if presume_session_closed(meta, dates.dt.date(), datetime.now(tz_IN).date()):
+                logger.warning(
+                    f"BSE Bhavcopy for {dates.pandasDt} is still missing after "
+                    "repeated runs; treating it as a market holiday."
+                )
+                meta["lastUpdate"] = dates.dt.isoformat()
+                _write_meta(meta_file, meta)
+                continue
+            # Keep the cursor on this session: a file that is not published
+            # yet (or a transient 404) must be retried, not skipped forever.
+            logger.warning(
+                f"BSE Bhavcopy not available for {dates.pandasDt} (HTTP 404). "
+                "Sync stopped; this date will be retried on the next run."
+            )
+            _write_meta(meta_file, meta)
+            return False
         elif r_bhav.status_code != 200:
             logger.error(f"Failed to download BSE Bhavcopy for {dates.pandasDt} (HTTP {r_bhav.status_code})")
             return False
 
+        # Delivery quantities are optional enrichment; prices are stored even
+        # when the deliverables archive is late or missing.
         logger.info(f"Downloading BSE Deliverables for {dates.pandasDt}...")
-        r_delv = session.get(deliverables_url, timeout=15)
-        if r_delv.status_code == 404:
-            logger.warning(f"BSE Deliverables not found for {dates.pandasDt}. Skipping day (likely a market holiday).")
-            meta["lastUpdate"] = dates.dt.isoformat()
-            with open(meta_file, "w") as f:
-                json.dump(meta, f, indent=4)
-            continue
-        elif r_delv.status_code != 200:
-            logger.error(f"Failed to download BSE Deliverables for {dates.pandasDt} (HTTP {r_delv.status_code})")
-            return False
+        try:
+            r_delv = session.get(deliverables_url, timeout=15)
+            delivery_status = r_delv.status_code
+        except requests.RequestException as error:
+            r_delv = None
+            delivery_status = error
+        if delivery_status != 200:
+            logger.warning(
+                f"BSE Deliverables unavailable for {dates.pandasDt} ({delivery_status}); "
+                "storing prices without delivery data."
+            )
 
 
         # Load both DataFrames
@@ -440,12 +462,15 @@ def sync_database(
             raw_bhav_file = daily_bhavcopy_dir / f"BhavCopy_BSE_CM_{bhav_date_str}.csv"
             raw_bhav_file.write_bytes(r_bhav.content)
             
-            with zipfile.ZipFile(BytesIO(r_delv.content)) as zf:
-                with zf.open(zf.namelist()[0]) as f_delv:
-                    raw_delv_bytes = f_delv.read()
-                    
-            df_delv = pd.read_csv(BytesIO(raw_delv_bytes), sep="|", dtype=str)
-            df_delv.columns = [c.strip() for c in df_delv.columns]
+            if delivery_status == 200:
+                with zipfile.ZipFile(BytesIO(r_delv.content)) as zf:
+                    with zf.open(zf.namelist()[0]) as f_delv:
+                        raw_delv_bytes = f_delv.read()
+
+                df_delv = pd.read_csv(BytesIO(raw_delv_bytes), sep="|", dtype=str)
+                df_delv.columns = [c.strip() for c in df_delv.columns]
+            else:
+                df_delv = pd.DataFrame(columns=["SCRIP CODE", "DELIVERY QTY"], dtype=str)
             
             # Data Cleaning and Normalization
             df_bhav["FinInstrmId"] = df_bhav["FinInstrmId"].astype(str).str.strip()
@@ -476,9 +501,9 @@ def sync_database(
             return False
 
         # Save checkpoint
+        clear_session_attempts(meta, dates.dt.date())
         meta["lastUpdate"] = dates.dt.isoformat()
-        with open(meta_file, "w") as f:
-            json.dump(meta, f, indent=4)
-            
+        _write_meta(meta_file, meta)
+
     logger.info("BSE EOD Sync Pipeline completed successfully!")
     return True

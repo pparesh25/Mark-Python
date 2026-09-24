@@ -4,7 +4,9 @@ These tests use temporary files and mocked NSE responses.  They do not call
 the live NSE service or modify the project's real database.
 """
 
-from datetime import datetime
+import json
+import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo
@@ -15,6 +17,7 @@ import pandas as pd
 import config
 from eod_store import create_compact_schema, upsert_daily_prices
 from nse_eod_downloader import eod_downloader as eod
+from nse_eod_downloader.sync import SyncDependencies, sync_database
 from nse_eod_downloader.corporate_actions import (
     parse_bonus_factor,
     parse_split_factor,
@@ -196,3 +199,97 @@ def test_sync_entrypoint_rejects_missing_metadata(tmp_path):
     logger = Mock()
     assert eod.sync_database(tmp_path, logger, tmp_path / "metadata") is False
     logger.error.assert_called_once()
+
+
+def test_sme_split_adjusts_the_stored_upper_case_ticker(tmp_path, monkeypatch):
+    database = tmp_path / "prices.duckdb"
+    conn = duckdb.connect(str(database))
+    create_compact_schema(conn)
+    upsert_daily_prices(conn, pd.DataFrame([
+        {
+            "Date": day, "Symbol": "SMECO_SME", "Exchange": "NSE",
+            "ISIN": "INE321X01011", "Open": close, "High": close,
+            "Low": close, "Close": close, "Volume": 100, "Series": "SM",
+        }
+        for day, close in (("2024-05-02", 100.0), ("2024-05-03", 20.0))
+    ]))
+    conn.close()
+    monkeypatch.setattr(config, "DUCKDB_FILE", database)
+    dates = _dates("2024-05-03T00:00:00+05:30")
+    meta = {"smeActions": [{
+        "symbol": "SMECO",
+        "subject": "Face Value Split (Sub-Division) - From Rs 10/- Per Share To Rs 2/- Per Share",
+        "exDate": "03-May-2024",
+        "series": "SM",
+    }]}
+
+    eod._adjust_nse_stocks(meta, tmp_path, dates, _logger())
+
+    conn = duckdb.connect(str(database), read_only=True)
+    closes = conn.execute(
+        "SELECT Close FROM eod_data WHERE Symbol = 'SMECO_SME' ORDER BY Date"
+    ).fetchall()
+    conn.close()
+    assert closes == [(20.0,), (20.0,)]
+
+
+class _WeekOfDates:
+    """Dates stub that walks 2024-05-02 .. 2024-05-03 with a fixed today."""
+
+    def __init__(self, last_update):
+        self.dt = self.lastUpdate = datetime.fromisoformat(last_update)
+        self.today = datetime(2024, 5, 10)
+        self.pandasDt = self.dt.strftime("%Y-%m-%d")
+
+    def nextDate(self):
+        self.dt = self.dt + timedelta(1)
+        if self.dt.date() > datetime(2024, 5, 3).date():
+            return False
+        self.pandasDt = self.dt.strftime("%Y-%m-%d")
+        return True
+
+
+def _failing_sync_deps(update_stock):
+    nse = Mock()
+    nse.equityBhavcopy.side_effect = ConnectionError("HTTP 503")
+    return SyncDependencies(
+        nse_available=True,
+        nse_factory=lambda temp_dir: nse,
+        dates_factory=_WeekOfDates,
+        check_special_sessions=lambda *args: False,
+        check_for_holidays=lambda *args: False,
+        validate_actions=lambda *args: None,
+        check_reports_status=lambda *args: {},
+        update_pending_delivery=lambda *args: False,
+        update_stock=update_stock,
+        update_index=Mock(),
+        adjust_stocks=Mock(),
+        date_encoder=eod.DateEncoder,
+        sync_lock=threading.Lock(),
+        tz_in=TZ_IN,
+    )
+
+
+def test_failed_bhavcopy_keeps_cursor_until_session_is_presumed_closed(tmp_path):
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    (tmp_path / "data").mkdir()
+    meta_file = metadata / "meta.json"
+    meta_file.write_text(json.dumps({"lastUpdate": "2024-05-01T00:00:00+05:30"}), encoding="utf-8")
+    update_stock = Mock()
+    deps = _failing_sync_deps(update_stock)
+
+    for _ in range(2):
+        sync_database(tmp_path / "data", _logger(), metadata, None, deps)
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        assert meta["lastUpdate"] == "2024-05-01T00:00:00+05:30"
+    assert meta["missingSessionAttempts"] == {"2024-05-02": 2}
+
+    # The third failed run, a week later, presumes an unlisted holiday and
+    # stops again at the next session instead of skipping it too.
+    sync_database(tmp_path / "data", _logger(), metadata, None, deps)
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["lastUpdate"].startswith("2024-05-02")
+    assert meta["skippedSessions"] == ["2024-05-02"]
+    assert meta["missingSessionAttempts"] == {"2024-05-03": 1}
+    update_stock.assert_not_called()
