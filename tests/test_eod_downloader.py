@@ -148,6 +148,57 @@ def test_symbol_rename_preserves_duckdb_history_without_text_copy(
     ] == "NEWBOB"
 
 
+def test_unpublished_delivery_figure_is_stored_as_missing(tmp_path, monkeypatch):
+    # NSE's 2026-09-11 delivery file carried " -" for DELIV_QTY and stopped
+    # the whole day's sync.
+    database = tmp_path / "prices.duckdb"
+    conn = duckdb.connect(str(database))
+    create_compact_schema(conn)
+    conn.close()
+    monkeypatch.setattr(config, "DUCKDB_FILE", database)
+    bhav = tmp_path / "bhav.csv"
+    delivery = tmp_path / "delivery.csv"
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    pd.DataFrame([
+        {"ISIN": "ISIN1", "TckrSymb": "HASDLV", "SctySrs": "EQ",
+         "OpnPric": 110, "HghPric": 120, "LwPric": 100, "ClsPric": 115,
+         "TtlTradgVol": 1000},
+        {"ISIN": "ISIN2", "TckrSymb": "NODLV", "SctySrs": "EQ",
+         "OpnPric": 10, "HghPric": 12, "LwPric": 9, "ClsPric": 11,
+         "TtlTradgVol": 400},
+    ]).to_csv(bhav, index=False)
+    pd.DataFrame([
+        {"SYMBOL": "HASDLV", " SERIES": " EQ", " NO_OF_TRADES": 100,
+         " DELIV_QTY": " 500"},
+        {"SYMBOL": "NODLV", " SERIES": " EQ", " NO_OF_TRADES": 40,
+         " DELIV_QTY": " -"},
+    ]).to_csv(delivery, index=False)
+    isin = pd.DataFrame(
+        {"SYMBOL": ["HASDLV", "NODLV"]},
+        index=pd.Index(["ISIN1", "ISIN2"], name="ISIN"),
+    )
+
+    text_rows = []
+    eod._update_nse_eod(
+        bhav, delivery, tmp_path / "text", metadata, isin,
+        _dates("2024-05-03T00:00:00+05:30"), _logger(),
+        bhavcopy_rows=text_rows,
+    )
+
+    conn = duckdb.connect(str(database), read_only=True)
+    rows = conn.execute(
+        "SELECT Symbol, Close FROM eod_data ORDER BY Symbol"
+    ).fetchall()
+    conn.close()
+    assert rows == [("HASDLV", 115.0), ("NODLV", 11.0)]
+    # The compact store keeps no delivery columns; the text row does.
+    assert [row.strip().split(",")[-3:] for row in text_rows] == [
+        ["100", "10.0", "500"],
+        ["40", "10.0", "nan"],
+    ]
+
+
 def test_pending_delivery_updates_daily_file_and_cleans_download(tmp_path):
     daily = tmp_path / "20240502_BENNY_NSE_EOD.txt"
     pd.DataFrame([{

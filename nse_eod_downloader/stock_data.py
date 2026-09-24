@@ -40,6 +40,10 @@ def update_nse_eod(
         # Clean column names by stripping spaces
         delivery_df.columns = delivery_df.columns.str.strip()
         delivery_df = delivery_df[delivery_df["SERIES"].str.strip().isin(STOCK_SERIES)]
+        # NSE writes " -" where a figure is not published; read it as missing
+        for column in ("NO_OF_TRADES", "DELIV_QTY"):
+            if column in delivery_df.columns:
+                delivery_df[column] = pd.to_numeric(delivery_df[column], errors="coerce")
         for r in delivery_df.itertuples():
             sym = str(r.SYMBOL).strip().upper()
             trades_val = getattr(r, "NO_OF_TRADES", np.nan)
@@ -66,7 +70,7 @@ def update_nse_eod(
             if trades_deliv is not None:
                 raw_trades, raw_delivered = trades_deliv
                 trades = raw_trades
-                delivered = row.TtlTradgVol if row.SctySrs in ("BE", "BZ") else int(raw_delivered)
+                delivered = row.TtlTradgVol if row.SctySrs in ("BE", "BZ") else raw_delivered
             else:
                 trades = delivered = np.nan
 
@@ -113,8 +117,11 @@ def update_nse_eod(
 
             if bhavcopy_rows is not None:
                 avg_trades = "" if trades == "" or pd.isna(trades) else round(row.TtlTradgVol / trades, 2)
+                # A coerced column is float; the text copy keeps whole numbers
+                trades_text = trades if total_trades is None else total_trades
+                delivered_text = delivered if dlv_qty is None else dlv_qty
                 bhavcopy_rows.append(
-                    f"{symbol},{dates.pandasDt},{row.OpnPric},{row.HghPric},{row.LwPric},{row.ClsPric},{row.TtlTradgVol},{row.SctySrs},{trades},{avg_trades},{delivered}\n"
+                    f"{symbol},{dates.pandasDt},{row.OpnPric},{row.HghPric},{row.LwPric},{row.ClsPric},{row.TtlTradgVol},{row.SctySrs},{trades_text},{avg_trades},{delivered_text}\n"
                 )
 
         if insert_rows:
