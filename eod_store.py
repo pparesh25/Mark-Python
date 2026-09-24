@@ -8,12 +8,20 @@ in daily batches.  ISIN and Series are symbol metadata, not daily facts.
 
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 
 import config
 
+logger = logging.getLogger(__name__)
+
 RETAIN_CANDLES = config.EOD_RETAIN_CANDLES
 PRICE_COLUMNS = ["Date", "Symbol", "Exchange", "Open", "High", "Low", "Close", "Volume"]
+# Indian ISINs are ``IN`` + issuer type + 4-character issuer code + security
+# type + serial + check digit.  A face-value split or consolidation keeps the
+# first seven characters and only changes the serial.
+ISIN_ISSUER_PREFIX_LENGTH = 7
 
 
 def create_compact_schema(conn) -> None:
@@ -86,12 +94,100 @@ def _trim_symbols(conn, exchange: str, symbols: pd.Series, retain_candles: int) 
         conn.unregister("retention_symbols")
 
 
-def _deduplicate_symbols(conn, exchange: str, symbols: pd.Series) -> None:
-    """Collapse rename collisions to one row per symbol/date.
+def _discard_reused_ticker_history(conn) -> None:
+    """Delete stored prices that belong to another company under a reused ticker.
 
-    A renamed ISIN can move old history onto a ticker that already has price
-    rows.  Prefer the more liquid row for an overlapping date so the compact
-    store remains deterministic and its text backup can mirror it exactly.
+    Two cases hand a ticker that already has price rows to a different ISIN:
+
+    * a known ISIN is renamed onto the ticker (its own history lives under its
+      old ticker and is moved there next), unless the current owner is being
+      renamed away in the same batch (a same-day swap);
+    * a never-seen ISIN from a different issuer starts trading under a ticker
+      whose previous owner is no longer trading.
+
+    Without this step the old owner's candles stay under the ticker and are
+    labelled with the new owner's ISIN, so charts and screens silently mix two
+    companies.  A split keeps the issuer prefix and therefore keeps history.
+    """
+    targets = conn.execute(
+        f"""
+        WITH batch AS (
+            SELECT DISTINCT Exchange, ISIN, Symbol FROM incoming_prices
+        ),
+        renames AS (
+            SELECT b.Exchange, b.ISIN, s.Symbol AS old_symbol, b.Symbol AS new_symbol
+            FROM batch b
+            JOIN securities s ON s.Exchange = b.Exchange AND s.ISIN = b.ISIN
+            WHERE s.Symbol <> b.Symbol
+        ),
+        rename_targets AS (
+            SELECT r.Exchange, r.new_symbol AS Symbol
+            FROM renames r
+            WHERE NOT EXISTS (
+                SELECT 1 FROM renames source
+                WHERE source.Exchange = r.Exchange
+                  AND source.old_symbol = r.new_symbol
+            )
+        ),
+        new_issuer_targets AS (
+            SELECT b.Exchange, b.Symbol
+            FROM batch b
+            JOIN securities s ON s.Exchange = b.Exchange AND s.Symbol = b.Symbol
+            WHERE s.ISIN <> b.ISIN
+              AND LEFT(s.ISIN, {ISIN_ISSUER_PREFIX_LENGTH})
+                  <> LEFT(b.ISIN, {ISIN_ISSUER_PREFIX_LENGTH})
+              AND NOT EXISTS (
+                  SELECT 1 FROM securities known
+                  WHERE known.Exchange = b.Exchange AND known.ISIN = b.ISIN
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM batch active
+                  WHERE active.Exchange = s.Exchange AND active.ISIN = s.ISIN
+              )
+        )
+        SELECT t.Exchange, t.Symbol, COUNT(p.Date) AS stale_rows
+        FROM (
+            SELECT Exchange, Symbol FROM rename_targets
+            UNION
+            SELECT Exchange, Symbol FROM new_issuer_targets
+        ) t
+        JOIN eod_prices p ON p.Exchange = t.Exchange AND p.Symbol = t.Symbol
+        GROUP BY t.Exchange, t.Symbol
+        ORDER BY t.Exchange, t.Symbol
+        """
+    ).fetchall()
+    if not targets:
+        return
+
+    target_frame = pd.DataFrame(targets, columns=["Exchange", "Symbol", "stale_rows"])
+    conn.register("reused_tickers", target_frame)
+    try:
+        conn.execute(
+            """
+            DELETE FROM eod_prices
+            WHERE rowid IN (
+                SELECT p.rowid
+                FROM eod_prices p
+                JOIN reused_tickers t
+                  ON t.Exchange = p.Exchange AND t.Symbol = p.Symbol
+            )
+            """
+        )
+    finally:
+        conn.unregister("reused_tickers")
+    for exchange, symbol, stale_rows in targets:
+        logger.warning(
+            f"{exchange} {symbol}: ticker now belongs to another ISIN; "
+            f"discarded {stale_rows} price rows of its previous owner."
+        )
+
+
+def _deduplicate_symbols(conn, exchange: str, symbols: pd.Series) -> None:
+    """Collapse same-symbol/date duplicates to one row.
+
+    Reused-ticker history is discarded before renames, so this only resolves
+    duplicate rows inside one batch.  Prefer the more liquid row so the
+    compact store remains deterministic.
     """
     symbol_frame = pd.DataFrame({"Symbol": symbols.dropna().astype(str).unique()})
     if symbol_frame.empty:
@@ -150,6 +246,7 @@ def upsert_daily_prices(
 
     conn.register("incoming_prices", incoming)
     try:
+        _discard_reused_ticker_history(conn)
         # Rename retained price history by stable ISIN before updating metadata.
         conn.execute(
             """

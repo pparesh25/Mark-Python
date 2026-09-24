@@ -90,18 +90,19 @@ def test_isin_change_for_same_symbol_does_not_multiply_price_rows(tmp_path):
         create_compact_schema(conn)
         upsert_daily_prices(
             conn,
-            _prices("SPLITCO", "INE_OLD", pd.date_range("2025-01-01", periods=2)),
+            _prices("SPLITCO", "INE123A01016", pd.date_range("2025-01-01", periods=2)),
         )
+        # A face-value split keeps the issuer prefix and only changes the serial.
         upsert_daily_prices(
             conn,
-            _prices("SPLITCO", "INE_NEW", pd.date_range("2025-01-03", periods=1)),
+            _prices("SPLITCO", "INE123A01024", pd.date_range("2025-01-03", periods=1)),
         )
 
         assert conn.execute("SELECT COUNT(*) FROM eod_prices").fetchone()[0] == 3
         assert conn.execute("SELECT COUNT(*) FROM eod_data").fetchone()[0] == 3
         assert conn.execute(
             "SELECT DISTINCT ISIN FROM eod_data"
-        ).fetchall() == [("INE_NEW",)]
+        ).fetchall() == [("INE123A01024",)]
         assert conn.execute(
             "SELECT COUNT(*) FROM securities WHERE Symbol = 'SPLITCO'"
         ).fetchone()[0] == 1
@@ -109,50 +110,85 @@ def test_isin_change_for_same_symbol_does_not_multiply_price_rows(tmp_path):
         conn.close()
 
 
-def test_symbol_rename_collision_keeps_one_liquid_row_per_date(tmp_path):
+def _history(conn, symbol):
+    return conn.execute(
+        """
+        SELECT Date, Close, Volume, ISIN
+        FROM eod_data
+        WHERE Exchange = 'NSE' AND Symbol = ?
+        ORDER BY Date
+        """,
+        [symbol],
+    ).fetchall()
+
+
+def test_rename_onto_retired_ticker_discards_the_previous_owner(tmp_path):
     conn = duckdb.connect(str(tmp_path / "prices.duckdb"))
     try:
         create_compact_schema(conn)
-        old_history = _prices(
-            "OLD", "INE_STABLE", pd.date_range("2025-01-01", periods=2)
-        )
-        old_history["Volume"] = 100
-        occupied_ticker = _prices(
-            "NEW", "INE_RETIRED", pd.date_range("2025-01-01", periods=2)
-        )
-        occupied_ticker["Volume"] = 200
-        upsert_daily_prices(conn, old_history)
-        upsert_daily_prices(conn, occupied_ticker)
+        stable = _prices("OLD", "INE111A01011", pd.date_range("2025-01-01", periods=2))
+        stable["Volume"] = 100
+        retired = _prices("NEW", "INE999Z01019", pd.date_range("2024-12-30", periods=4))
+        retired["Close"] = 1000.0
+        retired["Volume"] = 200
+        upsert_daily_prices(conn, stable)
+        upsert_daily_prices(conn, retired)
 
-        renamed_day = _prices(
-            "NEW", "INE_STABLE", pd.date_range("2025-01-03", periods=1)
+        upsert_daily_prices(
+            conn,
+            _prices("NEW", "INE111A01011", pd.date_range("2025-01-03", periods=1)),
         )
-        upsert_daily_prices(conn, renamed_day)
 
-        rows = conn.execute(
-            """
-            SELECT Date, Volume
-            FROM eod_data
-            WHERE Exchange = 'NSE' AND Symbol = 'NEW'
-            ORDER BY Date
-            """
-        ).fetchall()
-        assert rows == [
-            (pd.Timestamp("2025-01-01").date(), 200),
-            (pd.Timestamp("2025-01-02").date(), 200),
-            (pd.Timestamp("2025-01-03").date(), 100),
+        date = lambda text: pd.Timestamp(text).date()
+        assert _history(conn, "NEW") == [
+            (date("2025-01-01"), 1.0, 100, "INE111A01011"),
+            (date("2025-01-02"), 2.0, 100, "INE111A01011"),
+            (date("2025-01-03"), 1.0, 100, "INE111A01011"),
         ]
         assert conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM (
-                SELECT Date
-                FROM eod_prices
-                GROUP BY Exchange, Symbol, Date
-                HAVING COUNT(*) > 1
-            )
-            """
+            "SELECT COUNT(*) FROM eod_prices WHERE Close = 1000.0"
         ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_new_issuer_on_reused_ticker_starts_with_clean_history(tmp_path):
+    conn = duckdb.connect(str(tmp_path / "prices.duckdb"))
+    try:
+        create_compact_schema(conn)
+        upsert_daily_prices(
+            conn,
+            _prices("REUSED", "INE555B01012", pd.date_range("2025-01-01", periods=3)),
+        )
+        upsert_daily_prices(
+            conn,
+            _prices("REUSED", "INE777C01014", pd.date_range("2025-03-03", periods=1)),
+        )
+
+        assert _history(conn, "REUSED") == [
+            (pd.Timestamp("2025-03-03").date(), 1.0, 100, "INE777C01014"),
+        ]
+    finally:
+        conn.close()
+
+
+def test_same_day_ticker_swap_keeps_both_histories(tmp_path):
+    conn = duckdb.connect(str(tmp_path / "prices.duckdb"))
+    try:
+        create_compact_schema(conn)
+        first = _prices("AAA", "INE100A01010", pd.date_range("2025-01-01", periods=2))
+        second = _prices("BBB", "INE200B01010", pd.date_range("2025-01-01", periods=2))
+        second["Close"] = 500.0
+        upsert_daily_prices(conn, pd.concat([first, second], ignore_index=True))
+
+        swap = pd.concat([
+            _prices("BBB", "INE100A01010", pd.date_range("2025-01-03", periods=1)),
+            _prices("AAA", "INE200B01010", pd.date_range("2025-01-03", periods=1)).assign(Close=510.0),
+        ], ignore_index=True)
+        upsert_daily_prices(conn, swap)
+
+        assert [row[1] for row in _history(conn, "BBB")] == [1.0, 2.0, 1.0]
+        assert [row[1] for row in _history(conn, "AAA")] == [500.0, 500.0, 510.0]
     finally:
         conn.close()
 
