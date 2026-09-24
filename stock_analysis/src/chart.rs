@@ -1,3 +1,4 @@
+use crate::screener::ema_series;
 use chrono::{Duration, NaiveDate};
 use plotters::prelude::*;
 use plotters::style::full_palette::ORANGE;
@@ -60,7 +61,7 @@ pub fn create_stock_chart(
         "Volume" => &eod_data.volumes,
     )?;
 
-    // Calculate EMAs on the full dataset before slicing
+    // Parse dates on the full dataset before slicing
     let df = df
         .lazy()
         .with_column(
@@ -76,35 +77,6 @@ pub fn create_stock_chart(
                 )
                 .alias("date"),
         )
-        .with_columns(vec![
-            col("Close")
-                .ewm_mean(EWMOptions {
-                    alpha: 2.0 / (50.0 + 1.0),
-                    adjust: false,
-                    bias: false,
-                    min_periods: 50,
-                    ignore_nulls: false,
-                })
-                .alias("ema50"),
-            col("Close")
-                .ewm_mean(EWMOptions {
-                    alpha: 2.0 / (150.0 + 1.0),
-                    adjust: false,
-                    bias: false,
-                    min_periods: 150,
-                    ignore_nulls: false,
-                })
-                .alias("ema150"),
-            col("Close")
-                .ewm_mean(EWMOptions {
-                    alpha: 2.0 / (200.0 + 1.0),
-                    adjust: false,
-                    bias: false,
-                    min_periods: 200,
-                    ignore_nulls: false,
-                })
-                .alias("ema200"),
-        ])
         .collect()?;
 
     // Extract dates to find start/end indices
@@ -159,21 +131,11 @@ pub fn create_stock_chart(
         .f64()?
         .into_no_null_iter()
         .collect();
-    let ema50: Vec<f64> = df_slice
-        .column("ema50")?
-        .f64()?
-        .into_no_null_iter()
-        .collect();
-    let ema150: Vec<f64> = df_slice
-        .column("ema150")?
-        .f64()?
-        .into_no_null_iter()
-        .collect();
-    let ema200: Vec<f64> = df_slice
-        .column("ema200")?
-        .f64()?
-        .into_no_null_iter()
-        .collect();
+    // Plot the EMAs the screens evaluated (SMA seed, full history) rather
+    // than a differently seeded rolling mean.
+    let ema50 = ema_series(&eod_data.closes, 50)[start_idx..=end_idx].to_vec();
+    let ema150 = ema_series(&eod_data.closes, 150)[start_idx..=end_idx].to_vec();
+    let ema200 = ema_series(&eod_data.closes, 200)[start_idx..=end_idx].to_vec();
     let volumes: Vec<f64> = df_slice
         .column("Volume")?
         .f64()?

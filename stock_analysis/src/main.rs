@@ -277,11 +277,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let plot_end = NaiveDate::parse_from_str(clean_plot_end, "%Y-%m-%d").unwrap();
 
         // Layout vertical lines based on task date fields
-        let p_start = clean_opt_date(&task.flag_start_date)
-            .or_else(|| clean_opt_date(&task.tight_start_date))
+        // Prefer the qualifying tight pole, which the breakout date belongs to.
+        let p_start = clean_opt_date(&task.tight_start_date)
+            .or_else(|| clean_opt_date(&task.flag_start_date))
             .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
-        let p_end = clean_opt_date(&task.flag_peak_date)
-            .or_else(|| clean_opt_date(&task.tight_peak_date))
+        let p_end = clean_opt_date(&task.tight_peak_date)
+            .or_else(|| clean_opt_date(&task.flag_peak_date))
             .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
         let breakout = clean_opt_date(&task.breakout_date)
             .or_else(|| clean_opt_date(&task.mark_tight_date))

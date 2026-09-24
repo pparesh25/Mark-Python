@@ -45,6 +45,10 @@ pub struct ScreenedDataset {
     pub selected_symbols: usize,
     pub history_ready: usize,
     pub max_history: usize,
+    /// Latest session stored for this exchange (after any max_date limit).
+    pub latest_session: Option<String>,
+    /// Symbols skipped because their last candle is too old to screen.
+    pub stale_skipped: usize,
     pub mark_tight_qualified: Vec<MarkResult>,
     pub tight_flag_qualified: Vec<FlagResult>,
 }
@@ -67,6 +71,9 @@ pub struct ScreenOptions {
     pub include_sme: bool,
     pub only_sme: bool,
     pub flag_lookback: usize,
+    /// A symbol is screened only when its last candle is within this many
+    /// sessions of its exchange's latest session.
+    pub max_stale_sessions: usize,
     pub mark_tight_only: bool,
     pub tight_flag_only: bool,
     pub max_date: Option<String>,
@@ -78,6 +85,7 @@ impl Default for ScreenOptions {
             include_sme: false,
             only_sme: false,
             flag_lookback: 90,
+            max_stale_sessions: 5,
             mark_tight_only: false,
             tight_flag_only: false,
             max_date: None,
@@ -123,6 +131,16 @@ impl EmaAccumulator {
     }
 }
 
+/// Rounded EMA exactly as the screens evaluate it: SMA seed, NaN during the
+/// warm-up period.  Charts reuse it so the plotted lines match the rules.
+pub fn ema_series(closes: &[f64], period: usize) -> Vec<f64> {
+    let mut ema = EmaAccumulator::new(period, closes.len());
+    for (index, close) in closes.iter().copied().enumerate() {
+        ema.push(index, close);
+    }
+    ema.values
+}
+
 struct MarkIndicators {
     ema_50: Vec<f64>,
     ema_150: Vec<f64>,
@@ -134,14 +152,6 @@ struct MarkIndicators {
 
 fn calculate_mark_indicators(data: &SymbolData) -> MarkIndicators {
     let n = data.closes.len();
-    let mut ema_50 = EmaAccumulator::new(50, n);
-    let mut ema_150 = EmaAccumulator::new(150, n);
-    let mut ema_200 = EmaAccumulator::new(200, n);
-    for (index, close) in data.closes.iter().copied().enumerate() {
-        ema_50.push(index, close);
-        ema_150.push(index, close);
-        ema_200.push(index, close);
-    }
 
     let mut high_52w = vec![f64::NAN; n];
     let mut low_52w = vec![f64::NAN; n];
@@ -203,9 +213,9 @@ fn calculate_mark_indicators(data: &SymbolData) -> MarkIndicators {
     }
 
     MarkIndicators {
-        ema_50: ema_50.values,
-        ema_150: ema_150.values,
-        ema_200: ema_200.values,
+        ema_50: ema_series(&data.closes, 50),
+        ema_150: ema_series(&data.closes, 150),
+        ema_200: ema_series(&data.closes, 200),
         high_52w,
         low_52w,
         donchian_60,
@@ -316,15 +326,11 @@ fn process_flag_screener(
             indicators.high_52w[n_total - 1],
         )
     } else {
-        let mut ema_200 = EmaAccumulator::new(200, n_total);
-        for (index, close) in data.closes.iter().copied().enumerate() {
-            ema_200.push(index, close);
-        }
         let high = data.highs[n_total - 252..]
             .iter()
             .copied()
             .fold(f64::NEG_INFINITY, f64::max);
-        (ema_200.values[n_total - 1], high)
+        (ema_series(&data.closes, 200)[n_total - 1], high)
     };
     let dist_52w = if high_52w > 0.0 {
         (high_52w - last_close) / high_52w * 100.0
@@ -469,6 +475,56 @@ fn load_valid_isins(fundamental_csv: &str) -> Result<HashSet<String>, Box<dyn st
     Ok(valid_isins)
 }
 
+struct ExchangeFreshness {
+    latest: String,
+    cutoff: String,
+}
+
+/// Latest session and the oldest acceptable last-candle date per exchange.
+fn exchange_freshness(
+    conn: &Connection,
+    date_limit: &str,
+    max_stale_sessions: usize,
+) -> Result<HashMap<String, ExchangeFreshness>, Box<dyn std::error::Error>> {
+    let sql = format!(
+        "SELECT Exchange, CAST(MAX(Date) AS VARCHAR), CAST(MIN(Date) AS VARCHAR)
+         FROM (
+             SELECT Exchange, Date,
+                    DENSE_RANK() OVER (PARTITION BY Exchange ORDER BY Date DESC) AS session_rank
+             FROM (SELECT DISTINCT Exchange, Date FROM eod_data WHERE Date <= {date_limit})
+         )
+         WHERE session_rank <= {}
+         GROUP BY Exchange",
+        max_stale_sessions + 1
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut freshness = HashMap::new();
+    while let Some(row) = rows.next()? {
+        freshness.insert(
+            row.get::<_, String>(0)?,
+            ExchangeFreshness {
+                latest: row.get(1)?,
+                cutoff: row.get(2)?,
+            },
+        );
+    }
+    Ok(freshness)
+}
+
+fn sql_date_limit(max_date: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let Some(value) = max_date else {
+        return Ok("DATE '9999-12-31'".to_string());
+    };
+    let parsed = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("max_date must be YYYY-MM-DD, got {value}"),
+        )
+    })?;
+    Ok(format!("DATE '{}'", parsed.format("%Y-%m-%d")))
+}
+
 fn validate_exchange_scope(exchange_scope: &str) -> Result<(), Box<dyn std::error::Error>> {
     if !matches!(exchange_scope, "NSE" | "BSE" | "ALL") {
         return Err(std::io::Error::new(
@@ -511,6 +567,13 @@ pub fn screen_market(
         duckdb_file,
         Config::default().access_mode(AccessMode::ReadOnly)?,
     )?;
+    let date_limit = sql_date_limit(options.max_date.as_deref())?;
+    let freshness = exchange_freshness(&conn, &date_limit, options.max_stale_sessions)?;
+    // Only NSE listings that are still trading hide the BSE listing of the
+    // same ISIN; a suspended or delisted NSE series must not do so.
+    let nse_cutoff = freshness
+        .get("NSE")
+        .map_or("9999-12-31", |value| value.cutoff.as_str());
     let exchange_predicate = match exchange_scope.as_str() {
         "NSE" => "e.Exchange = 'NSE'",
         "BSE" => {
@@ -539,6 +602,8 @@ pub fn screen_market(
              SELECT DISTINCT TRIM(UPPER(ISIN)) AS isin
              FROM eod_data
              WHERE Exchange = 'NSE'
+               AND Date >= DATE '{nse_cutoff}'
+               AND Date <= {date_limit}
          )
          SELECT e.Exchange, CAST(e.Date AS VARCHAR), e.Symbol, e.ISIN, \
          COALESCE(e.Open, 0.0), COALESCE(e.High, 0.0), \
@@ -654,6 +719,20 @@ pub fn screen_market(
     drop(stmt);
     drop(conn);
 
+    // A series that stopped trading (suspension, delisting, a ticker that
+    // moved) would otherwise be screened on an old candle.
+    let mut stale_skipped: HashMap<String, usize> = HashMap::new();
+    symbol_datasets.retain(|data| {
+        let fresh = match (freshness.get(&data.exchange), data.dates.last()) {
+            (Some(limits), Some(last)) => last.as_str() >= limits.cutoff.as_str(),
+            _ => false,
+        };
+        if !fresh {
+            *stale_skipped.entry(data.exchange.clone()).or_default() += 1;
+        }
+        fresh
+    });
+
     println!(
         "⏱️ [1/3] One-pass DuckDB fetch: {:.2}s ({} eligible symbols)",
         fetch_started.elapsed().as_secs_f64(),
@@ -716,6 +795,8 @@ pub fn screen_market(
             results.remove(*exchange).unwrap_or_default();
         let dataset = ScreenedDataset {
             exchange: exchange.to_string(),
+            latest_session: freshness.get(*exchange).map(|value| value.latest.clone()),
+            stale_skipped: stale_skipped.get(*exchange).copied().unwrap_or(0),
             fundamental_isins: valid_isins.len(),
             selected_symbols: selected.len(),
             history_ready: selected
@@ -731,10 +812,12 @@ pub fn screen_market(
             tight_flag_qualified,
         };
         println!(
-            "   {}: {} Mark Tight | {} Tight Flag",
+            "   {}: {} Mark Tight | {} Tight Flag | latest session {} | {} stale symbols skipped",
             exchange,
             dataset.mark_tight_qualified.len(),
             dataset.tight_flag_qualified.len(),
+            dataset.latest_session.as_deref().unwrap_or("none"),
+            dataset.stale_skipped,
         );
         datasets.insert(exchange.to_string(), dataset);
     }
@@ -759,6 +842,21 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
             "--only-sme" => options.only_sme = true,
             "--mark-tight-only" => options.mark_tight_only = true,
             "--tight-flag-only" => options.tight_flag_only = true,
+            "--max-stale-sessions" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--max-stale-sessions requires a non-negative integer",
+                    )
+                })?;
+                options.max_stale_sessions = value.parse::<usize>().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--max-stale-sessions requires a non-negative integer",
+                    )
+                })?;
+                index += 1;
+            }
             "--flag-lookback" => {
                 let value = args.get(index + 1).ok_or_else(|| {
                     std::io::Error::new(
@@ -787,7 +885,7 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
     }
 
     if positional.len() < 4 {
-        eprintln!("Usage: stock_analysis screen <duckdb_file> <fundamental_csv> <NSE|BSE|ALL> <out_dir> [max_date] [--mark-tight-only|--tight-flag-only] [--include-sme|--only-sme] [--flag-lookback N]");
+        eprintln!("Usage: stock_analysis screen <duckdb_file> <fundamental_csv> <NSE|BSE|ALL> <out_dir> [max_date] [--mark-tight-only|--tight-flag-only] [--include-sme|--only-sme] [--flag-lookback N] [--max-stale-sessions N]");
         std::process::exit(1);
     }
     options.max_date = positional
@@ -821,7 +919,10 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_mark_indicators, process_mark_screener, SymbolData};
+    use super::{
+        calculate_mark_indicators, ema_series, process_mark_screener, screen_market, ScreenOptions,
+        SymbolData,
+    };
 
     fn symbol_data(closes: Vec<f64>, highs: Vec<f64>) -> SymbolData {
         let len = closes.len();
@@ -875,5 +976,81 @@ mod tests {
         let indicators = calculate_mark_indicators(&data);
 
         assert!(process_mark_screener(&data, &indicators).is_none());
+    }
+
+    #[test]
+    fn ema_series_seeds_with_the_simple_average() {
+        let values = ema_series(&[1.0, 2.0, 3.0, 4.0], 3);
+        assert!(values[0].is_nan() && values[1].is_nan());
+        assert_eq!(values[2], 2.0);
+        assert_eq!(values[3], 3.0);
+    }
+
+    /// NSE `STALE` stopped trading 20 sessions ago while the same ISIN keeps
+    /// trading on BSE as `STALEB`; `LAGGY` is only 3 sessions behind.
+    #[test]
+    fn stale_series_are_skipped_and_do_not_hide_active_bse_listings() {
+        let root = std::env::temp_dir().join(format!(
+            "mark-stale-screen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("prices.duckdb");
+        let fundamentals = root.join("fundamentals.csv");
+        std::fs::write(
+            &fundamentals,
+            "Name,ISIN Code\nLive,INE111A01011\nStale,INE222B01012\nLaggy,INE333C01013\n",
+        )
+        .unwrap();
+        {
+            let conn = duckdb::Connection::open(&database).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE eod_data AS
+                 WITH series(Symbol, Exchange, ISIN, sessions) AS (
+                     VALUES ('LIVE', 'NSE', 'INE111A01011', 300),
+                            ('STALE', 'NSE', 'INE222B01012', 280),
+                            ('LAGGY', 'NSE', 'INE333C01013', 297),
+                            ('STALEB', 'BSE', 'INE222B01012', 300)
+                 )
+                 SELECT CAST(DATE '2025-01-01' + CAST(i AS INTEGER) AS DATE) AS Date,
+                        Symbol, Exchange, ISIN,
+                        100 * POW(1.003, i) AS Open,
+                        100 * POW(1.003, i) * 1.001 AS High,
+                        100 * POW(1.003, i) * 0.99 AS Low,
+                        100 * POW(1.003, i) AS Close,
+                        1000.0 AS Volume
+                 FROM series, range(0, 300) AS r(i)
+                 WHERE i < sessions",
+            )
+            .unwrap();
+        }
+
+        let run = screen_market(
+            database.to_str().unwrap(),
+            fundamentals.to_str().unwrap(),
+            "ALL",
+            &ScreenOptions::default(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let symbols = |exchange: &str| -> Vec<String> {
+            run.datasets[exchange]
+                .mark_tight_qualified
+                .iter()
+                .map(|result| result.symbol.clone())
+                .collect()
+        };
+        assert_eq!(symbols("NSE"), ["LAGGY", "LIVE"]);
+        assert_eq!(symbols("BSE"), ["STALEB"]);
+        assert_eq!(run.datasets["NSE"].stale_skipped, 1);
+        assert_eq!(
+            run.datasets["NSE"].latest_session.as_deref(),
+            Some("2025-10-27")
+        );
     }
 }
