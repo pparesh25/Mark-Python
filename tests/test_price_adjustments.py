@@ -196,3 +196,14 @@ def test_a_list_an_exchange_refuses_is_logged_and_the_stored_one_used(tmp_path, 
                                       get=lambda *a, **k: Refused())
     assert result["BSE"].startswith("failed") and "unavailable" in caplog.text
     conn.close()
+
+
+def test_the_review_list_holds_shares_only():
+    events = pd.DataFrame({"Exchange": ["BSE", "BSE", "NSE"], "Symbol": ["1175MBFL27", "RATNA-RE", "TURTLEMINT"],
+                           "Date": [date(2026, 9, 28)] * 3, "Gap": [0.8, 0.6, 0.8], "Factor": [1.0] * 3,
+                           "Event": [None] * 3, "Flag": ["unresolved gap"] * 3, "Listed_Kind": [None] * 3,
+                           "Listed_Factor": [np.nan] * 3})
+    securities = pd.DataFrame({"Exchange": ["BSE", "BSE", "NSE"], "Symbol": ["1175MBFL27", "RATNA-RE", "TURTLEMINT"],
+                               "ISIN": ["INE721A07RM6", "INE703A20015", "INE0ABC01016"]})
+    out = pa.review_list(events, date(2026, 10, 1), securities)
+    assert out["Symbol"].tolist() == ["TURTLEMINT"]

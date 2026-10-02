@@ -263,7 +263,7 @@ def rebuild(conn, overrides_path: Path | None = None, review_path: Path | None =
     finally:
         conn.unregister("decided_periods")
         conn.unregister("decided_events")
-    review = review_list(events, today or date.today())
+    review = review_list(events, today or date.today(), securities)
     if review_path is not None:
         review.to_csv(review_path, index=False)
     applied = events[events["Event"].notna() & (events["Factor"] != 1.0)]
@@ -289,10 +289,24 @@ def adjustment_periods(events: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["Exchange", "Symbol", "From_Date", "Adj"])
 
 
-def review_list(events: pd.DataFrame, today: date) -> pd.DataFrame:
-    """The last 30 days' unexplained gaps and listed factors the price did not confirm."""
+def is_equity(isin: pd.Series) -> pd.Series:
+    """An Indian equity share: issuer type E or 9 and security-type digits 01 (bonds, NCDs and funds are not)."""
+    isin = isin.fillna("").astype(str)
+    return isin.str.match(r"^IN[E9]") & (isin.str[7:9] == "01")
+
+
+def review_list(events: pd.DataFrame, today: date, securities: pd.DataFrame | None = None) -> pd.DataFrame:
+    """The last 30 days' unexplained gaps and listed factors the price did not confirm, on shares.
+
+    Bonds and rights entitlements gap all the time and the screener never reads
+    them (on 2026-10-01, 13 of 14 lines were BSE bonds and one -RE), so they are
+    left out of the list -- not out of the decisions.
+    """
     since = pd.Timestamp(today) - pd.Timedelta(days=REVIEW_DAYS)
     recent = events[pd.to_datetime(events["Date"]) >= since]
+    if securities is not None:
+        shares = securities[is_equity(securities["ISIN"]) & ~securities["Symbol"].str.contains(r"-RE\d*(?:_SME)?$")]
+        recent = recent.merge(shares[["Exchange", "Symbol"]], on=["Exchange", "Symbol"])
     unconfirmed = recent["Listed_Factor"].notna() & ~recent["Event"].isin(["list", "nse", "override"])
     return recent[recent["Flag"].notna() | unconfirmed].sort_values(["Date", "Exchange", "Symbol"])
 
