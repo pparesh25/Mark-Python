@@ -105,3 +105,9 @@ def test_portable_cli_accepts_path_and_watchlist_flags():
     assert args.watchlists is False
     assert args.strip_sme_watchlist_suffix is True
     assert args.allow_stale_fundamentals is True
+
+
+def test_skip_sync_is_off_unless_asked():
+    parser = run_screener.build_argument_parser()
+    assert parser.parse_args([]).skip_sync is False
+    assert parser.parse_args(["--skip-sync"]).skip_sync is True

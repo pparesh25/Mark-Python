@@ -39,6 +39,15 @@ def update_nse_eod(
         delivery_df = pd.read_csv(delivery_file)
         # Clean column names by stripping spaces
         delivery_df.columns = delivery_df.columns.str.strip()
+        # NSE answers a request for a day without a session with ANOTHER day's
+        # file (sec_bhavdata_full_27092026, a Sunday, held 2026-09-26's rows; and
+        # 2019-09-30 held 2019-06-27's): its delivery must not land on this day.
+        if "DATE1" in delivery_df.columns:
+            inside = set(pd.to_datetime(delivery_df["DATE1"].astype(str).str.strip(), format="%d-%b-%Y",
+                                        errors="coerce").dt.date.dropna())
+            if inside and inside != {pd.to_datetime(dates.pandasDt).date()}:
+                logger.warning(f"NSE delivery file for {dates.pandasDt} holds {sorted(inside)[:2]}; not used.")
+                delivery_df = delivery_df.iloc[0:0]
         delivery_df = delivery_df[delivery_df["SERIES"].str.strip().isin(STOCK_SERIES)]
         # NSE writes " -" where a figure is not published; read it as missing
         for column in ("NO_OF_TRADES", "DELIV_QTY"):

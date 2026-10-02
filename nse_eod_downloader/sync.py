@@ -24,12 +24,10 @@ class SyncDependencies:
     dates_factory: Callable[[str], Any]
     check_special_sessions: Callable[..., bool]
     check_for_holidays: Callable[..., bool]
-    validate_actions: Callable[..., Any]
     check_reports_status: Callable[..., dict[str, bool]]
     update_pending_delivery: Callable[..., bool]
     update_stock: Callable[..., Any]
     update_index: Callable[..., Any]
-    adjust_stocks: Callable[..., Any]
     date_encoder: type[json.JSONEncoder]
     sync_lock: Any
     tz_in: Any
@@ -87,7 +85,6 @@ def sync_database(
                     meta_updated = True
                     continue
 
-                deps.validate_actions(nse, dates, meta, logger, deps.tz_in)
                 meta_updated = True
                 logger.info(f"Downloading NSE reports for {dates.pandasDt}")
 
@@ -149,7 +146,9 @@ def sync_database(
                         isin, dates, logger, bhavcopy_rows,
                     )
                     deps.update_index(index_file, data_dir, dates, logger, bhavcopy_rows)
-                    deps.adjust_stocks(meta, data_dir, dates, logger)
+                    # No adjustment here: the day is stored as published, and the split and
+                    # bonus factors are decided after the sync from the raw prices and the
+                    # exchanges' lists (price_adjustments.refresh) -- never divided in place.
 
                     if daily_bhavcopy_dir and bhavcopy_rows:
                         daily_bhavcopy_dir.mkdir(parents=True, exist_ok=True)

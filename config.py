@@ -94,11 +94,11 @@ RUST_BINARY = _resolve_rust_binary()
 # listed stock with a shortened indicator window.
 MIN_HISTORY_DAYS = 252
 EMA_PERIOD = 200
-# Daily updates retain all available price history.  A 600-candle database can
-# still be produced deliberately with ``compact_price_database.py``; ordinary
-# NSE/BSE syncs never delete an older candle.
-EOD_RETAIN_CANDLES = None
-EOD_COMPACT_CANDLES = 600
+# The price store keeps two years of raw daily prices (decided with Paresh,
+# 2026-10-02): enough for the 252-session indicators; a thinly traded stock with
+# fewer sessions in two years is skipped by the screener. Older raw rows are
+# dropped after every sync; factors and actions are kept.
+EOD_RETAIN_YEARS = 2
 # Number of most-recent daily candles searched for a Flag pole.  This value is
 # passed to the Rust engine on every run so both implementations use it.
 FLAG_LOOKBACK_DAYS = 90

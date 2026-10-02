@@ -18,10 +18,6 @@ import config
 from eod_store import create_compact_schema, upsert_daily_prices
 from nse_eod_downloader import eod_downloader as eod
 from nse_eod_downloader.sync import SyncDependencies, sync_database
-from nse_eod_downloader.corporate_actions import (
-    parse_bonus_factor,
-    parse_split_factor,
-)
 
 
 TZ_IN = ZoneInfo("Asia/Kolkata")
@@ -38,15 +34,6 @@ def _dates(value="2024-05-02T00:00:00+05:30"):
     dates.dt = datetime.fromisoformat(value)
     dates.pandasDt = dates.dt.strftime("%Y-%m-%d")
     return dates
-
-
-def test_corporate_action_parsers():
-    assert parse_split_factor(
-        "Face Value Split (Sub-Division) - From Rs 5/- Per Share To Rs 2/- Per Share"
-    ) == 2.5
-    assert parse_bonus_factor("Bonus 1:1") == 2
-    assert parse_split_factor("not a split") is None
-    assert parse_bonus_factor("Bonus 1:0") is None
 
 
 def test_holiday_list_and_muhurat():
@@ -82,21 +69,6 @@ def test_holiday_decisions_cover_weekend_weekday_and_special_session():
         {"holidays": {}, "year": 2024, "special_sessions": ["2024-03-16T00:00:00"]},
         _logger(),
     ) is False
-
-
-def test_actions_are_fetched_then_cached():
-    nse = Mock()
-    nse.actions.return_value = []
-    dates = _dates("2024-01-01T00:00:00+05:30")
-    meta = {}
-
-    eod._validate_nse_actions_file(nse, dates, meta, _logger(), TZ_IN)
-    assert nse.actions.call_count == 3
-    assert all(key in meta for key in ("equityActions", "smeActions", "mfActions"))
-
-    nse.reset_mock()
-    eod._validate_nse_actions_file(nse, dates, meta, _logger(), TZ_IN)
-    nse.actions.assert_not_called()
 
 
 def test_symbol_rename_preserves_duckdb_history_without_text_copy(
@@ -290,38 +262,6 @@ def test_sync_entrypoint_rejects_missing_metadata(tmp_path):
     logger.error.assert_called_once()
 
 
-def test_sme_split_adjusts_the_stored_upper_case_ticker(tmp_path, monkeypatch):
-    database = tmp_path / "prices.duckdb"
-    conn = duckdb.connect(str(database))
-    create_compact_schema(conn)
-    upsert_daily_prices(conn, pd.DataFrame([
-        {
-            "Date": day, "Symbol": "SMECO_SME", "Exchange": "NSE",
-            "ISIN": "INE321X01011", "Open": close, "High": close,
-            "Low": close, "Close": close, "Volume": 100, "Series": "SM",
-        }
-        for day, close in (("2024-05-02", 100.0), ("2024-05-03", 20.0))
-    ]))
-    conn.close()
-    monkeypatch.setattr(config, "DUCKDB_FILE", database)
-    dates = _dates("2024-05-03T00:00:00+05:30")
-    meta = {"smeActions": [{
-        "symbol": "SMECO",
-        "subject": "Face Value Split (Sub-Division) - From Rs 10/- Per Share To Rs 2/- Per Share",
-        "exDate": "03-May-2024",
-        "series": "SM",
-    }]}
-
-    eod._adjust_nse_stocks(meta, tmp_path, dates, _logger())
-
-    conn = duckdb.connect(str(database), read_only=True)
-    closes = conn.execute(
-        "SELECT Close FROM eod_data WHERE Symbol = 'SMECO_SME' ORDER BY Date"
-    ).fetchall()
-    conn.close()
-    assert closes == [(20.0,), (20.0,)]
-
-
 class _WeekOfDates:
     """Dates stub that walks 2024-05-02 .. 2024-05-03 with a fixed today."""
 
@@ -347,12 +287,10 @@ def _failing_sync_deps(update_stock):
         dates_factory=_WeekOfDates,
         check_special_sessions=lambda *args: False,
         check_for_holidays=lambda *args: False,
-        validate_actions=lambda *args: None,
         check_reports_status=lambda *args: {},
         update_pending_delivery=lambda *args: False,
         update_stock=update_stock,
         update_index=Mock(),
-        adjust_stocks=Mock(),
         date_encoder=eod.DateEncoder,
         sync_lock=threading.Lock(),
         tz_in=TZ_IN,

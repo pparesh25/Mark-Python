@@ -35,8 +35,15 @@ Copy the production data into the target user's home directory:
         └── bse_isin.csv
 ```
 
-The minimum metadata files and the production DuckDB must be copied together.
-The BSE corporate-action ledger is stored inside that DuckDB.
+The metadata files are needed; the DuckDB is not. When the price store is
+missing, or is an old (version 1) store, the first run builds it from NSE's and
+BSE's own daily files with `rebuild_eod_database.py` -- two years, about 30-40
+minutes once -- and keeps an old file beside it as `NSE_BSE_EOD.v1-backup.duckdb`.
+It can also be run by hand at any time:
+
+```bash
+python rebuild_eod_database.py            # add --data-root "/path/to/Mark EMA and HTF" for another root
+```
 
 Create the credential file below the portable data root when automatic
 fundamental downloads are required:
@@ -166,7 +173,8 @@ optimized two-request HTTP flow.  An older local file is used only when
 ## Pipeline
 
 1. Inspect both exchanges in DuckDB and update only when an eligible EOD
-   session is missing.
+   session is missing; then, every run, decide the corporate-action factors
+   from the raw prices (below).
 2. Select or download validated fundamentals.
 3. Filter listed symbols by fundamental ISIN; remove NSE/BSE overlap from the
    BSE universe (only NSE listings that are still trading count), skip series
@@ -176,12 +184,34 @@ optimized two-request HTTP flow.  An older local file is used only when
    by latest breakout and exports all CSVs, OpenTrader Pro watchlists and
    charts. Screening data is reused for charting, so DuckDB is not read again.
 
-Daily NSE/BSE updates retain full price history in DuckDB; they do not maintain
-separate per-symbol text backups or delete an older candle when a new session
-is added. The current production store starts with its previously compacted
-600 rows and will grow to 601, 602, and onward. The manual
-`compact_price_database.py --retain-candles 600` utility remains available
-only for an explicitly requested future compaction.
+### Prices, splits, bonuses and demergers
+
+The store keeps every session **as the exchange published it** (`raw_prices`,
+with trades and delivered quantity) and never divides it in place. After every
+sync, `eod_maintenance.py` fetches NSE's and BSE's corporate-action lists for
+the days around today (60 back, 45 ahead -- an action listed late is still
+caught), decides a factor for every split, bonus, consolidation and demerger
+(`price_adjustments.py`), and the screener reads the raw prices times those
+factors (`eod_data`, unchanged columns). So an action can never be applied
+twice, a corrected list corrects the prices on the next run, and NSE and BSE
+of the same company carry the same factor. In order:
+
+1. a hand decision in `Database/metadata/corporate_action_overrides.csv`
+   (`Exchange,Symbol,Date,Factor,Note`);
+2. on BSE, the NSE twin's factor (same ISIN);
+3. the exchange's own list -- NSE matched by ISIN, BSE by scrip code, never by
+   today's name -- when the day's open confirms it (within 25%; a 1:10 bonus is
+   taken from the list when the open did not gap);
+4. a listed demerger or capital reduction: the open over the previous close;
+5. an open below 0.55x the previous close that nothing explains, snapped to
+   the nearest common split/bonus ratio; 0.55-0.80x or above 1.8x is left
+   alone and written to `Database/corporate_action_review.csv` for a look.
+
+Volume and delivery are adjusted like prices. Two years of raw prices are kept
+(`config.EOD_RETAIN_YEARS`); a thinly traded stock with fewer than 252 sessions
+in that window is skipped by the screener. `compact_price_database.py --apply`
+copies the store into a fresh file to give back the space deleted rows hold.
+`run_screener.py --skip-sync` screens a store made elsewhere without touching it.
 
 An EOD network failure is logged and screening may continue against local
 data.  A session whose file could not be downloaded is retried on the next run

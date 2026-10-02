@@ -269,6 +269,29 @@ def run_all_screening(logger, include_sme=False, only_sme=False):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def ensure_current_store(logger) -> bool:
+    """True when the price store is version 2; an old or missing one is rebuilt from exchange files first."""
+    import duckdb
+    from eod_store import schema_version
+
+    if config.DUCKDB_FILE.exists():
+        conn = duckdb.connect(str(config.DUCKDB_FILE), read_only=True)
+        try:
+            if schema_version(conn) == 2:
+                return True
+        finally:
+            conn.close()
+    logger.info(color(
+        "  One-time rebuild of the price store from NSE/BSE files (two years, about 30-40 minutes); "
+        "the old store is kept as a backup.", 'CYAN'))
+    import rebuild_eod_database
+    report = rebuild_eod_database.rebuild(logger)
+    if not report.get("swapped"):
+        logger.warning(f"  Rebuild incomplete ({len(report.get('holes', []))} days missing on one exchange); "
+                       "it continues on the next run from its cache.")
+    return bool(report.get("swapped"))
+
+
 def build_argument_parser():
     """Build the portable command-line interface used by every launcher."""
     import argparse
@@ -311,6 +334,12 @@ def build_argument_parser():
         '--allow-stale-fundamentals',
         action='store_true',
         help="Use the newest older local fundamentals when today's file is absent",
+    )
+    parser.add_argument(
+        '--skip-sync',
+        action='store_true',
+        help="Never download or adjust EOD data here: the database is generated "
+             "elsewhere (the market-data lake's lake.export_mark) and is screened as it is",
     )
     return parser
 
@@ -355,6 +384,7 @@ def main():
 
     # --- Step 1: EOD update only when a locally eligible session is missing
     logger.info(color("▶ Step 1/4: EOD Data Update (eod2)", 'BOLD'))
+    store_ready = args.skip_sync or ensure_current_store(logger)
     try:
         readiness = inspect_eod_readiness(
             config.DUCKDB_FILE,
@@ -367,7 +397,18 @@ def main():
 
     as_of = ", ".join(f"{exchange}={value:%Y-%m-%d}" for exchange, value in readiness.as_of_dates.items())
     logger.info(f"  Local EOD as-of: {as_of}; eligible target: {readiness.target_date:%Y-%m-%d}")
-    if readiness.needs_update:
+    if not store_ready:
+        logger.warning("  The price store could not be rebuilt yet; screening the old store, no update.")
+    elif args.skip_sync:
+        # The database comes from the lake (docs/MARK_DB.md in the strategy project):
+        # syncing here would apply corporate actions a second time to adjusted prices.
+        if readiness.needs_update:
+            logger.warning(
+                "  --skip-sync: the database is behind the eligible target; screening it as it is."
+            )
+        else:
+            logger.info(color("  ✓ Local EOD is current for this run (--skip-sync).", 'GREEN'))
+    elif readiness.needs_update:
         logger.info(color("  Missing eligible EOD session; starting NSE/BSE update...", 'CYAN'))
         if rebase_sync_cursor(config.EOD_METADATA_DIR / "meta.json", readiness.as_of_dates["NSE"]):
             logger.info("  NSE sync cursor rebased to the actual local EOD date.")
@@ -415,6 +456,16 @@ def main():
             logger.info(color(f"  ✓ EOD update completed in {time.time() - t0:.1f}s", 'GREEN'))
     else:
         logger.info(color("  ✓ Local EOD is current for this run; network update skipped.", 'GREEN'))
+    if store_ready and not args.skip_sync:
+        # Every run, synced or not: the action lists around today and the factors
+        # decided from the raw prices (eod_maintenance.py) -- a split listed late,
+        # a demerger, a renamed BSE scrip are caught here, never applied twice.
+        try:
+            from eod_maintenance import maintain
+            summary = maintain(logger)
+            logger.info(color(f"  ✓ Corporate actions decided from raw prices: {summary.get('factors')}", 'GREEN'))
+        except Exception as error:
+            logger.warning(f"  Corporate-action step failed ({error}); prices stay as last decided.")
     report_missing_sessions(logger)
 
     # --- Step 2: fundamentals download ------------------------------------

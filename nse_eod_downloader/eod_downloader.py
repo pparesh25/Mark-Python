@@ -20,7 +20,6 @@ import tzlocal
 import config
 from screening_readiness import EOD_READY_TIME
 
-from .corporate_actions import parse_bonus_factor, parse_split_factor
 from .delivery import update_pending_delivery_data
 from .holidays import (
     get_holiday_list as fetch_holiday_list,
@@ -110,192 +109,6 @@ def retry(max_retries=10, base_wait=2, max_wait=10):
     return decorator
 
 
-def _get_split(sym: str, string: str, logger: logging.Logger) -> float | None:
-    factor = parse_split_factor(string)
-    if factor is None:
-        logger.warning(f"{sym}: Split Not Matched. {string}")
-        return None
-    return factor
-
-
-def _get_bonus(sym: str, string: str, logger: logging.Logger) -> float | None:
-    factor = parse_bonus_factor(string)
-    if factor is None:
-        logger.warning(f"{sym}: Bonus Not Matched. {string}")
-        return None
-    return factor
-
-
-def _make_adjustment(
-    symbol: str,
-    adjustmentFactor: float,
-    data_dir: Path,
-    dates: Dates,
-    logger: logging.Logger,
-    prev_commit: Optional[Dict[str, Any]] = None,
-) -> Optional[Tuple[pd.DataFrame, Any]]:
-    if prev_commit:
-        file = prev_commit["file"]
-        df = prev_commit["df"]
-    else:
-        file = symbol
-        import duckdb
-        conn = duckdb.connect(str(config.DUCKDB_FILE))
-        try:
-            df = conn.execute("SELECT * FROM eod_data WHERE Symbol = ? AND Exchange = 'NSE'", (symbol,)).fetchdf()
-        finally:
-            conn.close()
-
-        if df.empty:
-            logger.warning(f"{symbol}: Data not found in DuckDB for adjustment - {dates.pandasDt}")
-            return None
-
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.set_index("Date")
-
-    # Remove timezone info as DataFrame index is not timezone aware
-    dt = dates.dt.replace(tzinfo=None)
-
-    # Use boolean masking to adjust prices before Ex Date in-place
-    mask_before = df.index < dt
-    for col in ("Open", "High", "Low", "Close"):
-        df.loc[mask_before, col] = ((df.loc[mask_before, col] / adjustmentFactor / 0.05).round() * 0.05).round(2)
-
-    return (df, file)
-
-
-def _adjust_nse_stocks(meta: dict, data_dir: Path, dates: Dates, logger: logging.Logger):
-    logger.info("Making adjustments for splits and bonus")
-
-    dtStr = dates.dt.strftime("%d-%b-%Y")
-
-    for actions in ("equityActions", "smeActions", "mfActions"):
-        df_commits: dict[str, dict[str, Any]] = {}
-        post_commits: List[Tuple[str, float]] = []
-        error_context = None
-
-        try:
-            for act in meta.get(actions, []):
-                sym = act["symbol"]
-                purpose = act["subject"].lower()
-                ex = act["exDate"]
-                series = act["series"]
-
-                if series not in ("EQ", "BE", "BZ", "SM", "ST"):
-                    continue
-
-                # Must match stock_data.update_nse_eod, which stores SME
-                # tickers upper-cased (``ABC_SME``); DuckDB compares case-sensitively.
-                if series in ("SM", "ST"):
-                    sym += "_SME"
-
-                if (
-                    "split" in purpose
-                    or "splt" in purpose
-                    or "consolidation" in purpose
-                    ) and ex == dtStr:
-                    if "consolidation" in purpose:
-                        error_context = f"{sym} - consolidation - {dtStr}"
-                        i = purpose.index("consolidation")
-                    else:
-                        error_context = f"{sym} - Split - {dtStr}"
-                        i = purpose.index("spl")
-
-                    adjustmentFactor = _get_split(sym, purpose[i:], logger)
-
-                    if adjustmentFactor is None:
-                        logger.warning(
-                            f"Possible adjustment failure: SPLIT - {sym} - {purpose} - exDate: {dtStr}"
-                        )
-                        continue
-
-                    commit = _make_adjustment(
-                        sym, adjustmentFactor, data_dir, dates, logger, df_commits.get(sym, None)
-                    )
-
-                    if commit:
-                        df, file = commit
-                        if sym in df_commits:
-                            df_commits[sym]["df"] = df
-                        else:
-                            df_commits[sym] = {"file": file, "df": df}
-
-                        post_commits.append((sym, adjustmentFactor))
-                        logger.info(f"{sym}: {purpose}")
-
-                if "bonus" in purpose and ex == dtStr:
-                    if (
-                        "deb" in purpose
-                        or "pref" in purpose
-                        or "ncrps" in purpose
-                        or "dvr" in purpose
-                    ):
-                        continue
-
-                    error_context = f"{sym} - Bonus - {dtStr}"
-                    adjustmentFactor = _get_bonus(sym, purpose, logger)
-
-                    if adjustmentFactor is None:
-                        logger.warning(
-                            f"Possible adjustment failure: BONUS - {sym} - {purpose} - exDate: {dtStr}"
-                        )
-                        continue
-
-                    commit = _make_adjustment(
-                        sym, adjustmentFactor, data_dir, dates, logger, df_commits.get(sym, None)
-                    )
-
-                    if commit:
-                        df, file = commit
-                        if sym in df_commits:
-                            df_commits[sym]["df"] = df
-                        else:
-                            df_commits[sym] = {"file": file, "df": df}
-
-                        post_commits.append((sym, adjustmentFactor))
-                        logger.warning(f"{sym}: {purpose}")
-
-        except Exception as e:
-            logger.critical(f"Adjustment Error - Context {error_context}")
-            df_commits.clear()
-            raise e
-
-        # commit changes
-        for sym, commit in df_commits.items():
-            sym_name = commit["file"]
-            df = commit["df"]
-
-            dt = dates.dt.replace(tzinfo=None)
-
-            if dt in df.index:
-                idx = df.index.get_loc(dt)
-                if isinstance(idx, int):
-                    close = df.at[df.index[idx], "Close"]
-                    if idx > 0:
-                        prev_close = df.at[df.index[idx - 1], "Close"]
-                        diff = close / prev_close
-                        if diff > 1.5 or diff < 0.67:
-                            context = f"Current Close {close}, Previous Close {prev_close}"
-                            logger.warning(
-                                f"WARN: Possible adjustment failure in {sym}: {context} - {dates.pandasDt}"
-                            )
-            else:
-                logger.warning(
-                    f"Unable to verify adjustment on {sym} - Please confirm manually. - {dates.pandasDt}"
-                )
-
-            import duckdb
-            from eod_store import replace_symbol_prices
-            conn = duckdb.connect(str(config.DUCKDB_FILE))
-            try:
-                replace_symbol_prices(conn, "NSE", sym, df.reset_index())
-            finally:
-                conn.close()
-
-        df_commits.clear()
-        post_commits.clear()
-
-
 def _check_reports_update_status(nse: NSE, dates: Dates) -> Dict[str, bool]:
     result = {
         "CM-UDIFF-BHAVCOPY-CSV": False,
@@ -364,43 +177,6 @@ def _get_holiday_list(nse: NSE, logger: logging.Logger):
 
 def _get_muhurat_holiday_info(holidays: Dict[str, List[dict]]) -> dict:
     return get_muhurat_holiday_info(holidays)
-
-
-@retry()
-def _validate_nse_actions_file(nse: NSE, dates: Dates, meta: dict, logger: logging.Logger, tz_IN: ZoneInfo):
-    for action in ("equity", "sme", "mf"):
-        segment = "equities" if action == "equity" else action
-
-        if f"{action}Actions" not in meta:
-            logger.warning(f"Downloading NSE {action.upper()} actions")
-
-            meta[f"{action}Actions"] = nse.actions(
-                segment=segment,
-                from_date=dates.dt,
-                to_date=dates.dt + timedelta(8),
-            )
-
-            meta[f"{action}ActionsExpiry"] = (dates.dt + timedelta(7)).isoformat()
-        else:
-            expiryDate = datetime.fromisoformat(
-                meta[f"{action}ActionsExpiry"]
-            ).astimezone(tz_IN)
-
-            newExpiry = (expiryDate + timedelta(7)).isoformat()
-
-            # Update every 7 days from last download
-            if dates.dt < expiryDate:
-                continue
-
-            logger.warning(f"Updating NSE {action.upper()} actions")
-
-            meta[f"{action}Actions"] = nse.actions(
-                segment=segment,
-                from_date=expiryDate,
-                to_date=expiryDate + timedelta(8),
-            )
-
-            meta[f"{action}ActionsExpiry"] = newExpiry
 
 
 def _check_special_sessions(nse: NSE, meta: dict, dates: Dates, logger: logging.Logger, tz_IN: ZoneInfo) -> bool:
@@ -492,12 +268,10 @@ def sync_database(
         dates_factory=lambda last_update: Dates(last_update, tz_IN),
         check_special_sessions=_check_special_sessions,
         check_for_holidays=_check_for_holidays,
-        validate_actions=_validate_nse_actions_file,
         check_reports_status=_check_reports_update_status,
         update_pending_delivery=_update_pending_delivery_data,
         update_stock=_update_nse_eod,
         update_index=_update_index_eod,
-        adjust_stocks=_adjust_nse_stocks,
         date_encoder=DateEncoder,
         sync_lock=sync_lock,
         tz_in=tz_IN,

@@ -31,9 +31,9 @@ def _database(tmp_path: Path, nse_date: str, bse_date: str) -> Path:
     conn = duckdb.connect(str(database))
     try:
         create_compact_schema(conn)
-        conn.execute("INSERT INTO securities VALUES ('NSE', 'NSETEST', 'INE000A', 'EQ'), ('BSE', 'BSETEST', 'INE000B', 'A')")
+        conn.execute("INSERT INTO securities (Exchange, Symbol, ISIN, Series) VALUES ('NSE', 'NSETEST', 'INE000A', 'EQ'), ('BSE', 'BSETEST', 'INE000B', 'A')")
         conn.execute(
-            "INSERT INTO eod_prices VALUES (?, 'NSETEST', 'NSE', 1, 1, 1, 1, 1), (?, 'BSETEST', 'BSE', 1, 1, 1, 1, 1)",
+            "INSERT INTO raw_prices (Date, Symbol, Exchange, Open, High, Low, Close, Volume) VALUES (?, 'NSETEST', 'NSE', 1, 1, 1, 1, 1), (?, 'BSETEST', 'BSE', 1, 1, 1, 1, 1)",
             [nse_date, bse_date],
         )
     finally:
@@ -113,13 +113,13 @@ def test_missing_sessions_are_reported_per_exchange(tmp_path):
     conn = duckdb.connect(str(database))
     try:
         create_compact_schema(conn)
-        conn.execute("INSERT INTO securities VALUES ('NSE', 'NSETEST', 'INE000A', 'EQ'), ('BSE', 'BSETEST', 'INE000B', 'A')")
+        conn.execute("INSERT INTO securities (Exchange, Symbol, ISIN, Series) VALUES ('NSE', 'NSETEST', 'INE000A', 'EQ'), ('BSE', 'BSETEST', 'INE000B', 'A')")
         # Mon 27 .. Fri 31 July; Wednesday 29 is a holiday.  NSE lost the
         # 28th, BSE lost the 30th, and both lost nothing else.
         for day in ("2026-07-27", "2026-07-30", "2026-07-31"):
-            conn.execute("INSERT INTO eod_prices VALUES (?, 'NSETEST', 'NSE', 1, 1, 1, 1, 1)", [day])
+            conn.execute("INSERT INTO raw_prices (Date, Symbol, Exchange, Open, High, Low, Close, Volume) VALUES (?, 'NSETEST', 'NSE', 1, 1, 1, 1, 1)", [day])
         for day in ("2026-07-27", "2026-07-28", "2026-07-31"):
-            conn.execute("INSERT INTO eod_prices VALUES (?, 'BSETEST', 'BSE', 1, 1, 1, 1, 1)", [day])
+            conn.execute("INSERT INTO raw_prices (Date, Symbol, Exchange, Open, High, Low, Close, Volume) VALUES (?, 'BSETEST', 'BSE', 1, 1, 1, 1, 1)", [day])
     finally:
         conn.close()
 

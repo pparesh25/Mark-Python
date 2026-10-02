@@ -3,7 +3,7 @@ from __future__ import annotations
 import duckdb
 import pandas as pd
 
-from eod_store import create_compact_schema, replace_symbol_prices, upsert_daily_prices
+from eod_store import create_compact_schema, upsert_daily_prices
 
 
 def _prices(symbol: str, isin: str, dates: pd.DatetimeIndex) -> pd.DataFrame:
@@ -24,15 +24,15 @@ def _prices(symbol: str, isin: str, dates: pd.DatetimeIndex) -> pd.DataFrame:
     )
 
 
-def test_compact_store_can_apply_an_explicit_retention_limit(tmp_path):
+def test_a_rename_moves_the_raw_history_to_the_new_ticker(tmp_path):
     conn = duckdb.connect(str(tmp_path / "prices.duckdb"))
     try:
         create_compact_schema(conn)
-        upsert_daily_prices(conn, _prices("OLD", "INE000A", pd.date_range("2025-01-01", periods=5)), retain_candles=3)
-        upsert_daily_prices(conn, _prices("NEW", "INE000A", pd.date_range("2025-01-06", periods=1)), retain_candles=3)
+        upsert_daily_prices(conn, _prices("OLD", "INE000A", pd.date_range("2025-01-01", periods=5)))
+        upsert_daily_prices(conn, _prices("NEW", "INE000A", pd.date_range("2025-01-06", periods=1)))
 
-        assert conn.execute("SELECT COUNT(*) FROM eod_prices").fetchone()[0] == 3
-        assert conn.execute("SELECT COUNT(*) FROM eod_data").fetchone()[0] == 3
+        assert conn.execute("SELECT COUNT(*) FROM raw_prices").fetchone()[0] == 6
+        assert conn.execute("SELECT COUNT(*) FROM eod_data").fetchone()[0] == 6
         assert conn.execute("SELECT DISTINCT Symbol FROM eod_data").fetchall() == [("NEW",)]
         assert conn.execute("SELECT ISIN, Series FROM eod_data LIMIT 1").fetchone() == ("INE000A", "EQ")
         assert conn.execute("SELECT Total_Trades FROM eod_data LIMIT 1").fetchone() == (None,)
@@ -68,22 +68,6 @@ def test_daily_upsert_keeps_full_history_by_default(tmp_path):
         conn.close()
 
 
-def test_replace_adjusted_prices_preserves_compact_schema(tmp_path):
-    conn = duckdb.connect(str(tmp_path / "prices.duckdb"))
-    try:
-        create_compact_schema(conn)
-        source = _prices("ABC", "INE000B", pd.date_range("2025-01-01", periods=3))
-        upsert_daily_prices(conn, source)
-        adjusted = source.loc[:, ["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
-        adjusted["Close"] *= 2
-        replace_symbol_prices(conn, "NSE", "ABC", adjusted)
-
-        assert conn.execute("SELECT COUNT(*) FROM eod_prices WHERE Symbol = 'ABC'").fetchone()[0] == 3
-        assert conn.execute("SELECT MAX(Close) FROM eod_data WHERE Symbol = 'ABC'").fetchone()[0] == 6
-    finally:
-        conn.close()
-
-
 def test_isin_change_for_same_symbol_does_not_multiply_price_rows(tmp_path):
     conn = duckdb.connect(str(tmp_path / "prices.duckdb"))
     try:
@@ -98,7 +82,7 @@ def test_isin_change_for_same_symbol_does_not_multiply_price_rows(tmp_path):
             _prices("SPLITCO", "INE123A01024", pd.date_range("2025-01-03", periods=1)),
         )
 
-        assert conn.execute("SELECT COUNT(*) FROM eod_prices").fetchone()[0] == 3
+        assert conn.execute("SELECT COUNT(*) FROM raw_prices").fetchone()[0] == 3
         assert conn.execute("SELECT COUNT(*) FROM eod_data").fetchone()[0] == 3
         assert conn.execute(
             "SELECT DISTINCT ISIN FROM eod_data"
@@ -215,3 +199,25 @@ def test_rerun_updates_existing_date_without_adding_a_row(tmp_path):
         ).fetchone() == (1, 10, 12, 9, 11, 250)
     finally:
         conn.close()
+
+
+def test_compaction_copies_every_table_and_keeps_two_years(tmp_path):
+    from compact_price_database import install_compact_database
+
+    source = tmp_path / "prices.duckdb"
+    conn = duckdb.connect(str(source))
+    create_compact_schema(conn)
+    upsert_daily_prices(conn, _prices("OLDCO", "INE000C", pd.date_range("2023-01-02", periods=3)))
+    upsert_daily_prices(conn, _prices("OLDCO", "INE000C", pd.date_range("2026-01-02", periods=3)))
+    conn.execute("INSERT INTO exchange_actions (Exchange, Symbol, Purpose) VALUES ('NSE', 'OLDCO', 'Bonus 1:1')")
+    conn.close()
+
+    backup = install_compact_database(source, years=2)
+
+    conn = duckdb.connect(str(source), read_only=True)
+    try:
+        assert conn.execute("SELECT min(Date), count(*) FROM eod_data").fetchone() == (pd.Timestamp("2026-01-02").date(), 3)
+        assert conn.execute("SELECT count(*) FROM exchange_actions").fetchone()[0] == 1
+    finally:
+        conn.close()
+    assert backup.exists()

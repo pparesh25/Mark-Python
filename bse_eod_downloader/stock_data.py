@@ -139,14 +139,15 @@ def update_bse_eod(
             qty_per_trade = round(vol / total_trades, 2) if total_trades and total_trades > 0 else None
             dlv_qty = int(delivered) if not is_nan(delivered) else None
 
+            code = str(getattr(row, "FinInstrmId", "") or "").strip() or None      # the scrip code survives renames
             insert_rows.append((
-                date_val, symbol_name, 'BSE', isin_code, open_p, high_p, low_p, close_p, vol, series, total_trades, qty_per_trade, dlv_qty
+                date_val, symbol_name, 'BSE', isin_code, open_p, high_p, low_p, close_p, vol, series, total_trades, qty_per_trade, dlv_qty, code
             ))
 
         if insert_rows:
             # Create a DataFrame from the collected rows and insert it in a single vectorized SQL query
             df_insert = pd.DataFrame(insert_rows, columns=[
-                'Date', 'Symbol', 'Exchange', 'ISIN', 'Open', 'High', 'Low', 'Close', 'Volume', 'Series', 'Total_Trades', 'Qty_Per_Trade', 'Dlv_Qty'
+                'Date', 'Symbol', 'Exchange', 'ISIN', 'Open', 'High', 'Low', 'Close', 'Volume', 'Series', 'Total_Trades', 'Qty_Per_Trade', 'Dlv_Qty', 'Code'
             ])
             upsert_daily_prices(conn, df_insert)
 
