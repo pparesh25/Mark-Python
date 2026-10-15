@@ -295,6 +295,51 @@ def test_a_late_delivery_report_reaches_raw_prices_without_a_text_copy(tmp_path,
     assert not report.exists()
 
 
+def test_a_late_delivery_report_that_updates_no_row_stays_pending_until_given_up(tmp_path, monkeypatch):
+    yesterday = (datetime.now(TZ_IN) - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    database = tmp_path / "prices.duckdb"
+    conn = duckdb.connect(str(database))
+    create_compact_schema(conn)
+    upsert_daily_prices(conn, pd.DataFrame([{"Date": yesterday.date(), "Symbol": "ABC", "Exchange": "NSE",
+                                             "ISIN": "INE000000011", "Open": 1, "High": 1, "Low": 1, "Close": 1,
+                                             "Volume": 900, "Series": "EQ"}]))
+    conn.close()
+    monkeypatch.setattr(config, "DUCKDB_FILE", database)
+
+    def report_for(day_text, symbol="ABC"):
+        report = tmp_path / "delivery.csv"
+        pd.DataFrame([{"SYMBOL": symbol, " SERIES": " EQ", " DATE1": f" {day_text}", " NO_OF_TRADES": 100,
+                       " DELIV_QTY": 500}]).to_csv(report, index=False)
+        nse = Mock()
+        nse.deliveryBhavcopy.return_value = report
+        return nse
+
+    logger = _logger()
+    other_day = f"{yesterday - timedelta(days=3):%d-%b-%Y}"
+    assert eod._update_pending_delivery_data(report_for(other_day), yesterday.isoformat(), None, logger, TZ_IN) is False
+    assert "holds another day" in str(logger.info.call_args)
+    assert eod._update_pending_delivery_data(report_for(f"{yesterday:%d-%b-%Y}", "NOTSTORED"), yesterday.isoformat(),
+                                             None, logger, TZ_IN) is False
+    assert "matched no stored NSE row" in str(logger.info.call_args)
+    assert _stored_delivery_on(database, yesterday.date()) == {"ABC": (None, None)}
+    # five days on it is given up, with a warning saying why
+    old = (yesterday - timedelta(days=6)).isoformat()
+    assert eod._update_pending_delivery_data(report_for(other_day), old, None, logger, TZ_IN) is True
+    assert "Max attempts reached" in str(logger.warning.call_args)
+    assert eod._update_pending_delivery_data(report_for(f"{yesterday:%d-%b-%Y}"), yesterday.isoformat(),
+                                             None, logger, TZ_IN) is True
+    assert _stored_delivery_on(database, yesterday.date()) == {"ABC": (100, 500)}
+
+
+def _stored_delivery_on(database, day):
+    conn = duckdb.connect(str(database), read_only=True)
+    try:
+        return {s: (t, d) for s, t, d in conn.execute(
+            "SELECT Symbol, Total_Trades, Dlv_Qty FROM raw_prices WHERE Date = ?", [day]).fetchall()}
+    finally:
+        conn.close()
+
+
 def test_a_late_delivery_report_the_store_could_not_take_stays_pending(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DUCKDB_FILE", tmp_path / "missing-folder" / "prices.duckdb")
     report = tmp_path / "delivery.csv"

@@ -9,11 +9,15 @@ purpose text (action_factors.py); a row already stored is not stored twice.
 
 A fetch that SUCCEEDS replaces what is stored for what it covered: per
 exchange, segment and requested year chunk that returned at least one row, the
-stored rows whose ex-date falls in that chunk are deleted and the fetched ones
-written, in one transaction. An exchange revises an ex-date or a ratio now and
-then; when the old row stayed beside the new one, a near-1 bonus was applied
-twice or a corrected ratio was multiplied with the stale one. A fetch that
-fails (an exception, an HTTP error) or comes back empty deletes nothing.
+stored rows whose ex-date falls in that chunk of the securities the answer
+lists there (BSE by scrip code, NSE by ISIN, else by symbol) are deleted and
+the fetched ones written, in one transaction. An exchange revises an ex-date or
+a ratio now and then; when the old row stayed beside the new one, a near-1
+bonus was applied twice or a corrected ratio was multiplied with the stale one.
+A security absent from the answer keeps its rows: BSE's list leaves out scrips
+delisted or amalgamated since (GSPL, JBCHEPHARM, ...), so an answer is not
+complete. A fetch that fails (an exception, an HTTP error, NSE's "no data
+found") or comes back empty deletes nothing.
 
 The whole retained history is asked again per exchange when it was last fetched
 in full more than 30 days ago (or never: `action_list_history`), so a listing
@@ -78,9 +82,16 @@ def _date(text, fmt: str):
         return None
 
 
+def _records(answer) -> list[dict]:
+    """NSE's action records: a list, or none for its {"msg": "no data found"} (or any other non-list) answer."""
+    if isinstance(answer, dict):
+        answer = answer.get("data")
+    return [r for r in answer if isinstance(r, dict)] if isinstance(answer, list) else []
+
+
 def nse_rows(records: list[dict], segment: str) -> pd.DataFrame:
     rows = []
-    for r in records or []:
+    for r in _records(records):
         isin = str(r.get("isin") or "").strip().upper()
         rows.append({"Exchange": "NSE", "Segment": segment, "Symbol": str(r.get("symbol") or "").strip().upper(),
                      "Code": None, "ISIN": isin if ISIN.match(isin) else None,
@@ -167,9 +178,18 @@ SAME_ROW = """
     AND a.Ex_Date IS NOT DISTINCT FROM f.Ex_Date
     AND a.Purpose IS NOT DISTINCT FROM f.Purpose
 """
-IN_SCOPE = """
+# A security is its BSE scrip code, else its ISIN, else (NSE SME rows carry none) its symbol.
+SECURITY = "COALESCE({t}.Code, {t}.ISIN, 'symbol:' || {t}.Symbol)"
+# A stored row is replaced only inside a fetched chunk AND for a security the answer lists in
+# that chunk: BSE's list leaves out scrips that were delisted or amalgamated since, so rows of
+# a security absent from the answer are kept.
+IN_SCOPE = f"""
     a.Exchange = s.Exchange AND a.Segment IS NOT DISTINCT FROM s.Segment
     AND a.Ex_Date BETWEEN CAST(s.From_Date AS DATE) AND CAST(s.To_Date AS DATE)
+    AND {SECURITY.format(t='a')} IN (
+        SELECT {SECURITY.format(t='f')} FROM fetched_actions f
+        WHERE f.Exchange = s.Exchange AND f.Segment IS NOT DISTINCT FROM s.Segment
+          AND CAST(f.Ex_Date AS DATE) BETWEEN CAST(s.From_Date AS DATE) AND CAST(s.To_Date AS DATE))
 """
 
 
@@ -177,10 +197,11 @@ def store(conn, rows: pd.DataFrame, replace=()) -> tuple[int, int]:
     """Store fetched rows; returns (rows new to the store, stored rows the fetch no longer lists).
 
     `replace` names what the fetch covered, as (exchange, segment, start, end): the
-    stored rows of such a scope with an ex-date in [start, end] are replaced by the
-    fetched ones (delete, then insert, in one transaction) -- but only for a scope
-    the fetch returned at least one row for, so an empty answer deletes nothing.
-    Without `replace` rows are only added.
+    stored rows of such a scope with an ex-date in [start, end], of a security the
+    fetch lists in that scope, are replaced by the fetched ones (delete, then
+    insert, in one transaction) -- only for a scope the fetch returned at least one
+    row for, so an empty answer deletes nothing, and never for a security the
+    answer left out. Without `replace` rows are only added.
     """
     if rows.empty:
         return 0, 0

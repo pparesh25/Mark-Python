@@ -231,7 +231,19 @@ def test_override_rows_that_are_not_plain_sane_numbers_are_skipped_one_warning_e
     assert len(skipped) == 10
     assert "FRACTION" in skipped[0].getMessage() and "not a plain finite number" in skipped[0].getMessage()
     assert "from 0.001 to 1000" in skipped[4].getMessage()                     # ZERO
-    assert "Date does not parse" in skipped[8].getMessage() and "NSE or BSE" in skipped[9].getMessage()
+    assert "YYYY-MM-DD" in skipped[8].getMessage() and "NSE or BSE" in skipped[9].getMessage()
+
+
+def test_an_override_date_must_be_written_yyyy_mm_dd(tmp_path, caplog):
+    # Without a format 01/02/2026 reads as 2 January; the user in India meant 1 February.
+    path = write_overrides(tmp_path / "overrides.csv", [
+        "NSE,ISO,2026-02-01,0.5,", "NSE,DAYFIRST,01/02/2026,0.5,", "NSE,DOTTED,01.02.2026,0.5,",
+        "NSE,UNPADDED,2026-2-1,0.5,", "NSE,NOSUCHDAY,2026-02-30,0.5,", "NSE,WITHTIME,2026-02-01 10:00,0.5,"])
+    with caplog.at_level(logging.WARNING):
+        got = pa.read_overrides(path, logging.getLogger("t"))
+    assert got[["Symbol", "Date"]].values.tolist() == [["ISO", pd.Timestamp("2026-02-01")]]
+    skipped = [r.getMessage() for r in caplog.records if "override skipped" in r.getMessage()]
+    assert len(skipped) == 5 and all("YYYY-MM-DD" in m for m in skipped)
 
 
 def pocl_store(tmp_path):
@@ -356,6 +368,58 @@ def test_a_failed_or_empty_list_fetch_deletes_nothing(tmp_path):
     conn.close()
 
 
+def bse_answer(*rows):
+    """A BSE action-list fetcher answering `rows` (code, name, day, purpose)."""
+    text = "Security Code,Security Name,Company Name,Ex Date,Purpose,Record Date\n" + "".join(
+        f"{code},{name},{name} Ltd,{day:%d %b %Y},{purpose},{day:%d %b %Y}\n" for code, name, day, purpose in rows)
+
+    def get(*args, **kwargs):
+        class Answer:
+            status_code = 200
+        Answer.text = text
+        return Answer()
+    return get
+
+
+def stored_bse(conn):
+    return conn.execute("SELECT Code, Ex_Date, Purpose FROM exchange_actions WHERE Exchange = 'BSE' "
+                        "ORDER BY Code, Ex_Date").fetchall()
+
+
+def test_a_list_answer_replaces_only_the_securities_it_lists(tmp_path):
+    # BSE's list leaves out scrips delisted or amalgamated since (GSPL, JBCHEPHARM...): a
+    # non-empty answer is not complete, and a one-row answer deleted a stored 1:10 bonus.
+    conn = store(tmp_path)
+    log, window = logging.getLogger("t"), (DAYS[0].date(), DAYS[29].date())
+    action_lists.refresh(conn, None, *window, log, get=bse_answer(
+        ("500001", "SMALLBON", DAYS[5], "Bonus issue 1:10"), ("500002", "GONE", DAYS[6], "Amalgamation"),
+        ("500003", "REVISED", DAYS[7], "Bonus issue 1:1")))
+    result = action_lists.refresh(conn, None, *window, log, get=bse_answer(
+        ("500003", "REVISEDNEW", DAYS[9], "Bonus issue 1:1"), ("500004", "OTHER", DAYS[8], "Dividend - Rs. - 1.0000")))
+    assert "1 no longer listed" in result["BSE"]                      # REVISED's old ex-date, nothing else
+    assert stored_bse(conn) == [("500001", DAYS[5].date(), "Bonus issue 1:10"),
+                                ("500002", DAYS[6].date(), "Amalgamation"),
+                                ("500003", DAYS[9].date(), "Bonus issue 1:1"),
+                                ("500004", DAYS[8].date(), "Dividend - Rs. - 1.0000")]
+    conn.close()
+
+
+def test_nses_no_data_found_answer_is_an_empty_list_that_deletes_nothing(tmp_path):
+    conn = store(tmp_path)
+    log, window = logging.getLogger("t"), (DAYS[0].date(), DAYS[29].date())
+    action_lists.refresh(conn, ListNSE([bonus(DAYS[20], "Bonus 1:1")]), *window, log, get=empty_bse)
+
+    class NoData:
+        def actions(self, segment, from_date, to_date):
+            return {"msg": "no data found"}
+
+    assert action_lists.nse_rows({"msg": "no data found"}, "equities").empty
+    result = action_lists.refresh(conn, NoData(), *window, log, get=empty_bse)
+    assert result["NSE"].startswith("0 listed")
+    assert conn.execute("SELECT count(*) FROM exchange_actions WHERE Exchange = 'NSE'").fetchone()[0] == 1
+    conn.close()
+
+
 # --- 3. the whole retained history is asked again when its last full fetch is missing or old --------
 
 def test_the_whole_list_history_is_fetched_when_due_and_recorded_per_exchange(tmp_path, caplog):
@@ -475,6 +539,28 @@ def test_a_bonus_in_bses_own_list_on_another_day_is_not_applied_on_top_of_the_tw
     # far from any twin factor BSE's own list still counts (a BSE-only symbol keeps it always: test above)
     alone = bse_decision(raw("ACUTAAS", [100] * 40), NO_LIST.copy(), bse, listed("ACUTAAS", 20, "bonus", 10 / 11))
     assert events(alone) == [["list", pytest.approx(10 / 11)]]
+
+
+def test_a_bse_listing_its_open_confirms_takes_the_twins_factor_when_nse_was_halted_across_the_ex_date():
+    # NSE halted from day 10 to 19 and decided the 1:1 bonus by its gap on day 20;
+    # BSE traded on the real ex-date (day 12), where its own list and open agree.
+    nse = raw("ACUTAAS", [50] * 10 + [25] * 20, days=list(DAYS[:10]) + list(DAYS[20:40]))
+    bse = raw("ACUTAAS", [50.1] * 12 + [25.1] * 28)
+    out = bse_decision(nse, NO_LIST.copy(), bse, listed("ACUTAAS", 12, "bonus", 0.5))
+    assert events(out) == [["nse", pytest.approx(0.5)]]
+    assert out.loc[out["Event"].notna(), "Date"].tolist() == [DAYS[12]]
+    assert (out["Close"] * out["Adj"]).tolist() == pytest.approx([25.05] * 12 + [25.1] * 28)   # not 50/25/25
+    assert out["Flag"].isna().all()
+
+
+def test_a_bse_listing_with_another_ratio_near_a_twin_factor_is_its_own_event_and_flagged():
+    nse = raw("ACUTAAS", [100] * 20 + [50] * 20)
+    bse = raw("ACUTAAS", [100.1] * 20 + [50.1] * 5 + [45.5] * 15)
+    out = bse_decision(nse, listed("ACUTAAS", 20, "split", 0.5), bse, listed("ACUTAAS", 25, "bonus", 10 / 11))
+    assert events(out) == [["nse", pytest.approx(0.5)], ["list", pytest.approx(10 / 11)]]
+    assert out.loc[out["Flag"].notna(), "Date"].tolist() == [DAYS[25]]
+    flagged = out[out["Flag"].notna()].assign(Exchange="BSE")[pa.EVENT_COLUMNS]
+    assert pa.review_list(flagged, DAYS[30].date())["Flag"].tolist() == [pa.FLAG_TWIN_DIFFERS]
 
 
 # --- 7. a listed action no trading day matched goes to the review list ---------------------------

@@ -9,7 +9,8 @@ place. Per symbol and day, in this order:
 
   1. a hand decision in Database/metadata/corporate_action_overrides.csv
      (Exchange, Symbol, Date, Factor, Note) -- for what no rule can see. A row
-     is used only when Exchange is NSE or BSE, Date parses and Factor is a plain
+     is used only when Exchange is NSE or BSE, Date is YYYY-MM-DD (01/02/2026
+     would read as 2 January) and Factor is a plain
      number from 0.001 to 1000 ("1/2", "50%", "1.0x" and blanks are not
      numbers); any other row is skipped with a warning, and so is a valid row
      that matches no stored day of that symbol (a Date that was not a trading
@@ -20,10 +21,14 @@ place. Per symbol and day, in this order:
      It is placed on the BSE twin's first trading day on or after NSE's day,
      however late (every earlier BSE row is before the event), and is FLAGGED
      when that BSE day's open does not show it. While the twin trades on NSE no
-     BSE gap rule runs (BSE's thin trading sees events NSE does not have), and
-     BSE's own list does not add a factor within 30 days of one the twin brings
-     (event `nse_covers`): the twin already carries that event, so a bonus BSE
-     listed on another day was applied twice;
+     BSE gap rule runs (BSE's thin trading sees events NSE does not have). A
+     BSE listing within 30 days of a twin factor with the same ratio (or none)
+     is the same event, applied once: on the listing's day when BSE's open
+     there confirms it and the twin's day does not (NSE, halted across the
+     ex-date, decided it on its first day back), else on the twin's day, the
+     listing becoming `nse_covers` -- a bonus BSE listed on another day was
+     applied twice. A listing with another ratio is another event: the list
+     rule decides it and it is FLAGGED;
   3. the exchange's own list (NSE matched by ISIN, else by today's name; BSE by
      scrip code only -- never by today's name, which lost ACUTAAS's split when
      its name changed and put another scrip's bonus on a namesake): the
@@ -52,6 +57,7 @@ or the rebuild raises and the previous tables stay.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -76,6 +82,7 @@ REVIEW_DAYS = 30
 FLAG_GAP = "unresolved gap"
 FLAG_NEW_LISTING = f"new listing: back after more than {NEW_LISTING_AFTER_DAYS} days without a trade, no factor"
 FLAG_TWIN = "NSE twin's factor; the BSE open does not show it"
+FLAG_TWIN_DIFFERS = "BSE listing's ratio differs from the NSE twin's factor nearby"
 FLAG_NO_TRADE = f"listed, no trade within {LAG.days} days"
 # The ratios splits and bonuses come in, most common first: the ex-date's own move
 # is often 5-15%, so the nearest ratio in a dense list is not the answer.
@@ -86,6 +93,7 @@ RATIOS = np.array(sorted(RATIO_RANKS))
 RANKS = np.array([RATIO_RANKS[r] for r in RATIOS])
 RATIO_TOLERANCE = 0.16
 OVERRIDE_COLUMNS = ["Exchange", "Symbol", "Date", "Factor", "Note"]
+ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 EVENT_COLUMNS = ["Exchange", "Symbol", "Date", "Gap", "Factor", "Event", "Flag", "Listed_Kind", "Listed_Factor"]
 
 module_logger = logging.getLogger(__name__)
@@ -214,25 +222,71 @@ def unmatched_listings(actions: pd.DataFrame, securities: pd.DataFrame, raw: pd.
     return out.assign(Gap=np.nan, Factor=1.0, Event=None, Flag=FLAG_NO_TRADE)[empty.columns]
 
 
-def _twin_near(df: pd.DataFrame, rows: pd.Series, twin: pd.DataFrame | None) -> pd.Series:
-    """True on `rows` lying within TWIN_SAME_EVENT of a factor the NSE twin brings to the same symbol."""
-    near = pd.Series(False, index=df.index)
-    if twin is None or twin.empty or not rows.any():
-        return near
-    events = twin[["Symbol", "Date"]].rename(columns={"Date": "_bse_day"})
-    events["_nse_day"] = pd.to_datetime(twin["NSE_Date"]) if "NSE_Date" in twin.columns else events["_bse_day"]
-    pairs = df.loc[rows, ["Symbol", "Date"]].reset_index().merge(events, on="Symbol")
-    close = (((pairs["Date"] - pairs["_nse_day"]).abs() <= TWIN_SAME_EVENT)
-             | ((pairs["Date"] - pairs["_bse_day"]).abs() <= TWIN_SAME_EVENT))
-    near[pairs.loc[close, "index"].unique()] = True
-    return near
-
-
 def _agrees(gap: pd.Series, factor: pd.Series) -> np.ndarray:
     """The open confirms `factor`: within LIST_TOLERANCE of it, or, for a factor near 1, no gap beyond NO_GAP."""
     with np.errstate(divide="ignore", invalid="ignore"):
         near_one = np.abs(np.log(factor)) < NEAR_ONE
         return np.where(near_one, np.abs(np.log(gap)) < NO_GAP, np.abs(np.log(gap / factor)) < LIST_TOLERANCE)
+
+
+def _same_ratio(listed: pd.Series, twin: pd.Series) -> np.ndarray:
+    """Two factors of one event: within LIST_TOLERANCE of each other, or both within NEAR_ONE of 1."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        both_near_one = (np.abs(np.log(listed)) < NEAR_ONE) & (np.abs(np.log(twin)) < NEAR_ONE)
+        return (np.abs(np.log(listed / twin)) < LIST_TOLERANCE) | both_near_one
+
+
+def _twin_meets_listing(df: pd.DataFrame, twin: pd.DataFrame | None):
+    """Match the NSE twin's factors with BSE's own listings of the same event.
+
+    A BSE listing within TWIN_SAME_EVENT of a twin factor is the SAME event when
+    its ratio matches the twin's (or it has none: a demerger the price decides).
+    The factor is then applied once: on the listing's day when BSE's open there
+    confirms it (NSE may have decided it on its first day back from a halt, after
+    BSE's real ex-date), else on the twin's placement day, the listing becoming
+    `nse_covers`. A listing whose ratio differs is another event: it keeps the
+    normal list rule and is FLAGGED. Returns (twin moved where confirmed,
+    nse_covers rows, differing rows), the rows as boolean Series on df.
+    """
+    covers = pd.Series(False, index=df.index)
+    differs = pd.Series(False, index=df.index)
+    listing = df["Listed_Factor"].notna() | df["Price_Decides"]
+    if twin is None or twin.empty or not listing.any():
+        return twin, covers, differs
+    twin = twin.reset_index(drop=True)
+    events = twin.assign(_event=twin.index, _bse_day=twin["Date"],
+                         _nse_day=pd.to_datetime(twin["NSE_Date"]) if "NSE_Date" in twin.columns else twin["Date"])
+    rows = df.loc[listing, ["Symbol", "Date", "Gap", "Listed_Factor"]].reset_index()
+    pairs = rows.merge(events[["Symbol", "Factor", "_event", "_bse_day", "_nse_day"]], on="Symbol")
+    pairs = pairs[((pairs["Date"] - pairs["_nse_day"]).abs() <= TWIN_SAME_EVENT)
+                  | ((pairs["Date"] - pairs["_bse_day"]).abs() <= TWIN_SAME_EVENT)]
+    if pairs.empty:
+        return twin, covers, differs
+    same = pairs["Listed_Factor"].isna() | pd.Series(_same_ratio(pairs["Listed_Factor"], pairs["Factor"]),
+                                                      index=pairs.index).fillna(False).astype(bool)
+    confirmed = same & pairs["Gap"].notna() & pd.Series(_agrees(pairs["Gap"], pairs["Factor"]),
+                                                         index=pairs.index).astype(bool)
+    # The twin's own day keeps the factor when BSE's open there shows it too (always so for a
+    # factor near 1, which no open pins to a day): only a factor that day cannot explain moves.
+    gap_on = df[["Symbol", "Date", "Gap"]].rename(columns={"Date": "_bse_day", "Gap": "_twin_gap"})
+    pairs = pairs.merge(gap_on, on=["Symbol", "_bse_day"], how="left")
+    at_twin_day = pairs["_twin_gap"].notna() & pd.Series(_agrees(pairs["_twin_gap"], pairs["Factor"]),
+                                                          index=pairs.index).astype(bool)
+    pairs = pairs.assign(_same=same.to_numpy(), _confirmed=confirmed.to_numpy() & ~at_twin_day.to_numpy(),
+                         _distance=(pairs["Date"] - pairs["_bse_day"]).abs())
+    chosen = (pairs[pairs["_confirmed"]].sort_values(["_event", "_distance"]).drop_duplicates("_event"))
+    twin.loc[chosen["_event"].to_numpy(), "Date"] = chosen["Date"].to_numpy()            # applied on BSE's ex-date
+    landed = set(zip(twin["Symbol"], twin["Date"]))
+    same_rows = pairs[pairs["_same"]]
+    covers[same_rows.loc[[(s, d) not in landed for s, d in zip(same_rows["Symbol"], same_rows["Date"])],
+                         "index"].unique()] = True
+    differs[pairs.loc[~pairs["index"].isin(same_rows["index"]), "index"].unique()] = True
+    if not twin.empty:
+        agg = {"Factor": ("Factor", "prod")}
+        if "NSE_Date" in twin.columns:
+            agg["NSE_Date"] = ("NSE_Date", "min")
+        twin = twin.groupby(["Symbol", "Date"]).agg(**agg).reset_index()
+    return twin, covers, differs
 
 
 def decide(raw: pd.DataFrame, listed: pd.DataFrame, overrides: pd.DataFrame, twin: pd.DataFrame | None = None,
@@ -247,14 +301,18 @@ def decide(raw: pd.DataFrame, listed: pd.DataFrame, overrides: pd.DataFrame, twi
     df = df.merge(listed, on=["Symbol", "Date"], how="left")
     df = df.merge(overrides[["Symbol", "Date", "Factor"]].drop_duplicates(["Symbol", "Date"], keep="last")
                   .rename(columns={"Factor": "_override"}), on=["Symbol", "Date"], how="left")
-    df["_twin"] = np.nan
-    if twin is not None and not twin.empty:
-        df = df.drop(columns="_twin").merge(twin.rename(columns={"Factor": "_twin"})[["Symbol", "Date", "_twin"]],
-                                           on=["Symbol", "Date"], how="left")
     df["_covered"] = covered.to_numpy() if covered is not None else False
-    for column in ("Listed_Factor", "_override", "_twin"):                 # an empty list merges as object
+    for column in ("Listed_Factor", "_override"):                          # an empty list merges as object
         df[column] = pd.to_numeric(df[column], errors="coerce")
     df["Price_Decides"] = df["Price_Decides"].eq(True)
+    twin, nse_covers, twin_differs = _twin_meets_listing(df, twin)
+    df["_twin"] = np.nan
+    if twin is not None and not twin.empty:                                # a left merge keeps the row order
+        df = df.drop(columns="_twin").merge(twin.rename(columns={"Factor": "_twin"})[["Symbol", "Date", "_twin"]],
+                                           on=["Symbol", "Date"], how="left")
+        df["_twin"] = pd.to_numeric(df["_twin"], errors="coerce")
+    nse_covers = pd.Series(nse_covers.to_numpy(), index=df.index)
+    twin_differs = pd.Series(twin_differs.to_numpy(), index=df.index)
 
     gap = df["Gap"]
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -270,8 +328,7 @@ def decide(raw: pd.DataFrame, listed: pd.DataFrame, overrides: pd.DataFrame, twi
     listed_factor = df["Listed_Factor"]
     override = df["_override"].notna()
     by_twin = df["_twin"].notna() & ~override
-    listing = listed_factor.notna() | df["Price_Decides"]
-    nse_covers = listing & _twin_near(df, listing, twin) & ~override & ~by_twin
+    nse_covers = nse_covers & ~override & ~by_twin
     by_list = listed_factor.notna() & gap.notna() & _agrees(gap, listed_factor)
     by_list = pd.Series(by_list, index=df.index).fillna(False).astype(bool) & ~nse_covers
     by_price = (df["Price_Decides"] & gap.notna() & (gap_off > 0.03) & priced
@@ -287,8 +344,9 @@ def decide(raw: pd.DataFrame, listed: pd.DataFrame, overrides: pd.DataFrame, twi
     twin_unconfirmed = by_twin & gap.notna() & ~pd.Series(_agrees(gap, df["_twin"]), index=df.index).astype(bool)
     df["Factor"] = factor.astype(float)
     df["Event"] = event
-    df["Flag"] = np.select([unsure & ~explained, twin_unconfirmed, relisted & ~(override | by_twin)],
-                           [FLAG_GAP, FLAG_TWIN, FLAG_NEW_LISTING], default=None)
+    df["Flag"] = np.select([unsure & ~explained, twin_differs & ~override, twin_unconfirmed,
+                            relisted & ~(override | by_twin)],
+                           [FLAG_GAP, FLAG_TWIN_DIFFERS, FLAG_TWIN, FLAG_NEW_LISTING], default=None)
     # Each row is multiplied by the product of the factors on LATER days of its symbol.
     with np.errstate(divide="ignore", invalid="ignore"):      # a bad factor is refused in rebuild (check_factors)
         log_f = np.log(df["Factor"])
@@ -364,14 +422,17 @@ def read_overrides(path: Path | None, logger: logging.Logger | None = None) -> p
     for number, row in frame.iterrows():
         exchange = str(row["Exchange"]).strip().upper()
         symbol = str(row["Symbol"]).strip().upper()
-        day = pd.to_datetime(str(row["Date"]).strip(), errors="coerce")
+        text = str(row["Date"]).strip()
+        # ISO only: without a format 01/02/2026 reads as 2 January, which a user in India means as 1 February.
+        day = (pd.to_datetime(text, format="%Y-%m-%d", errors="coerce") if ISO_DATE.fullmatch(text)
+               else pd.NaT)
         factor = pd.to_numeric(str(row["Factor"]).strip(), errors="coerce")
         if exchange not in ("NSE", "BSE"):
             reason = "Exchange must be NSE or BSE"
         elif not symbol:
             reason = "Symbol is empty"
         elif pd.isna(day):
-            reason = "Date does not parse"
+            reason = "Date must be a real date written YYYY-MM-DD"
         elif not np.isfinite(factor):
             reason = "Factor is not a plain finite number"
         elif not MIN_OVERRIDE <= factor <= MAX_OVERRIDE:

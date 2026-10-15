@@ -113,7 +113,7 @@ def nse_files(nse, day: date, folder: Path, logger) -> tuple[Path | None, Path |
             try:
                 fetch(stamp, folder=folder)
                 break
-            except RuntimeError:                     # NSE answered with a page: no file that day
+            except RuntimeError:                     # NSE answered with a page (its 404): no file that day
                 break
             except Exception as error:               # dropped or refused: back off, then give up on the day
                 if wait is None:
@@ -213,7 +213,11 @@ def rebuild(logger: logging.Logger, years: float = config.EOD_RETAIN_YEARS, now:
         for n, day in enumerate(sorted(set(days) | probes), 1):
             bhav, dlv, nse_note = nse_files(nse, day, cache / "NSE" / str(day.year), logger)
             if day in probes:
-                if bhav is None:                     # an ordinary weekend: BSE is not asked
+                if bhav is None and nse_note:        # NSE did not answer: unknown, not a weekend off
+                    logger.warning(f"{day} ({day:%A}): NSE could not be asked ({nse_note}); counted as failed.")
+                    report["failed"].append(f"{day} {nse_note}")
+                    continue
+                if bhav is None:                     # NSE answered "no file": an ordinary weekend, BSE not asked
                     continue
                 logger.warning(f"{day} ({day:%A}) has an NSE bhavcopy: a session no calendar listed; stored.")
                 report["weekend_sessions"].append(str(day))
@@ -364,8 +368,12 @@ def fill_missing(logger: logging.Logger, now: datetime | None = None, nse_factor
             bhav, dlv, nse_note = (nse_files(nse, day, cache / "NSE" / str(day.year), logger) if "NSE" in need
                                    else (None, None, ""))
             if day not in wanted:
+                if bhav is None and nse_note:        # NSE did not answer: the day stays unknown
+                    logger.warning(f"{day} ({day:%A}): NSE could not be asked ({nse_note}); counted as failed.")
+                    report["failed"].append(f"{day} {nse_note}")
+                    continue
                 if bhav is None:
-                    continue                         # a holiday or weekend: nothing to fill
+                    continue                         # NSE answered "no file": a holiday or weekend
                 logger.warning(f"{day} ({day:%A}) has an NSE bhavcopy but no stored rows: filling it.")
                 report["found"].append(str(day))
             bse_bhav, bse_dlv, bse_note = (bse_files(day, cache / "BSE" / str(day.year), get) if "BSE" in need

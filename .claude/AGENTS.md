@@ -172,7 +172,7 @@ Screener.in columns; `EOD_Down_From_52w_High` is computed from EOD data.
    NSE's holiday list as "Laxmi Pujan" and is still a session on both exchanges.
 
 7. **Corporate-action overrides**: `Database/metadata/corporate_action_overrides.csv`
-   rows need Factor as a plain number in [0.001, 1000]; bad or unmatched rows
+   rows need Date as `YYYY-MM-DD` and Factor as a plain number in [0.001, 1000]; bad or unmatched rows
    are skipped with a warning, and a non-finite or non-positive factor is
    refused before anything is written.
 

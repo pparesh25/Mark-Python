@@ -203,19 +203,24 @@ caught), decides a factor for every split, bonus, consolidation and demerger
 factors (`eod_data`, unchanged columns). So an action can never be applied
 twice, a corrected list corrects the prices on the next run, and NSE and BSE
 of the same company carry the same factor. A list fetch that succeeds replaces
-the stored rows it covered (an exchange that revised an ex-date or a ratio
-leaves no stale row behind); a failed or empty fetch deletes nothing. Each
+the stored rows it covered of the securities it lists (an exchange that revised
+an ex-date or a ratio leaves no stale row behind); a security the answer leaves
+out keeps its rows (BSE drops delisted and amalgamated scrips), and a failed or
+empty fetch deletes nothing. Each
 exchange's whole two-year list is fetched again when its last full fetch is
 more than 30 days old (`action_list_history`). Dates are India's (IST). In order:
 
 1. a hand decision in `Database/metadata/corporate_action_overrides.csv`
-   (`Exchange,Symbol,Date,Factor,Note`): Exchange NSE or BSE, a Date that
-   parses, and Factor a plain number from 0.001 to 1000 (`0.5`, not `1/2`,
+   (`Exchange,Symbol,Date,Factor,Note`): Exchange NSE or BSE, Date written
+   `YYYY-MM-DD` (`2026-02-01`; `01/02/2026` is refused, it would read as 2
+   January), and Factor a plain number from 0.001 to 1000 (`0.5`, not `1/2`,
    `50%` or `0.5x`). Any other row, and a row that matches no stored trading
    day of that symbol, is skipped with a warning in the run log;
 2. on BSE, the NSE twin's factor (same ISIN), on BSE's first trading day on or
-   after NSE's day however late, flagged when BSE's open does not show it; BSE's
-   own list adds no second factor within 30 days of one the twin brings;
+   after NSE's day however late, flagged when BSE's open does not show it. A
+   BSE listing of the same ratio within 30 days is the same event, applied once
+   (on the listing's day when only BSE's open there shows it); a listing of
+   another ratio nearby is decided by the list rule and flagged;
 3. the exchange's own list -- NSE matched by ISIN, BSE by scrip code only, never
    by today's name -- when the day's open confirms it (within 25%; a 1:10 bonus
    is taken from the list when the open did not gap);

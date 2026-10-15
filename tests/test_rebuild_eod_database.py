@@ -186,6 +186,26 @@ def test_fill_missing_adds_a_lost_session_under_todays_symbols_and_decides_again
         ("BSE", "nse"), ("NSE", "list")]
 
 
+class FlakyWeekendNSE(FakeNSE):
+    """NSE drops the connection when asked about Sunday 2026-07-05 (not its "no file" page)."""
+
+    def equityBhavcopy(self, day, folder):
+        if day.date() == datetime(2026, 7, 5).date():
+            self.asked.append(day.date())
+            raise ConnectionError("connection reset by peer")
+        return super().equityBhavcopy(day, folder)
+
+
+def test_a_weekend_nse_could_not_be_asked_about_is_a_failed_day_not_a_weekend_off(data_root):
+    now = datetime(2026, 7, 10, 20, 0, tzinfo=config.MARKET_TIMEZONE)
+    report = rebuild.rebuild(logging.getLogger("t"), years=0.02, now=now, nse_factory=FlakyWeekendNSE, get=fake_get)
+    assert report["swapped"] is False and [f[:10] for f in report["failed"]] == ["2026-07-05"]
+
+    assert rebuild.rebuild(logging.getLogger("t"), years=0.02, now=now, nse_factory=FakeNSE, get=fake_get)["swapped"]
+    filled = rebuild.fill_missing(logging.getLogger("t"), now=now, nse_factory=FlakyWeekendNSE, get=fake_get)
+    assert [f[:10] for f in filled["failed"]] == ["2026-07-05"]
+
+
 def test_fill_missing_asks_for_a_known_special_session(data_root, monkeypatch):
     saturday = datetime(2026, 7, 4).date()
     WEEKEND_SESSIONS.add(saturday)
