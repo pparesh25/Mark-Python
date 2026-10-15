@@ -140,19 +140,31 @@ cross starts a new breakout.  The reported breakout is the most recent one
 whose level is still below the latest close, so a newer breakout the price
 has fallen back from does not hide an older one that holds.  With none
 holding the symbol does not qualify.  That candle's date = `Mark_Tight_Date`.
+The run's first candle counts as a crossing only when the run really starts
+there (the candle before it had all indicators and failed Mark); when the
+walk-back stops at the indicator warm-up (index 251, the first 52-week value),
+that candle must pass the normal test against the candle before it.
 Every symbol the first-breakout rule (0.3.0) qualified still qualifies, with
 the same or a later date, apart from differences the history anchor makes.
 
 ### Tight Flag
-Within the last `FLAG_LOOKBACK_DAYS` candles: a 90%+ run-up within 45
-candles (pole longer than 3 candles, no >50% gap, <=40% circuit candles), a
-close above the pole high within 15 candles of the peak, no low between the
-peak and that breakout candle more than `MAX_FLAG_DEPTH` (20%) below the pole
-high, and the latest close still above the pole high.  Latest close >= 5,
->= EMA 200 and within 45% of the 52w high.  Every candidate pole is checked;
-the qualifying pole with the latest breakout candle is reported (ties: later
-peak, then the start with the lowest low, then the later start).
-`flag_*` columns describe the first 90% pole (stage-1 gate); `tight_*`,
+Gates on the latest candle: close >= 5, >= EMA 200 and within 45% of the 52w
+high.  Inside the last `FLAG_LOOKBACK_DAYS` candles every candle j is a
+candidate peak:
+- start i = the lowest low (low > 0) among candles j-45 ..= j-4 inside the
+  window (ties: the later candle), so a pole is 4 to 45 candles long;
+- no high in i ..= j above high[j];
+- run-up (high[j] - low[i]) / low[i] >= 90%;
+- no open gap > 50% in i+1 ..= j, circuit candles (high == low) <= 40% of
+  i ..= j;
+- breakout k = the first candle in j+1 ..= j+15 with close > high[j]; no
+  high in j+1 ..= k-1 above high[j] (a higher candle is its own candidate);
+- flag depth: every low in j+1 ..= k-1 >= (1 - `MAX_FLAG_DEPTH`) * high[j]
+  (20%; the peak and breakout candles' lows do not count);
+- latest close > high[j].
+The qualifying candidate with the latest k is reported (ties: the later j).
+`flag_*` columns describe the earliest candidate whose pole (as defined above)
+has a 90% run-up, whatever the later checks (stage-1 gate); `tight_*`,
 `breakout_date` and the chart lines describe the reported pole.
 
 ### Ranking

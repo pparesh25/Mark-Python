@@ -455,6 +455,17 @@ fn reset_chart_directories(chart_root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Chart dates: from a fixed span before the breakout to the symbol's own last
+/// candle (not the run date).
+fn plot_window(job: &ChartJob, data: &SymbolData) -> Result<(NaiveDate, NaiveDate), String> {
+    let end = data
+        .dates
+        .last()
+        .and_then(|value| parse_date(value).ok())
+        .ok_or_else(|| format!("No valid last date for {} {}", job.exchange, job.symbol))?;
+    Ok((job.breakout - Duration::days(job.strategy.plot_days()), end))
+}
+
 fn render_charts(jobs: &[ChartJob], symbol_datasets: &[SymbolData]) -> Result<(), Box<dyn Error>> {
     let data_by_symbol: HashMap<(String, String), &SymbolData> = symbol_datasets
         .iter()
@@ -472,12 +483,7 @@ fn render_charts(jobs: &[ChartJob], symbol_datasets: &[SymbolData]) -> Result<()
             closes: data.closes.clone(),
             volumes: data.volumes.clone(),
         };
-        // The chart ends on the symbol's own last candle, not the run date.
-        let plot_end = data
-            .dates
-            .last()
-            .and_then(|value| parse_date(value).ok())
-            .ok_or_else(|| format!("No valid last date for {} {}", job.exchange, job.symbol))?;
+        let (plot_start, plot_end) = plot_window(job, data)?;
         let output_path = job
             .output_dir
             .join(format!("{}_{}.png", job.index, job.symbol));
@@ -485,7 +491,7 @@ fn render_charts(jobs: &[ChartJob], symbol_datasets: &[SymbolData]) -> Result<()
             &eod,
             &job.symbol,
             &output_path,
-            job.breakout - Duration::days(job.strategy.plot_days()),
+            plot_start,
             plot_end,
             job.pattern_start,
             job.pattern_end,
@@ -623,11 +629,11 @@ pub fn run_pipeline_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_candidates, output_headers, prepare_chart_jobs, run_date_from_timestamp,
-        sort_candidates, write_watchlist, Candidate, CandidateGroups, CandidateResult,
-        FundamentalTable, Strategy,
+        collect_candidates, output_headers, plot_window, prepare_chart_jobs,
+        run_date_from_timestamp, sort_candidates, write_watchlist, Candidate, CandidateGroups,
+        CandidateResult, FundamentalTable, Strategy,
     };
-    use crate::screener::{FlagResult, MarkResult, ScreenedDataset};
+    use crate::screener::{FlagResult, MarkResult, ScreenedDataset, SymbolData};
     use chrono::NaiveDate;
     use std::collections::HashMap;
     use std::fs;
@@ -811,5 +817,26 @@ mod tests {
         assert_eq!(jobs[0].pattern_start, NaiveDate::from_ymd_opt(2026, 6, 15));
         assert_eq!(jobs[0].pattern_end, NaiveDate::from_ymd_opt(2026, 7, 10));
         assert_eq!(jobs[0].breakout, breakout);
+
+        // The chart ends on the symbol's last candle (a Friday), whatever the
+        // run date, and starts 200 days before the breakout.
+        let data = SymbolData {
+            exchange: "NSE".to_string(),
+            symbol: "FLAGCO".to_string(),
+            isin: "INE000F01010".to_string(),
+            dates: vec!["2026-07-29".to_string(), "2026-07-31".to_string()],
+            opens: vec![1.0; 2],
+            highs: vec![1.0; 2],
+            lows: vec![1.0; 2],
+            closes: vec![1.0; 2],
+            volumes: vec![1.0; 2],
+        };
+        assert_eq!(
+            plot_window(&jobs[0], &data).unwrap(),
+            (
+                NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 7, 31).unwrap()
+            )
+        );
     }
 }

@@ -19,8 +19,10 @@ from zoneinfo import ZoneInfo
 import os
 
 # Run dates follow the exchange calendar, not the machine's clock setting, so
-# Windows, Linux and macOS machines agree on "today" (fundamentals file name,
-# Days_Since_Breakout and chart end date) whatever their local time zone.
+# Windows, Linux and macOS machines agree on "today" (fundamentals, CSV and
+# watchlist file names) whatever their local time zone.  The Rust engine
+# (0.4.0+) counts Days_Since_Breakout from each exchange's latest stored
+# session and ends each chart on the symbol's last candle, not on this date.
 MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 # Capture timestamp: check if an environment variable is set first, so child

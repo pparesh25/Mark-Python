@@ -222,6 +222,19 @@ fn calculate_mark_indicators(data: &SymbolData) -> MarkIndicators {
     }
 }
 
+/// Whether every indicator the Mark condition reads exists at `index`.
+fn mark_inputs_finite(indicators: &MarkIndicators, index: usize) -> bool {
+    [
+        indicators.ema_50[index],
+        indicators.ema_150[index],
+        indicators.ema_200[index],
+        indicators.high_52w[index],
+        indicators.low_52w[index],
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+}
+
 fn mark_condition(data: &SymbolData, indicators: &MarkIndicators, index: usize) -> bool {
     let close = data.closes[index];
     let ema_50 = indicators.ema_50[index];
@@ -229,9 +242,7 @@ fn mark_condition(data: &SymbolData, indicators: &MarkIndicators, index: usize) 
     let ema_200 = indicators.ema_200[index];
     let high_52w = indicators.high_52w[index];
     let low_52w = indicators.low_52w[index];
-    [ema_50, ema_150, ema_200, high_52w, low_52w]
-        .iter()
-        .all(|value| value.is_finite())
+    mark_inputs_finite(indicators, index)
         && close > ema_50
         && ema_50 > ema_150
         && ema_150 > ema_200
@@ -242,7 +253,8 @@ fn mark_condition(data: &SymbolData, indicators: &MarkIndicators, index: usize) 
 /// Mark Tight is the latest 60-session Donchian breakout that still holds
 /// inside the current uninterrupted Mark trend.  A breakout is a candle whose
 /// close crossed above the prior 60-session high (the first candle of the run
-/// counts when it is already above); the reported one is the most recent
+/// counts when it is already above, unless the run only appears to start
+/// there because the indicators begin there); the reported one is the most recent
 /// breakout whose level is still below the latest close.  The latest candle
 /// must also satisfy Mark.
 fn process_mark_screener(data: &SymbolData, indicators: &MarkIndicators) -> Option<MarkResult> {
@@ -260,14 +272,23 @@ fn process_mark_screener(data: &SymbolData, indicators: &MarkIndicators) -> Opti
         let level = indicators.donchian_60[index];
         level.is_finite() && data.closes[index] > level
     };
+    // The run really starts at mark_start only when the candle before it was
+    // evaluated and failed Mark.  When the walk-back stops at the indicator
+    // warm-up (the first candle with a 52-week value), the run began earlier
+    // and the first candle is a crossing only by the normal test.
+    let run_starts_here = mark_start > 0 && mark_inputs_finite(indicators, mark_start - 1);
+    let crossing = |index: usize| {
+        above_donchian(index)
+            && ((index == mark_start && run_starts_here)
+                || index == 0
+                || !above_donchian(index - 1))
+    };
     let latest_close = data.closes[n - 1];
     // A newer crossing the price has since fallen back below does not hide
     // an older one that still holds.
-    let breakout_index = (mark_start..n).rev().find(|&index| {
-        above_donchian(index)
-            && (index == mark_start || !above_donchian(index - 1))
-            && latest_close > indicators.donchian_60[index]
-    })?;
+    let breakout_index = (mark_start..n)
+        .rev()
+        .find(|&index| crossing(index) && latest_close > indicators.donchian_60[index])?;
 
     let down_52w_high = (((indicators.high_52w[n - 1] - data.closes[n - 1])
         / indicators.high_52w[n - 1])
@@ -311,30 +332,36 @@ pub fn history_start(latest_session: &str) -> Option<String> {
     )
 }
 
-/// Whether qualifying pole `candidate` (k, j_peak, low_i, i) beats `current`:
-/// the later breakout wins, then the later peak, then the start with the
-/// lowest low, then the later start.
-fn later_pole(candidate: (usize, usize, f64, usize), current: (usize, usize, f64, usize)) -> bool {
-    let (k, j, low, i) = candidate;
-    let (best_k, best_j, best_low, best_i) = current;
-    if k != best_k {
-        return k > best_k;
-    }
-    if j != best_j {
-        return j > best_j;
-    }
-    if low != best_low {
-        return low < best_low;
-    }
-    i > best_i
+/// A pole spans 4 to 45 candles from its start to its peak.
+const POLE_MIN_CANDLES: usize = 4;
+const POLE_MAX_CANDLES: usize = 45;
+/// The breakout close comes at most this many candles after the peak.
+const MAX_FLAG_CANDLES: usize = 15;
+
+/// Pole start for a peak at `j_peak`: the lowest positive low among the
+/// candles 45..=4 before it (inside the window); ties go to the later candle.
+fn pole_start(lows: &[f64], j_peak: usize) -> Option<usize> {
+    let first = j_peak.saturating_sub(POLE_MAX_CANDLES);
+    let last = j_peak.checked_sub(POLE_MIN_CANDLES)?;
+    (first..=last)
+        .filter(|&index| lows[index] > 0.0)
+        .fold(None, |best: Option<usize>, index| match best {
+            Some(current) if lows[current] < lows[index] => Some(current),
+            _ => Some(index),
+        })
 }
 
 /// Stage 1 ("Flag") -> Stage 2 ("Tight Flag") Hierarchical Screening.
 ///
-/// `flag_*` describe the first 90%-in-45-candles pole of the lookback window
-/// (the internal stage-1 gate).  Every candidate pole is then checked, and the
-/// qualifying pole whose breakout candle is the most recent supplies the
-/// `tight_*` dates and `breakout_date` (see `later_pole` for ties).
+/// Every candle j of the lookback window is a candidate peak.  Its pole starts
+/// at the lowest low 4..=45 candles earlier (`pole_start`), and no candle of
+/// the pole may trade above high[j].  `flag_*` describe the first candidate
+/// pole with a 90% run-up (the internal stage-1 gate).  A candidate qualifies
+/// when the pole has no >50% gap, <= 40% circuit candles, a close above
+/// high[j] within 15 candles with no flag candle trading above high[j] or
+/// more than MAX_FLAG_DEPTH below it, and the latest close above high[j].
+/// The qualifying pole with the latest breakout (then the later peak)
+/// supplies the `tight_*` dates and `breakout_date`.
 fn process_flag_screener(
     data: &SymbolData,
     flag_lookback: usize,
@@ -403,89 +430,66 @@ fn process_flag_screener(
             circuit_prefix[index] + usize::from((highs[index] - lows[index]).abs() < 1e-4);
     }
 
-    // The qualifying pole with the latest breakout wins: (k, j_peak, low, i).
-    let mut best: Option<(usize, usize, f64, usize)> = None;
+    // Candidates are ordered by breakout, then peak: the last one wins.
+    let mut best: Option<(usize, usize, usize)> = None; // (k, j_peak, i)
 
-    // --- STAGE 1: Flag Pattern Detection (90%+ gain in 45 days) ---
-    for i in 0..(n - 1) {
-        if lows[i] <= 0.0 {
+    for j_peak in POLE_MIN_CANDLES..n {
+        // --- Pole: start = lowest positive low 4..=45 candles before the peak.
+        let Some(i) = pole_start(lows, j_peak) else {
+            continue;
+        };
+        let peak_high = highs[j_peak];
+        if highs[i..j_peak].iter().any(|&high| high > peak_high) {
             continue;
         }
-        let max_j = std::cmp::min(n - 1, i + 45);
-        if max_j <= i {
+        let run_up = (peak_high - lows[i]) / lows[i];
+        if run_up < 0.90 {
             continue;
         }
-
-        // Find peak high index in range (i + 1)..=max_j
-        let mut j_peak = i + 1;
-        let mut max_h = highs[j_peak];
-        for (candidate_j, &candidate_high) in highs.iter().enumerate().take(max_j + 1).skip(i + 1) {
-            if candidate_high > max_h {
-                max_h = candidate_high;
-                j_peak = candidate_j;
-            }
+        // --- STAGE 1 ("Flag"): the first 90% pole of the window.
+        if !is_flag {
+            is_flag = true;
+            flag_date = Some(dates[j_peak].clone());
+            flag_start_date = Some(dates[i].clone());
+            flag_peak_date = Some(dates[j_peak].clone());
         }
 
-        let run_up = (highs[j_peak] - lows[i]) / lows[i];
-        if run_up >= 0.90 {
-            if !is_flag {
-                is_flag = true;
-                flag_date = Some(dates[j_peak].clone());
-                flag_start_date = Some(dates[i].clone());
-                flag_peak_date = Some(dates[j_peak].clone());
-            }
-
-            // --- STAGE 2: Tight Flag Checks ---
-            // 1. Minimum Pole Duration > 3 candles
-            if j_peak - i > 3 {
-                // 2. Extreme Gap Check (No single-day gap > 50% in pole)
-                let has_extreme_gap = gap_prefix[j_peak + 1] > gap_prefix[i + 1];
-
-                if !has_extreme_gap {
-                    // 3. Circuit Trap Check (Circuit candles <= 40% in pole)
-                    let pole_candles = j_peak - i + 1;
-                    let circuit_count = circuit_prefix[j_peak + 1] - circuit_prefix[i];
-                    let circuit_pct = (circuit_count as f64) / (pole_candles as f64) * 100.0;
-
-                    if circuit_pct <= 40.0 {
-                        // 4. Tight Breakout Check (within 15 days of peak)
-                        let mut breakout_k: Option<usize> = None;
-                        let max_breakout_k = std::cmp::min(n, j_peak + 16);
-                        for (k, &candidate_close) in closes
-                            .iter()
-                            .enumerate()
-                            .take(max_breakout_k)
-                            .skip(j_peak + 1)
-                        {
-                            if candidate_close > highs[j_peak] {
-                                breakout_k = Some(k);
-                                break;
-                            }
-                        }
-
-                        if let Some(k_idx) = breakout_k {
-                            // 5. Flag depth: no candle between the peak and
-                            // the breakout trades more than MAX_FLAG_DEPTH
-                            // below the pole high.
-                            let depth_floor = highs[j_peak] * (1.0 - MAX_FLAG_DEPTH);
-                            let shallow = lows[j_peak + 1..k_idx]
-                                .iter()
-                                .all(|&low| low >= depth_floor);
-                            // 6. Breakout Holding Rule: Latest close > Pole Peak High
-                            if shallow && closes[n - 1] > highs[j_peak] {
-                                let candidate = (k_idx, j_peak, lows[i], i);
-                                if best.is_none_or(|current| later_pole(candidate, current)) {
-                                    best = Some(candidate);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        // --- STAGE 2 ("Tight Flag") ---
+        // No single-day open gap > 50% inside the pole.
+        if gap_prefix[j_peak + 1] > gap_prefix[i + 1] {
+            continue;
+        }
+        // Circuit candles <= 40% of the pole.
+        let pole_candles = j_peak - i + 1;
+        let circuit_count = circuit_prefix[j_peak + 1] - circuit_prefix[i];
+        if (circuit_count as f64) / (pole_candles as f64) * 100.0 > 40.0 {
+            continue;
+        }
+        // Breakout: the first close above the peak within 15 candles.  A flag
+        // candle trading above the peak is a later candidate peak instead.
+        let last_k = std::cmp::min(n - 1, j_peak + MAX_FLAG_CANDLES);
+        let Some(k_idx) = (j_peak + 1..=last_k).find(|&k| closes[k] > peak_high) else {
+            continue;
+        };
+        let flag = j_peak + 1..k_idx;
+        if highs[flag.clone()].iter().any(|&high| high > peak_high) {
+            continue;
+        }
+        // Flag depth: no flag low more than MAX_FLAG_DEPTH below the peak.
+        let depth_floor = (1.0 - MAX_FLAG_DEPTH) * peak_high;
+        if lows[flag].iter().any(|&low| low < depth_floor) {
+            continue;
+        }
+        // Holding: the latest close is still above the peak.
+        if closes[n - 1] <= peak_high {
+            continue;
+        }
+        if best.is_none_or(|(best_k, best_j, _)| (k_idx, j_peak) > (best_k, best_j)) {
+            best = Some((k_idx, j_peak, i));
         }
     }
 
-    if let Some((k_idx, j_peak, _, i)) = best {
+    if let Some((k_idx, j_peak, i)) = best {
         is_tight_flag = true;
         tight_flag_date = Some(dates[j_peak].clone());
         tight_start_date = Some(dates[i].clone());
@@ -1053,13 +1057,17 @@ mod tests {
             }
         }
 
-        /// Rising candles whose highs go linearly from `first` to `last`.
-        fn ramp(&mut self, from: usize, to: usize, first: f64, last: f64) {
-            let step = (last - first) / (to - from) as f64;
-            for local in from..=to {
-                let high = first + step * (local - from) as f64;
-                self.set(local, high - 0.5, high, high - 1.0, high - 0.5);
+        /// A pole from `start` (low `low`) to `peak` (high `high`, close
+        /// `peak_close`).  The candles between close at low + 1 and their
+        /// highs stay below 1.5 x low, so none of them is a 90% peak itself.
+        fn pole(&mut self, start: usize, peak: usize, low: f64, high: f64, peak_close: f64) {
+            self.set(start, low + 1.0, low + 2.0, low, low + 1.0);
+            let step = (0.5 * low - 3.0) / (peak - start) as f64;
+            for local in start + 1..peak {
+                let candle_high = low + 3.0 + step * (local - start - 1) as f64;
+                self.set(local, low + 1.0, candle_high, low + 0.5, low + 1.0);
             }
+            self.set(peak, low + 1.0, high, low + 0.5, peak_close);
         }
 
         fn data(self) -> SymbolData {
@@ -1094,87 +1102,139 @@ mod tests {
         )
     }
 
-    /// Pole A: start 0 (low 49.5), peak 40 (high 100), flag 41-47 with lows
-    /// `a_flag_low`, breakout 48.  A >50% gap at 100 walls it off from pole B:
-    /// start 100 (low 158), peak 140 (high 320), flag 141-145 with lows
-    /// `b_flag_low`, breakout 146, then holding at 326.
-    fn two_pole_layout(a_flag_low: f64, b_flag_low: f64) -> Bars {
+    /// Pole A: start 20 (low 45), peak 30 (high 100), flag 31-37 with lows
+    /// `a_flag_low`, breakout 38, holding at 103.5.  Pole B: start 100 (low
+    /// 102), peak 110 (high 200), flag 111..`b_breakout` with lows
+    /// `b_flag_low`, breakout `b_breakout` (close 205), holding at 206.
+    fn two_pole_layout(a_flag_low: f64, b_flag_low: f64, b_breakout: usize) -> Bars {
         let mut bars = Bars::new();
-        bars.ramp(1, 39, 51.0, 98.0);
-        bars.set(40, 98.0, 100.0, 97.0, 98.0);
-        bars.flat(41..=47, 95.0, 96.0, a_flag_low);
-        bars.set(48, 95.0, 105.0, 94.0, 101.0);
-        bars.flat(49..=99, 102.0, 104.0, 101.0);
-        bars.set(100, 160.0, 162.0, 158.0, 160.0);
-        bars.ramp(101, 139, 165.0, 315.0);
-        bars.set(140, 314.0, 320.0, 310.0, 315.0);
-        bars.flat(141..=145, 290.0, 300.0, b_flag_low);
-        bars.set(146, 300.0, 330.0, 300.0, 325.0);
-        bars.flat(147..=199, 326.0, 328.0, 324.0);
+        bars.pole(20, 30, 45.0, 100.0, 92.0);
+        bars.flat(31..=37, 90.0, 95.0, a_flag_low);
+        bars.set(38, 90.0, 106.0, 89.0, 101.0);
+        bars.flat(39..=99, 103.5, 104.0, 103.0);
+        bars.pole(100, 110, 102.0, 200.0, 192.0);
+        bars.flat(111..=b_breakout - 1, 190.0, 195.0, b_flag_low);
+        bars.set(b_breakout, 190.0, 210.0, 189.0, 205.0);
+        bars.flat(b_breakout + 1..=199, 206.0, 208.0, 205.0);
         bars
+    }
+
+    fn screen(bars: Bars) -> Option<super::FlagResult> {
+        process_flag_screener(&bars.data(), LOOKBACK, None)
+    }
+
+    /// (start, peak, breakout) of the reported pole.
+    fn pole_dates(result: &super::FlagResult) -> (Option<String>, Option<String>, Option<String>) {
+        (
+            result.tight_start_date.clone(),
+            result.tight_peak_date.clone(),
+            result.breakout_date.clone(),
+        )
+    }
+
+    fn local_pole(
+        start: usize,
+        peak: usize,
+        breakout: usize,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        (local_date(start), local_date(peak), local_date(breakout))
     }
 
     #[test]
     fn tight_flag_reports_the_pole_with_the_latest_breakout() {
-        let data = two_pole_layout(90.0, 270.0).data();
-        let result = process_flag_screener(&data, LOOKBACK, None).unwrap();
+        let result = screen(two_pole_layout(90.0, 180.0, 118)).unwrap();
 
-        // flag_* still describe the first 90% pole of the window.
-        assert_eq!(result.flag_start_date, local_date(0));
-        assert_eq!(result.flag_peak_date, local_date(40));
-        // The older pole A also qualifies (breakout 48); the fresh one wins.
-        assert_eq!(result.tight_start_date, local_date(100));
-        assert_eq!(result.tight_peak_date, local_date(140));
-        assert_eq!(result.tight_flag_date, local_date(140));
-        assert_eq!(result.breakout_date, local_date(146));
+        // flag_* describe the first 90% pole of the window (pole A).
+        assert_eq!(result.flag_start_date, local_date(20));
+        assert_eq!(result.flag_peak_date, local_date(30));
+        // Pole A also qualifies (breakout 38); the fresh pole B wins.
+        assert_eq!(pole_dates(&result), local_pole(100, 110, 118));
+        assert_eq!(result.tight_flag_date, local_date(110));
+    }
+
+    /// A 10-candle pole breaking out 8 candles after its peak: under the old
+    /// definition a breakout had to come more than 45 candles after the start.
+    #[test]
+    fn a_ten_candle_v_pole_qualifies() {
+        let mut bars = Bars::new();
+        for (step, local) in (10..20).enumerate() {
+            let close = 50.0 - 0.4 * step as f64;
+            bars.set(local, close, close + 0.5, close - 0.5, close);
+        }
+        bars.pole(20, 30, 45.0, 100.0, 92.0);
+        bars.flat(31..=37, 90.0, 95.0, 90.0);
+        bars.set(38, 90.0, 106.0, 89.0, 101.0);
+        bars.flat(39..=199, 103.5, 104.0, 103.0);
+        let result = screen(bars).unwrap();
+
+        assert_eq!(pole_dates(&result), local_pole(20, 30, 38));
     }
 
     #[test]
-    fn tight_flag_depth_allows_19_percent_and_rejects_21_percent() {
+    fn tight_flag_depth_boundary_is_exactly_80_percent_of_the_peak() {
         assert_eq!(MAX_FLAG_DEPTH, 0.20);
-        let passing = two_pole_layout(81.0, 320.0 * 0.81).data();
-        let result = process_flag_screener(&passing, LOOKBACK, None).unwrap();
-        assert_eq!(result.breakout_date, local_date(146));
+        // B's flag low exactly 80% of 200 passes.
+        let result = screen(two_pole_layout(90.0, 160.0, 118)).unwrap();
+        assert_eq!(pole_dates(&result), local_pole(100, 110, 118));
 
-        // Both flags pull back 21%: nothing qualifies.
-        let failing = two_pole_layout(79.0, 320.0 * 0.79).data();
-        assert!(process_flag_screener(&failing, LOOKBACK, None).is_none());
+        // 79.99% fails: the fresh pole is rejected and the older pole A,
+        // whose flag low is exactly 80% of 100, is reported instead.
+        let result = screen(two_pole_layout(80.0, 159.98, 118)).unwrap();
+        assert_eq!(pole_dates(&result), local_pole(20, 30, 38));
+
+        // Both at 79.99%: nothing qualifies.
+        assert!(screen(two_pole_layout(79.99, 159.98, 118)).is_none());
     }
 
     #[test]
-    fn a_too_deep_fresh_flag_falls_back_to_an_older_passing_pole() {
-        let data = two_pole_layout(90.0, 320.0 * 0.79).data();
-        let result = process_flag_screener(&data, LOOKBACK, None).unwrap();
+    fn deep_lows_on_the_peak_or_breakout_candle_are_not_flag_lows() {
+        let mut bars = two_pole_layout(90.0, 180.0, 118);
+        bars.set(110, 103.0, 200.0, 150.0, 192.0); // peak candle low 75% of 200
+        bars.set(118, 190.0, 210.0, 150.0, 205.0); // breakout candle low 75%
+        let result = screen(bars).unwrap();
 
-        assert_eq!(result.tight_start_date, local_date(0));
-        assert_eq!(result.tight_peak_date, local_date(40));
-        assert_eq!(result.breakout_date, local_date(48));
+        assert_eq!(pole_dates(&result), local_pole(100, 110, 118));
     }
 
-    /// After the gap at 100: starts 100-102 see peak 145 (high 320), starts
-    /// 103-105 see peak 148 (high 321); both groups break out at 151.
     #[test]
-    fn tight_flag_ties_prefer_the_later_peak_then_the_lowest_low_then_the_later_start() {
-        let mut bars = two_pole_layout(90.0, 270.0);
-        bars.set(100, 160.0, 162.0, 158.0, 160.0);
-        bars.set(101, 160.0, 162.0, 150.0, 160.0); // lowest low, earlier peak
-        bars.set(102, 160.0, 162.0, 157.0, 160.0);
-        bars.set(103, 160.0, 162.0, 155.0, 160.0);
-        bars.set(104, 160.0, 162.0, 155.0, 160.0);
-        bars.set(105, 160.0, 162.0, 157.0, 160.0);
-        bars.ramp(106, 144, 165.0, 315.0);
-        bars.set(145, 314.0, 320.0, 310.0, 315.0);
-        bars.flat(146..=147, 290.0, 300.0, 270.0);
-        bars.set(148, 295.0, 321.0, 290.0, 300.0);
-        bars.flat(149..=150, 290.0, 300.0, 270.0);
-        bars.set(151, 300.0, 330.0, 300.0, 325.0);
-        bars.flat(152..=199, 326.0, 328.0, 324.0);
-        let result = process_flag_screener(&bars.data(), LOOKBACK, None).unwrap();
+    fn breakout_may_come_15_but_not_16_candles_after_the_peak() {
+        let result = screen(two_pole_layout(90.0, 180.0, 125)).unwrap();
+        assert_eq!(pole_dates(&result), local_pole(100, 110, 125));
 
-        assert_eq!(result.breakout_date, local_date(151));
-        assert_eq!(result.tight_peak_date, local_date(148));
-        // 103 and 104 share the lowest low of the later-peak group.
-        assert_eq!(result.tight_start_date, local_date(104));
+        // B breaks out one candle too late; only pole A remains.
+        let result = screen(two_pole_layout(90.0, 180.0, 126)).unwrap();
+        assert_eq!(pole_dates(&result), local_pole(20, 30, 38));
+    }
+
+    #[test]
+    fn pole_start_is_the_lowest_low_45_to_4_candles_before_the_peak() {
+        let mut bars = two_pole_layout(90.0, 180.0, 118);
+        bars.lows[PREFIX + 64] = 90.0; // 46 candles before the peak: outside
+        bars.lows[PREFIX + 103] = 101.0;
+        bars.lows[PREFIX + 106] = 101.0; // ties with 103: the later one wins
+        bars.lows[PREFIX + 107] = 95.0; // 3 candles before the peak: outside
+        let result = screen(bars).unwrap();
+
+        assert_eq!(pole_dates(&result), local_pole(106, 110, 118));
+    }
+
+    #[test]
+    fn a_higher_high_inside_the_flag_becomes_the_peak() {
+        let mut bars = two_pole_layout(90.0, 180.0, 118);
+        bars.set(113, 190.0, 202.0, 180.0, 190.0);
+        let result = screen(bars).unwrap();
+
+        // 110 no longer qualifies (a flag candle trades above it); 113 does.
+        assert_eq!(pole_dates(&result), local_pole(100, 113, 118));
+    }
+
+    #[test]
+    fn peaks_sharing_a_breakout_report_the_later_peak() {
+        let mut bars = two_pole_layout(90.0, 180.0, 118);
+        bars.set(113, 190.0, 200.0, 180.0, 190.0); // equals the 110 high
+        let result = screen(bars).unwrap();
+
+        assert_eq!(pole_dates(&result), local_pole(100, 113, 118));
     }
 
     #[test]
@@ -1291,6 +1351,38 @@ mod tests {
         assert_eq!(result.mark_tight_date, "2024-267");
     }
 
+    /// Closes rise above the prior 60-session high every day from 240.  The
+    /// Mark walk-back stops at 251, the first candle with a 52-week value, so
+    /// the run did not start there and 251 is not a crossing (SHANTAI case).
+    fn streak_through_the_warm_up(closes_after_240: &[f64]) -> SymbolData {
+        let mut closes = vec![100.0; 240];
+        closes.extend_from_slice(closes_after_240);
+        let highs = closes.clone();
+        symbol_data(closes, highs)
+    }
+
+    #[test]
+    fn the_indicator_warm_up_is_not_a_crossing() {
+        let rising: Vec<f64> = (0..30).map(|step| 150.0 + step as f64).collect(); // 240-269
+        let data = streak_through_the_warm_up(&rising);
+        let indicators = calculate_mark_indicators(&data);
+        assert!(super::mark_condition(&data, &indicators, 251));
+        assert!(!super::mark_inputs_finite(&indicators, 250));
+
+        assert!(process_mark_screener(&data, &indicators).is_none());
+    }
+
+    #[test]
+    fn after_the_warm_up_a_new_cross_is_reported() {
+        let mut path: Vec<f64> = (0..22).map(|step| 150.0 + step as f64).collect(); // 240-261
+        path.extend_from_slice(&[165.0, 175.0, 176.0, 177.0, 178.0, 179.0, 180.0, 181.0]); // 262 dips, 263 crosses
+        let data = streak_through_the_warm_up(&path);
+        let indicators = calculate_mark_indicators(&data);
+        let result = process_mark_screener(&data, &indicators).unwrap();
+
+        assert_eq!(result.mark_tight_date, "2024-263");
+    }
+
     /// The run's only crossing (252, level 300) no longer holds at 250.
     #[test]
     fn mark_tight_does_not_qualify_when_no_crossing_holds() {
@@ -1354,12 +1446,15 @@ mod tests {
                  )
                  SELECT CAST(DATE '2025-01-01' + CAST(i AS INTEGER) AS DATE) AS Date,
                         Symbol, Exchange, ISIN,
-                        100 * POW(1.003, i) AS Open,
-                        100 * POW(1.003, i) * 1.001 AS High,
-                        100 * POW(1.003, i) * 0.99 AS Low,
-                        100 * POW(1.003, i) AS Close,
+                        100 * POW(1.003, i) * dip AS Open,
+                        100 * POW(1.003, i) * dip * 1.001 AS High,
+                        100 * POW(1.003, i) * dip * 0.99 AS Low,
+                        100 * POW(1.003, i) * dip AS Close,
                         1000.0 AS Volume
-                 FROM series, range(0, 300) AS r(i)
+                 -- A 1% dip at 270-274 gives a real crossing at 275, after the
+                 -- indicator warm-up (the steady rise alone never crosses).
+                 FROM series, range(0, 300) AS r(i),
+                      LATERAL (SELECT CASE WHEN i BETWEEN 270 AND 274 THEN 0.99 ELSE 1.0 END AS dip)
                  WHERE i < sessions",
             )
             .unwrap();
@@ -1448,5 +1543,67 @@ mod tests {
             pruned.symbol_datasets[0].closes,
             full.symbol_datasets[0].closes
         );
+    }
+
+    /// NSE's latest session is 2027-03-11, BSE's 30 days earlier: each
+    /// exchange keeps its own last 700 days.
+    #[test]
+    fn history_anchor_is_per_exchange() {
+        let root = std::env::temp_dir().join(format!(
+            "mark-history-exchanges-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("prices.duckdb");
+        let fundamentals = root.join("fundamentals.csv");
+        std::fs::write(
+            &fundamentals,
+            "Name,ISIN Code\nN,INE555E01015\nB,INE666F01016\n",
+        )
+        .unwrap();
+        {
+            let conn = duckdb::Connection::open(&database).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE eod_data AS
+                 WITH series(Symbol, Exchange, ISIN, sessions) AS (
+                     VALUES ('NSEONLY', 'NSE', 'INE555E01015', 800),
+                            ('BSEONLY', 'BSE', 'INE666F01016', 770)
+                 )
+                 SELECT CAST(DATE '2025-01-01' + CAST(i AS INTEGER) AS DATE) AS Date,
+                        Symbol, Exchange, ISIN,
+                        100.0 AS Open, 101.0 AS High, 99.0 AS Low, 100.0 AS Close,
+                        1000.0 AS Volume
+                 FROM series, range(0, 800) AS r(i)
+                 WHERE i < sessions",
+            )
+            .unwrap();
+        }
+        let run = screen_market(
+            database.to_str().unwrap(),
+            fundamentals.to_str().unwrap(),
+            "ALL",
+            &ScreenOptions::default(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let first_date = |exchange: &str| {
+            let data = run
+                .symbol_datasets
+                .iter()
+                .find(|data| data.exchange == exchange)
+                .unwrap();
+            (data.dates.first().cloned().unwrap(), data.dates.len())
+        };
+        assert_eq!(
+            run.datasets["BSE"].latest_session.as_deref(),
+            Some("2027-02-09")
+        );
+        assert_eq!(first_date("NSE"), ("2025-04-10".to_string(), 701));
+        assert_eq!(first_date("BSE"), ("2025-03-11".to_string(), 701));
     }
 }

@@ -190,9 +190,16 @@ optimized two-request HTTP flow.  An older local file is used only when
   still holds: of the days the close crossed above the prior 60-session high,
   the most recent one whose level is still below the latest close. A newer
   breakout the price fell back from does not hide an older one that holds.
-- **Tight Flag** checks every pole of the last 90 candles and reports the
-  qualifying pole with the latest breakout. A flag may pull back at most 20%
-  from the pole high before the breakout.
+- **Tight Flag** treats every candle of the last 90 as a possible pole peak.
+  The pole starts at the lowest low 4 to 45 candles before the peak, no candle
+  of the pole trades above the peak, and the peak is at least 90% above that
+  low (no >50% opening gap, at most 40% circuit candles). The breakout is the
+  first close above the peak within 15 candles; until then no candle trades
+  above the peak or more than 20% below it, and the latest close is still
+  above the peak. Of the qualifying poles, the one with the latest breakout
+  (then the later peak) is reported.
+- A Mark trend that already began before the first candle with a 52-week
+  value has no breakout on that candle; only a later crossing counts.
 - **Days_Since_Breakout** counts calendar days from the exchange's latest
   stored session, so a weekend or holiday run ranks like the last trading day.
   Charts end on the symbol's last candle.
