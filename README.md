@@ -50,8 +50,9 @@ A rebuild asks NSE about every weekend day too, so a Saturday or Sunday
 session no calendar listed (the 2025-02-01 Union Budget session was missing
 from the first rebuild) is stored. `--fill-missing` downloads into the existing
 store the sessions it lacks on either exchange over its whole range, under the
-symbols it has today, and decides the factors again; do not run it while a
-scheduled sync is writing the store.
+symbols it has today, and decides every factor again (the full rebuild); do not
+run it while a scheduled sync is writing the store. A rebuild makes a version 3
+store directly.
 
 Create the credential file below the portable data root when automatic
 fundamental downloads are required:
@@ -176,6 +177,7 @@ Both launchers pass extra arguments to `run_screener.py`:
 --watchlists / --no-watchlists
 --strip-sme-watchlist-suffix
 --allow-stale-fundamentals
+--verify            (only compare the price store with a full rebuild, repair it, exit)
 ```
 
 Examples:
@@ -294,6 +296,39 @@ in that window is skipped by the screener. `compact_price_database.py --apply`
 copies the store into a fresh file to give back the space deleted rows hold.
 `run_screener.py --skip-sync` screens a store made elsewhere without touching it.
 
+#### Stored adjustments (price store version 3)
+
+Deciding every factor and recomputing 3.8 million adjusted rows took 12-24 s of
+each run. The store now keeps what was decided: `adjustment_ledger` holds every
+applied factor (one per symbol and day -- a second one, or a factor of 0, below
+0 or not finite, cannot be stored), `eod_prices` holds the adjusted rows, and
+`gap_history` the sure gaps of days that left the store (so the gap-noise rule
+still counts the whole listing). An adjusted row is always the raw row times
+the product of the symbol's later ledger factors, written from `raw_prices`,
+never from another adjusted row. After a sync only the symbols whose decisions
+can have changed are decided again -- a new day with a large gap, a day after a
+halt, a backfilled or re-sent day, a changed list row or override, an NSE twin
+whose factors changed, a renamed or reused ticker, rows aged out next to a
+decision (`adjustment_ledger.py` lists every rule) -- with the same code as a
+full rebuild, and their rows are rewritten in one transaction: about 1.5 s on
+the live store. Before it commits, every touched row is checked against raw x
+ledger and every factor day's adjusted gap against the raw gap over the factor
+(a factor applied twice shows there); a failed check rolls everything back,
+names the symbols in `corporate_action_review.csv` and runs the full rebuild.
+Once a week the whole store is compared with a full rebuild and, on any
+difference, logged and repaired from raw; `run_screener.py --verify` does just
+that and exits (0 equal, 5 repaired, 6 failed, 4 another run holds the lock).
+
+A version 2 store is migrated by its first run: the file is first copied to
+`NSE_BSE_EOD.v2-backup.duckdb` beside it, then the new tables are filled and
+checked in one transaction (about 30 s); the raw prices are not touched, and on
+any failure the store stays version 2 and the log says so. The migration needs
+free disk for the copy plus about 1.5 times the store (the adjusted rows make
+the file about 65% larger: 124 MB became 203 MB); with less it waits and says
+so. The screener reads the same `eod_data` as before -- on a copy of the live
+store the released engine wrote byte-identical CSVs and charts from the version
+2 and the migrated version 3 file.
+
 An EOD network failure is logged and screening may continue against local
 data.  A session whose file could not be downloaded is retried on the next run
 instead of being skipped; it is treated as an unlisted holiday only after
@@ -339,10 +374,10 @@ can change results differs.  The fields:
 | `data_as_of` | NSE/BSE latest local session, the eligible target, `as_of_mismatch`, `local_fallback` (screened older data than the target), `sync_stopped`, and the warnings |
 | `fundamentals` | file name, sha256, modified time (IST), rows and distinct ISINs |
 | `overrides` | whether `corporate_action_overrides.csv` exists, and its sha256 |
-| `store.kind`, `store.schema_version` | `v2` / 2 for the current store; `v1` / 1 for an old store that still needs `rebuild_eod_database.py`; `external` for a store screened with `--skip-sync` (the lake export keeps adjusted prices in an `eod_prices` table) |
-| `store.engine_input_hash` | one hash of everything the `eod_data` view the engine reads is computed from (prices, `adjustment_periods`, `securities`) -- equal values mean the engine saw the same data |
-| `store.exchanges` | per exchange: rows, sessions, first/last date, symbols, and `content_hash` of the price table (`raw_prices`, or `eod_prices` when that is a table): symbol, OHLC to 1/10^6, volume, per session |
-| `store.tables` | rows and a content hash of each other table (factors, actions, securities; NaN and infinity hashed as text) |
+| `store.kind`, `store.schema_version` | `v3` / 3 for the current store (adjusted prices stored with a ledger); `v2` / 2 for a store not yet migrated; `v1` / 1 for an old store that still needs `rebuild_eod_database.py`; `external` for a store screened with `--skip-sync` (the lake export keeps adjusted prices in an `eod_prices` table) |
+| `store.engine_input_hash` | one hash of everything the `eod_data` view the engine reads is computed from (v3: the stored `eod_prices` and `securities`; v2: raw prices, `adjustment_periods`, `securities`) -- equal values mean the engine saw the same data |
+| `store.exchanges` | per exchange: rows, sessions, first/last date, symbols, and `content_hash` of the price table (`eod_prices` in v3 and external stores -- what the engine reads --, `raw_prices` in v2): symbol, OHLC to 1/10^6, volume, per session |
+| `store.tables` | rows and a content hash of each other table (the ledger without its `Decided_At` time, `gap_history`, periods, actions, securities; NaN and infinity hashed as text); `maintenance_state` records when, not what, and is only counted |
 | `store.exchange_actions` | rows of the exchanges' corporate-action lists per exchange |
 | `store.sessions` | rows and hash per session -- the comparison names the sessions that differ |
 | `outputs` | per list (`NSE/mark_tight`, ...): count, hash and the (symbol, breakout date) pairs from the written CSVs |

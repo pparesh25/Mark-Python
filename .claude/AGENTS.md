@@ -32,7 +32,10 @@ OpenTrader Pro watchlists.
    DuckDB store through `eod_store.py`.  Missing sessions over the whole
    stored range are logged; `rebuild_eod_database.py --fill-missing` adds them.
    After the sync `eod_maintenance.py` refreshes the action lists and decides
-   the corporate-action factors (`price_adjustments.py`, IST dates).
+   the corporate-action factors (`price_adjustments.py`, IST dates): on a
+   version 3 store only the symbols whose decisions can have changed
+   (`adjustment_ledger.py`), with a full verify/repair against the full rebuild
+   once a week; a version 2 store is migrated on its first run.
 2. **Step 2** — `fundamental_downloader.py`: two-request HTTP export from
    screener.in (screen 3427564) into `all-company_YYYYMMDD.csv`.
 3. **Steps 3-4** — `stock_analysis` (Rust) `pipeline` subcommand: ISIN join
@@ -45,7 +48,10 @@ OpenTrader Pro watchlists.
 |------|---------|
 | `run_screener.py` | Unified pipeline orchestrator |
 | `config.py` | Centralized paths, parameters, strategy settings |
-| `eod_store.py` | DuckDB schema (`securities`, `eod_prices`, `eod_data` view) and upserts |
+| `eod_store.py` | DuckDB schema v3 (`raw_prices`, `eod_prices` table, `adjustment_ledger`, `gap_history`, `symbol_state`, `eod_data` view), upserts, retention |
+| `price_adjustments.py` | The factor rules (`decide_exchange`) and the full rebuild (`rebuild`, the oracle) |
+| `adjustment_ledger.py` | Incremental maintenance with its dependency rules, checks, full verify/repair, v2 -> v3 migration |
+| `eod_maintenance.py` | After-sync step (retention, migration, lists, decisions) and `verify_store` (`--verify`) |
 | `screening_readiness.py` | EOD freshness, sync-cursor rebase, retry/gap bookkeeping |
 | `nse_eod_downloader/`, `bse_eod_downloader/` | Exchange downloaders and corporate-action adjustments |
 | `fundamental_downloader.py` | Screener.in CSV download (HTTP) |
@@ -109,7 +115,9 @@ python -m run_fingerprint run_fingerprint_A.json run_fingerprint_B.json
   `MARK_SCHEDULER_NOW` (epoch, also the simulated clock for retries) for tests.
 - `run_screener.py` exit codes: 3 = screened data not current (only with
   `MARK_SCHEDULED=1`), 4 = another run holds `<data root>/mark_screener.lock`.
-  The scheduler retries both every 30 minutes until 23:30 IST.
+  The scheduler retries both every 30 minutes until 23:30 IST.  `--verify`
+  (under the same lock) only runs the full verify/repair: 0 equal, 5 repaired,
+  6 failed.
 - `Mark_Python.sh` picks `$MARK_PYTHON`, then `.venv/bin/python`, then a conda env
   `mark_screener` under `~/miniforge3`, `~/miniconda3`, `~/anaconda3`,
   `/opt/homebrew/Caskroom/miniforge/base`; it never relies on `conda` on PATH.
@@ -204,6 +212,20 @@ Screener.in columns; `EOD_Down_From_52w_High` is computed from EOD data.
    rows need Date as `YYYY-MM-DD` and Factor as a plain number in [0.001, 1000]; bad or unmatched rows
    are skipped with a warning, and a non-finite or non-positive factor is
    refused before anything is written.
+
+8. **Stored adjustments (store v3)**: `eod_prices` is a table, not a view.
+   Anything that writes `raw_prices` must keep it in step: `upsert_daily_prices`
+   writes the day's adjusted rows itself, renames move every derived table
+   (`eod_store.DERIVED_TABLES`), a reused ticker drops them, `apply_retention`
+   updates `symbol_state`; any other writer must call `eod_store.rematerialize`
+   for its rows or rely on the next maintenance (it finds the change through
+   `symbol_state` and decides the symbol again). Correctness is defined as
+   "equal to `price_adjustments.rebuild()`": a new dependency between symbols or
+   days needs a rule in `adjustment_ledger.py` (see its docstring) and a case in
+   `tests/test_adjustment_ledger.py`'s simulation; when unsure, decide more
+   symbols. Bump `adjustment_ledger.RULE_VERSION` when a decision rule changes,
+   so the next run rebuilds in full. The migration needs free disk for a copy
+   of the store plus ~1.5x its size (v3 is ~65% larger than v2).
 
 ## Git Workflow
 

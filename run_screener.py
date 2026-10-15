@@ -51,6 +51,9 @@ from config import CURRENT_TIMESTAMP
 # manual run still exits 0 -- and another run holding the run lock.
 EXIT_DATA_NOT_CURRENT = 3
 EXIT_BUSY = 4
+# --verify: the stored prices differed from a full rebuild and were repaired (5), or the verify failed (6).
+EXIT_VERIFY_REPAIRED = 5
+EXIT_VERIFY_FAILED = 6
 # A run lock older than this is stale whatever its process.
 RUN_LOCK_MAX_AGE_SECONDS = 6 * 3600
 
@@ -408,14 +411,15 @@ def run_all_screening(logger, include_sme=False, only_sme=False):
 # Main
 # ---------------------------------------------------------------------------
 def ensure_current_store(logger) -> bool:
-    """True when the price store is version 2; an old or missing one is rebuilt from exchange files first."""
+    """True when the price store is version 2 or 3 (a version 2 store is migrated by the maintenance step);
+    an old or missing one is rebuilt from exchange files first."""
     import duckdb
     from eod_store import schema_version
 
     if config.DUCKDB_FILE.exists():
         conn = duckdb.connect(str(config.DUCKDB_FILE), read_only=True)
         try:
-            if schema_version(conn) == 2:
+            if schema_version(conn) in (2, 3):
                 return True
         finally:
             conn.close()
@@ -479,6 +483,12 @@ def build_argument_parser():
         help="Never download or adjust EOD data here: the database is generated "
              "elsewhere (the market-data lake's lake.export_mark) and is screened as it is",
     )
+    parser.add_argument(
+        '--verify',
+        action='store_true',
+        help="Only compare the price store with a full rebuild from its raw prices and repair it on a "
+             f"difference, then exit (0 equal, {EXIT_VERIFY_REPAIRED} repaired, {EXIT_VERIFY_FAILED} failed)",
+    )
     return parser
 
 
@@ -505,11 +515,31 @@ def main():
     if lock is None:
         sys.exit(EXIT_BUSY)
     try:
-        code = run_pipeline(args, logger)
+        code = run_verify(logger) if args.verify else run_pipeline(args, logger)
     finally:
         release_run_lock(lock)
     if code:
         sys.exit(code)
+
+
+def run_verify(logger) -> int:
+    """--verify under the run lock: the full verify and repair of the price store; the exit code."""
+    logger.info(color("▶ Price store verify: every stored price and decision against a full rebuild", 'BOLD'))
+    try:
+        from eod_maintenance import verify_store
+        result = verify_store(logger)
+    except Exception as error:  # noqa: BLE001 - reported as the exit code
+        logger.error(color(f"  ✗ Verify failed: {error}", 'RED'))
+        return EXIT_VERIFY_FAILED
+    if result.get("status") == "ok":
+        logger.info(color(f"  ✓ The price store equals a full rebuild ({result.get('seconds')}s).", 'GREEN'))
+        return 0
+    tables = ", ".join(f"{table} ({len(pairs)} symbols)" for table, pairs in result.get("differences", {}).items())
+    if result.get("status") == "repaired":
+        logger.warning(color(f"  ! Differences found and repaired from raw prices: {tables}", 'YELLOW'))
+        return EXIT_VERIFY_REPAIRED
+    logger.error(color(f"  ✗ Differences found and not repaired: {tables}", 'RED'))
+    return EXIT_VERIFY_FAILED
 
 
 def run_pipeline(args, logger) -> int:

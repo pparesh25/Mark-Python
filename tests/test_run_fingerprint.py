@@ -23,10 +23,11 @@ ROWS = [
 ]
 
 
-def make_store(path, rows=ROWS, factors=True, factor=0.5):
+def make_store(path, rows=ROWS, factors=True, factor=0.5, version=2):
+    """A version 2 store (eod_prices a view over raw_prices) -- or version 3, its adjusted rows stored."""
     conn = duckdb.connect(str(path))
     try:
-        create_schema(conn)
+        create_schema(conn, version)
         conn.executemany(
             "INSERT INTO securities VALUES (?, ?, ?, 'EQ', NULL)",
             [("NSE", "AAA", "INE000A01011"), ("BSE", "BBB", "INE000B01011")],
@@ -36,10 +37,18 @@ def make_store(path, rows=ROWS, factors=True, factor=0.5):
         )
         if factors:
             conn.execute("INSERT INTO adjustment_periods VALUES ('NSE', 'AAA', DATE '2026-10-13', ?)", [factor])
+            if version == 3:
+                conn.execute("INSERT INTO adjustment_ledger VALUES ('NSE', 'AAA', DATE '2026-10-14', ?, 'list', "
+                             "'list|NSE|AAA|split|0.5', 1.0, 'split', ?, TIMESTAMP '2026-10-14 18:00:00', 1)",
+                             [factor, factor])
+                conn.execute("INSERT INTO gap_history VALUES ('NSE', 'AAA', DATE '2026-10-14', 0.4)")
         else:
             # Factor and action tables renamed or gone (the view needs only adjustment_periods).
             conn.execute("DROP TABLE price_adjustments")
             conn.execute("DROP TABLE exchange_actions")
+        if version == 3:
+            from eod_store import rematerialize
+            rematerialize(conn)
     finally:
         conn.close()
     return path
@@ -118,6 +127,25 @@ def test_an_exported_store_is_external_not_v1(tmp_path):
                                                                                       "eod_prices")
     assert external["exchanges"]["NSE"]["rows"] == 2
     assert store_section(path)["kind"] == "v1"  # the same layout synced here is an old store
+
+
+def test_a_version_3_store_hashes_its_stored_adjusted_prices_the_ledger_and_the_gap_history(tmp_path):
+    v3 = store_section(make_store(tmp_path / "a.duckdb", version=3))
+    assert (v3["schema_version"], v3["kind"], v3["price_table"]) == (3, "v3", "eod_prices")
+    assert v3["tables"]["eod_prices"] == {"rows": 4}
+    ledger = v3["tables"]["adjustment_ledger"]
+    assert ledger["rows"] == 1 and ledger["hash"] and "Decided_At" not in ledger["columns"]
+    assert v3["tables"]["gap_history"]["rows"] == 1 and v3["tables"]["gap_history"]["hash"]
+    assert "hash" not in v3["tables"]["maintenance_state"]            # when, not what
+    # The engine input is the stored adjusted prices: another factor over the same raw rows changes it.
+    other = store_section(make_store(tmp_path / "b.duckdb", version=3, factor=1 / 3))
+    assert other["engine_input_hash"] != v3["engine_input_hash"]
+    assert other["tables"]["adjustment_ledger"]["hash"] != ledger["hash"]
+    assert other["exchanges"]["NSE"]["content_hash"] != v3["exchanges"]["NSE"]["content_hash"]
+    # Version 2 hashes its raw rows: equal where no factor applies (BSE), different where one does (NSE).
+    v2 = store_section(make_store(tmp_path / "c.duckdb", version=2))
+    assert v2["kind"] == "v2" and v2["exchanges"]["BSE"] == v3["exchanges"]["BSE"]
+    assert v2["exchanges"]["NSE"]["content_hash"] != v3["exchanges"]["NSE"]["content_hash"]
 
 
 def test_store_hash_is_a_fixed_value(tmp_path):
@@ -386,6 +414,52 @@ def test_an_exported_store_screened_with_skip_sync_is_not_called_version_1(pipel
     assert "version 1" not in log
     fingerprint = json.loads(run_fingerprint.fingerprint_path().read_text(encoding="utf-8"))
     assert fingerprint["store"]["kind"] == "external"
+
+
+def make_maintained_store(path):
+    """A version 3 store decided by the full rebuild: AAA halves on 2026-10-14."""
+    import pandas as pd
+
+    import price_adjustments
+    from eod_store import upsert_daily_prices
+
+    conn = duckdb.connect(str(path))
+    try:
+        create_schema(conn)
+        days = pd.bdate_range("2026-09-01", "2026-10-14")
+        closes = [100.0] * (len(days) - 1) + [50.0]
+        upsert_daily_prices(conn, pd.DataFrame({
+            "Date": days, "Symbol": "AAA", "Exchange": "NSE", "ISIN": "INE000A01011", "Series": "EQ",
+            "Open": closes, "High": closes, "Low": closes, "Close": closes, "Volume": 1000}))
+        price_adjustments.rebuild(conn, None, None, date(2026, 10, 14))
+    finally:
+        conn.close()
+
+
+def test_verify_exits_0_on_an_equal_store_5_after_a_repair_6_when_it_cannot(pipeline):
+    make_maintained_store(config.DUCKDB_FILE)
+    code, log = pipeline("--verify")
+    assert code == 0 and "equals a full rebuild" in log
+    assert pipeline.state["screened"] == 0 and not config.RUN_LOCK_FILE.exists()
+    conn = duckdb.connect(str(config.DUCKDB_FILE))
+    conn.execute("UPDATE eod_prices SET Close = Close * 2 WHERE Date = '2026-09-01'")
+    conn.close()
+    code, log = pipeline("--verify")
+    assert code == run_screener.EXIT_VERIFY_REPAIRED == 5 and "repaired" in log
+    assert pipeline("--verify")[0] == 0
+    config.DUCKDB_FILE.unlink()
+    code, log = pipeline("--verify")
+    assert code == run_screener.EXIT_VERIFY_FAILED == 6 and "Verify failed" in log
+
+
+def test_verify_respects_the_run_lock(pipeline):
+    make_maintained_store(config.DUCKDB_FILE)
+    config.RUN_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    holder = {"pid": os.getpid(), "host": run_screener.platform.node(), "started": run_screener.time.time(),
+              "token": "other"}
+    config.RUN_LOCK_FILE.write_text(json.dumps(holder))
+    code, log = pipeline("--verify")
+    assert code == run_screener.EXIT_BUSY and "equals a full rebuild" not in log
 
 
 def test_a_second_run_while_one_holds_the_lock_exits_busy(pipeline):

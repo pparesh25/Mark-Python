@@ -4,7 +4,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from eod_store import create_compact_schema
+from eod_store import create_compact_schema, rematerialize
 from screening_readiness import (
     LocalDataError,
     clear_session_attempts,
@@ -36,6 +36,7 @@ def _database(tmp_path: Path, nse_date: str, bse_date: str) -> Path:
             "INSERT INTO raw_prices (Date, Symbol, Exchange, Open, High, Low, Close, Volume) VALUES (?, 'NSETEST', 'NSE', 1, 1, 1, 1, 1), (?, 'BSETEST', 'BSE', 1, 1, 1, 1, 1)",
             [nse_date, bse_date],
         )
+        rematerialize(conn)                     # raw rows written by hand: store their adjusted rows
     finally:
         conn.close()
     return database
@@ -120,6 +121,7 @@ def test_missing_sessions_are_reported_per_exchange(tmp_path):
             conn.execute("INSERT INTO raw_prices (Date, Symbol, Exchange, Open, High, Low, Close, Volume) VALUES (?, 'NSETEST', 'NSE', 1, 1, 1, 1, 1)", [day])
         for day in ("2026-07-27", "2026-07-28", "2026-07-31"):
             conn.execute("INSERT INTO raw_prices (Date, Symbol, Exchange, Open, High, Low, Close, Volume) VALUES (?, 'BSETEST', 'BSE', 1, 1, 1, 1, 1)", [day])
+        rematerialize(conn)
     finally:
         conn.close()
 
@@ -145,6 +147,7 @@ def test_a_special_session_neither_exchange_stored_is_missing_over_the_whole_ran
             for symbol, exchange in (("NSETEST", "NSE"), ("BSETEST", "BSE")):
                 conn.execute("INSERT INTO raw_prices (Date, Symbol, Exchange, Open, High, Low, Close, Volume) "
                              "VALUES (?, ?, ?, 1, 1, 1, 1, 1)", [day, symbol, exchange])
+        rematerialize(conn)
     finally:
         conn.close()
 

@@ -13,12 +13,17 @@ prints which fields differ between two runs (for example one from each
 machine), so the cause of a difference is visible without re-running anything.
 
 What is hashed: the engine reads the ``eod_data`` view, which is a pure
-function of the base tables -- ``raw_prices``, ``adjustment_periods`` and
-``securities`` in a version 2 store, the ``eod_prices`` table in a version 1
-store or an external (lake) export.  Hashing those base tables directly gives
-the same information as hashing the view, without its ASOF join, in one scan
-(about 1 s for 3.8 million rows instead of 4-10 s).  ``store.engine_input_hash``
-combines them into one value.
+function of base tables -- the ``eod_prices`` table and ``securities`` in a
+version 3 store (eod_prices is what the engine reads, raw x the ledger's
+factors), ``raw_prices``, ``adjustment_periods`` and ``securities`` in a
+version 2 store, the ``eod_prices`` table in a version 1 store or an external
+(lake) export.  Hashing those base tables directly gives the same information
+as hashing the view, without its ASOF join, in one scan (about 1 s for 3.8
+million rows instead of 4-10 s).  ``store.engine_input_hash`` combines them into
+one value.  The decision tables (``adjustment_ledger``, ``gap_history``,
+``price_adjustments``, ...) are hashed in ``store.tables`` (the ledger without
+its Decided_At time); ``maintenance_state`` records when, not what, and is only
+counted.
 
 The hashes are computed from text whose format does not depend on the platform
 or the DuckDB version: dates as ISO text, prices as integers of 1/10^6, other
@@ -54,9 +59,12 @@ _MOD64 = 1 << 64
 # Price tables hashed per session in one scan (never through the view).
 _PRICE_TABLES = ("raw_prices", "eod_prices")
 # Columns left out of a table hash because they record when, not what.
-_VOLATILE_COLUMNS = {"fetched_at", "applied_at"}
-# Tables the eod_data view reads besides the price table.
+_VOLATILE_COLUMNS = {"fetched_at", "applied_at", "decided_at"}
+# Tables only counted: they record when the store was maintained, not what it holds.
+_COUNTED_TABLES = ("maintenance_state",)
+# Tables the eod_data view reads besides the price table (version 2; version 3 reads eod_prices and securities).
 _VIEW_INPUT_TABLES = ("adjustment_periods", "securities")
+_STORED_VIEW_INPUT_TABLES = ("securities",)
 # Any other table larger than this is only counted: such tables (the lake
 # export's eod_delivery, 3.8 million rows) hold columns the engine does not
 # read, and hashing them would double the fingerprint's cost.
@@ -213,7 +221,7 @@ def _table_digest(conn, table: str) -> dict:
     ).fetchall()
     used = [(name, kind) for name, kind in columns if name.lower() not in _VOLATILE_COLUMNS]
     rows = conn.execute(f"SELECT count(*) FROM {_quote(table)}").fetchone()[0]
-    if not used:
+    if not used or table in _COUNTED_TABLES:
         return {"rows": rows}
     if rows > _HASH_ROW_LIMIT and table not in _VIEW_INPUT_TABLES:
         return {"rows": rows, "hash": None, "note": f"over {_HASH_ROW_LIMIT} rows: counted, not hashed"}
@@ -249,7 +257,11 @@ def _store_section(database: Path, external: bool = False) -> dict:
             "SELECT table_name, table_type FROM information_schema.tables"
         ).fetchall())
         base = next((name for name in _PRICE_TABLES if relations.get(name) == "BASE TABLE"), None)
-        if base == "raw_prices":
+        version = schema_version(conn)
+        if version == 3:
+            # Adjusted prices stored beside the raw ones: hash what the engine reads.
+            base, kind = "eod_prices", "v3"
+        elif base == "raw_prices":
             kind = "v2"
         elif base == "eod_prices":
             # Adjusted prices stored as a table: an old store, or one exported by
@@ -258,7 +270,7 @@ def _store_section(database: Path, external: bool = False) -> dict:
         else:
             kind = "empty"
         result["kind"] = kind
-        result["schema_version"] = "external" if kind == "external" else schema_version(conn)
+        result["schema_version"] = "external" if kind == "external" else version
         result["price_table"] = base
 
         exchanges: dict = {}
@@ -307,7 +319,7 @@ def _store_section(database: Path, external: bool = False) -> dict:
             "kind": kind,
             "prices": {exchange: info.get("content_hash") for exchange, info in exchanges.items()},
         }
-        for table in _VIEW_INPUT_TABLES:
+        for table in (_STORED_VIEW_INPUT_TABLES if kind == "v3" else _VIEW_INPUT_TABLES):
             view_inputs[table] = (tables.get(table) or {}).get("hash")
         result["engine_input_hash"] = _digest16([json.dumps(view_inputs, sort_keys=True)])
         if "exchange_actions" in relations:

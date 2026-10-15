@@ -57,7 +57,7 @@ import config
 import price_adjustments
 from bse_eod_downloader.eod_downloader import BHAVCOPY_URL, DELIVERY_URL, headers as BSE_HEADERS, merge_bse_day
 from bse_eod_downloader.stock_data import update_bse_eod
-from eod_store import apply_retention, create_schema, schema_version
+from eod_store import apply_retention, create_schema, rematerialize, schema_version
 from nse_eod_downloader.stock_data import update_nse_eod
 from screening_readiness import _read_calendar, find_missing_sessions, is_special_session_day, latest_eligible_eod_date
 
@@ -244,10 +244,11 @@ def rebuild(logger: logging.Logger, years: float = config.EOD_RETAIN_YEARS, now:
             report["action_lists"] = action_lists.refresh_history(
                 conn, nse, start - timedelta(days=action_lists.HISTORY_LEAD_DAYS),
                 end + timedelta(days=action_lists.LOOK_AHEAD_DAYS), now.date(), logger, get)
+            # Retention first: the full rebuild then decides exactly the rows that stay.
+            report["raw_rows_dropped"] = apply_retention(conn, years)
             report["prices"] = price_adjustments.rebuild(conn, metadata / "corporate_action_overrides.csv",
                                                          config.DATABASE_DIR / "corporate_action_review.csv", end,
                                                          logger)
-            report["raw_rows_dropped"] = apply_retention(conn, years)
             conn.execute("CHECKPOINT")
         finally:
             conn.close()
@@ -319,6 +320,13 @@ def backfill(conn, side: Path, exchange: str, day: date) -> tuple[int, int]:
             conn.execute("INSERT INTO raw_prices (Date, Symbol, Exchange, Open, High, Low, Close, Volume, Total_Trades, "
                          "Dlv_Qty) SELECT Date, Target, Exchange, Open, High, Low, Close, Volume, Total_Trades, Dlv_Qty "
                          "FROM backfill_rows WHERE Target IS NOT NULL")
+            if schema_version(conn) == 3:
+                # The day's adjusted rows at once; the full rebuild that follows (or, if this run stops,
+                # the next maintenance, which sees a backfill and decides those symbols again) settles them.
+                conn.execute("CREATE OR REPLACE TEMP TABLE backfill_keys AS SELECT DISTINCT Exchange, "
+                             "Target AS Symbol, Date FROM backfill_rows WHERE Target IS NOT NULL")
+                rematerialize(conn, "backfill_keys", ("Exchange", "Symbol", "Date"))
+                conn.execute("DROP TABLE backfill_keys")
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -336,8 +344,8 @@ def fill_missing(logger: logging.Logger, now: datetime | None = None, nse_factor
     live = Path(config.DUCKDB_FILE)
     conn = duckdb.connect(str(live), read_only=True)
     try:
-        if schema_version(conn) != 2:
-            raise RuntimeError("the price store is not version 2; run rebuild_eod_database.py first")
+        if schema_version(conn) not in (2, 3):
+            raise RuntimeError("the price store is version 1; run rebuild_eod_database.py first")
         stored = {exchange: set() for exchange in ("NSE", "BSE")}
         for exchange, day in conn.execute("SELECT DISTINCT Exchange, Date FROM raw_prices").fetchall():
             stored.setdefault(exchange, set()).add(day)

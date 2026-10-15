@@ -1,11 +1,17 @@
 """Decide every split, bonus and demerger factor from the raw prices and the exchanges' lists; rebuild the prices.
 
-    refresh(conn, ...)   after every sync: fetch the lists around today, decide, rewrite the factor periods
+    refresh(conn, ...)   after every sync: fetch the lists around today, decide what can have changed
+    rebuild(conn, ...)   the full rebuild: decide everything (the oracle the daily maintenance is held to)
 
 This is the method of the market-data lake the screener was checked against
 (2026-10): the stored prices are the exchanges' own, and the adjusted prices
-are recomputed from them and a factor table on every run -- never divided in
-place. Per symbol and day, in this order:
+are raw x the product of the symbol's factors after that day -- never divided
+in place, never derived from an adjusted price. A version 3 store keeps the
+applied factors in a ledger and the adjusted prices in a table and decides
+again, after each sync, only the symbols whose decisions can have changed
+(adjustment_ledger.py; both paths decide through decide_exchange here, so they
+cannot differ); a version 2 store decides everything on every run. Per symbol
+and day, in this order:
 
   1. a hand decision in Database/metadata/corporate_action_overrides.csv
      (Exchange, Symbol, Date, Factor, Note) -- for what no rule can see. A row
@@ -48,8 +54,14 @@ was "split" 1/50), and it is FLAGGED. A listed action is matched to the
 symbol's first trading day on or after its ex-date, at most 10 days later; one
 that matched no day although the symbol traded again later is FLAGGED ("listed,
 no trade within 10 days"). Prices before a factor's day are multiplied by it;
-volume and delivery divided. Every decision goes to `price_adjustments`; the
-last 30 days' flags and unconfirmed listings to corporate_action_review.csv.
+volume and delivery divided. The MAX_GAP_EVENTS noise rule counts the sure
+gaps of the whole listing: those of days that aged out of the store are kept in
+`gap_history` (version 3). One event is applied once: a listed factor whose
+Event_Key (exchange, symbol, kind, ratio -- not the day) was applied within 30
+days before, or a BSE listing beside an NSE twin factor of the same ratio, is
+refused and FLAGGED (refuse_repeats); a factor after which the adjusted open
+still gaps 25% or more is FLAGGED. Every decision goes to `price_adjustments`;
+the last 30 days' flags and unconfirmed listings to corporate_action_review.csv.
 Before anything is written every applied factor must be finite and above 0,
 or the rebuild raises and the previous tables stay.
 """
@@ -84,6 +96,12 @@ FLAG_NEW_LISTING = f"new listing: back after more than {NEW_LISTING_AFTER_DAYS} 
 FLAG_TWIN = "NSE twin's factor; the BSE open does not show it"
 FLAG_TWIN_DIFFERS = "BSE listing's ratio differs from the NSE twin's factor nearby"
 FLAG_NO_TRADE = f"listed, no trade within {LAG.days} days"
+# Double application (POCL, divided three times by the version 1 store): one event, two factors.
+EVENT_REFUSED = "refused"
+FLAG_REFUSED = "refused: the same event was already applied"
+# After a factor, the adjusted open should sit near the adjusted previous close.
+CONTINUITY_LIMIT = 0.25
+FLAG_CONTINUITY = f"adjusted open still gaps more than {CONTINUITY_LIMIT:.0%} after the factor"
 # The ratios splits and bonuses come in, most common first: the ex-date's own move
 # is often 5-15%, so the nearest ratio in a dense list is not the answer.
 RATIO_RANKS = {1 / 2: 1, 1 / 3: 1, 1 / 4: 1, 1 / 5: 1, 1 / 10: 1,
@@ -172,9 +190,14 @@ def _moving_actions(actions: pd.DataFrame, securities: pd.DataFrame, exchange: s
     return symbols_for(actions[moving], securities, exchange)[["Symbol", "Ex_Date", "Kind", "Factor"]]
 
 
-def listed_days(actions: pd.DataFrame, securities: pd.DataFrame, raw: pd.DataFrame, exchange: str) -> pd.DataFrame:
-    """(Symbol, Date, Listed_Kind, Listed_Factor, Price_Decides) from the exchange's list."""
-    hits = first_trading_day(_moving_actions(actions, securities, exchange), raw)
+def listed_days(actions: pd.DataFrame, securities: pd.DataFrame, raw: pd.DataFrame, exchange: str,
+                moving: pd.DataFrame | None = None) -> pd.DataFrame:
+    """(Symbol, Date, Listed_Kind, Listed_Factor, Price_Decides) from the exchange's list.
+
+    `moving` is _moving_actions(actions, securities, exchange) when the caller has it already.
+    """
+    moving = _moving_actions(actions, securities, exchange) if moving is None else moving
+    hits = first_trading_day(moving, raw)
     if hits.empty:
         return pd.DataFrame(columns=["Symbol", "Date", "Listed_Kind", "Listed_Factor", "Price_Decides"])
     hits = hits.drop_duplicates(["Symbol", "Date", "Kind", "Factor"])
@@ -189,20 +212,23 @@ def listed_days(actions: pd.DataFrame, securities: pd.DataFrame, raw: pd.DataFra
 
 
 def unmatched_listings(actions: pd.DataFrame, securities: pd.DataFrame, raw: pd.DataFrame, exchange: str,
-                       today: date) -> pd.DataFrame:
+                       today: date, first=None, last=None, moving: pd.DataFrame | None = None) -> pd.DataFrame:
     """Listed actions no trading day within LAG matched, as FLAGGED rows on their ex-date.
 
     Only an action resolved to a stored symbol, with an ex-date inside the stored
     range, at least LAG old (today and the store's last day), and a symbol that
     traded again later: its prices before and after are on different bases. A
-    symbol that never traded again needs no factor.
+    symbol that never traded again needs no factor. `first` and `last` are the
+    exchange's stored range; they default to `raw`'s, and must be given when
+    `raw` holds only some symbols (the incremental maintenance).
     """
     empty = pd.DataFrame(columns=["Symbol", "Date", "Gap", "Factor", "Event", "Flag", "Listed_Kind", "Listed_Factor"])
-    keys = _moving_actions(actions, securities, exchange)
+    keys = _moving_actions(actions, securities, exchange) if moving is None else moving
     if keys.empty or raw.empty:
         return empty
     days = pd.to_datetime(raw["Date"])
-    first, last = days.min(), days.max()
+    first = days.min() if first is None else pd.Timestamp(first)
+    last = days.max() if last is None else pd.Timestamp(last)
     keys = keys.assign(Ex_Date=pd.to_datetime(keys["Ex_Date"])).drop_duplicates(["Symbol", "Ex_Date", "Kind", "Factor"])
     keys = keys[(keys["Ex_Date"] >= first) & (keys["Ex_Date"] + LAG <= last)
                 & (keys["Ex_Date"] + LAG <= pd.Timestamp(today))]
@@ -290,8 +316,15 @@ def _twin_meets_listing(df: pd.DataFrame, twin: pd.DataFrame | None):
 
 
 def decide(raw: pd.DataFrame, listed: pd.DataFrame, overrides: pd.DataFrame, twin: pd.DataFrame | None = None,
-           covered: pd.Series | None = None) -> pd.DataFrame:
-    """Factor, event and flag for every row of one exchange; `Adj` multiplies the row's prices."""
+           covered: pd.Series | None = None, frozen: pd.Series | None = None) -> pd.DataFrame:
+    """Factor, event and flag for every row of one exchange; `Adj` multiplies the row's prices.
+
+    `frozen` counts, per symbol, the sure gaps of days no longer stored (the
+    store's `gap_history` before the symbol's first raw day): the MAX_GAP_EVENTS
+    noise rule counts over the whole listing, so a decision does not change when
+    old rows leave the store. `Sure` marks the rows that are such a gap now;
+    `Twin_Date` is NSE's day of a twin factor.
+    """
     df = with_gaps(raw)
     df["Date"] = pd.to_datetime(df["Date"])
     listed, overrides = listed.copy(), overrides.copy()
@@ -307,9 +340,12 @@ def decide(raw: pd.DataFrame, listed: pd.DataFrame, overrides: pd.DataFrame, twi
     df["Price_Decides"] = df["Price_Decides"].eq(True)
     twin, nse_covers, twin_differs = _twin_meets_listing(df, twin)
     df["_twin"] = np.nan
+    df["Twin_Date"] = pd.NaT
     if twin is not None and not twin.empty:                                # a left merge keeps the row order
-        df = df.drop(columns="_twin").merge(twin.rename(columns={"Factor": "_twin"})[["Symbol", "Date", "_twin"]],
-                                           on=["Symbol", "Date"], how="left")
+        twin = twin.rename(columns={"Factor": "_twin"})
+        twin["Twin_Date"] = pd.to_datetime(twin["NSE_Date"]) if "NSE_Date" in twin.columns else twin["Date"]
+        df = df.drop(columns=["_twin", "Twin_Date"]).merge(twin[["Symbol", "Date", "_twin", "Twin_Date"]],
+                                                           on=["Symbol", "Date"], how="left")
         df["_twin"] = pd.to_numeric(df["_twin"], errors="coerce")
     nse_covers = pd.Series(nse_covers.to_numpy(), index=df.index)
     twin_differs = pd.Series(twin_differs.to_numpy(), index=df.index)
@@ -321,7 +357,11 @@ def decide(raw: pd.DataFrame, listed: pd.DataFrame, overrides: pd.DataFrame, twi
     covered_ = df["_covered"].astype(bool)
     relisted = df["_relisted"].astype(bool)
     sure = priced & ~covered_ & (gap < SURE_BELOW)
-    noisy = sure.groupby(df["Symbol"]).transform("sum") > MAX_GAP_EVENTS
+    df["Sure"] = sure
+    count = sure.groupby(df["Symbol"]).transform("sum")
+    if frozen is not None and len(frozen):
+        count = count + df["Symbol"].map(frozen).fillna(0).to_numpy()
+    noisy = count > MAX_GAP_EVENTS
     sure = sure & ~noisy
     unsure = priced & ~covered_ & (((gap >= SURE_BELOW) & (gap < UNSURE_BELOW)) | (gap >= UNSURE_ABOVE)
                                    | ((gap < SURE_BELOW) & noisy))
@@ -355,6 +395,18 @@ def decide(raw: pd.DataFrame, listed: pd.DataFrame, overrides: pd.DataFrame, twi
     return df.drop(columns=["_priced", "_override", "_twin", "_covered", "_relisted"])
 
 
+def twin_map(securities: pd.DataFrame) -> dict:
+    """BSE symbol -> its NSE twin's symbol: the same ISIN, else the ISIN's first nine characters when one
+    NSE symbol has them (kept through a split)."""
+    nse_sec = securities[securities["Exchange"] == "NSE"]
+    bse_sec = securities[securities["Exchange"] == "BSE"]
+    exact = dict(zip(nse_sec["ISIN"], nse_sec["Symbol"]))
+    prefix = nse_sec.assign(_p=nse_sec["ISIN"].str[:ISIN_SECURITY]).drop_duplicates("_p", keep=False)
+    by_prefix = dict(zip(prefix["_p"], prefix["Symbol"]))
+    twins = bse_sec["ISIN"].map(exact).fillna(bse_sec["ISIN"].str[:ISIN_SECURITY].map(by_prefix))
+    return {symbol: twin for symbol, twin in zip(bse_sec["Symbol"], twins) if isinstance(twin, str)}
+
+
 def twin_inputs(bse_raw: pd.DataFrame, nse_decided: pd.DataFrame, securities: pd.DataFrame):
     """(twin factors on BSE days, covered flags aligned with with_gaps(bse_raw)) from NSE's decisions.
 
@@ -362,14 +414,10 @@ def twin_inputs(bse_raw: pd.DataFrame, nse_decided: pd.DataFrame, securities: pd
     NSE's day, with no limit on how much later: the shares are the same, so every
     earlier BSE row is before the event (`NSE_Date` keeps NSE's day). A BSE series
     whose first stored day is after NSE's day gets none: it has no earlier row.
+    `nse_decided` needs Symbol, Date, Event and Factor of every NSE day of the
+    twins (all NSE rows will do); only its applied factors and its days are read.
     """
-    nse_sec = securities[securities["Exchange"] == "NSE"]
-    bse_sec = securities[securities["Exchange"] == "BSE"]
-    exact = dict(zip(nse_sec["ISIN"], nse_sec["Symbol"]))
-    prefix = nse_sec.assign(_p=nse_sec["ISIN"].str[:ISIN_SECURITY]).drop_duplicates("_p", keep=False)
-    by_prefix = dict(zip(prefix["_p"], prefix["Symbol"]))
-    twins = bse_sec["ISIN"].map(exact).fillna(bse_sec["ISIN"].str[:ISIN_SECURITY].map(by_prefix))
-    twin_of = dict(zip(bse_sec["Symbol"], twins))
+    twin_of = twin_map(securities)
     rows = with_gaps(bse_raw)[["Symbol", "Date"]].copy()
     rows["Date"] = pd.to_datetime(rows["Date"])
     rows["Twin"] = rows["Symbol"].map(twin_of)
@@ -398,6 +446,111 @@ def twin_inputs(bse_raw: pd.DataFrame, nse_decided: pd.DataFrame, securities: pd
                             left_on="Date", right_on="_on", by="Twin", direction="backward", tolerance=LAG)
         covered[hit.loc[hit["NSE_Date"].notna(), "index"].to_numpy()] = True
     return twin, covered
+
+
+def _ratio_text(values: pd.Series) -> pd.Series:
+    return values.map(lambda v: f"{v:.6g}" if pd.notna(v) else "")
+
+
+def event_keys(decided: pd.DataFrame, exchange: str) -> pd.Series:
+    """The source event of each decided row (None where no event): one real event, one key.
+
+    A listed action is keyed without its day (exchange, symbol, kind and ratio;
+    a demerger the price decides, without the ratio) so that two days carrying
+    one listing -- a revised ex-date kept beside the old one -- share a key. A
+    twin factor is keyed by NSE's day, a gap and an override by their own day.
+    """
+    keys = pd.Series(None, index=decided.index, dtype=object)
+    rows = decided[decided["Event"].notna()]
+    if rows.empty:
+        return keys
+    day = rows["Date"].dt.strftime("%Y-%m-%d")
+    twin_day = pd.to_datetime(rows["Twin_Date"]).dt.strftime("%Y-%m-%d").fillna(day)
+    head = f"{exchange}|" + rows["Symbol"].astype(str)
+    kind = rows["Listed_Kind"].fillna("").astype(str)
+    event = rows["Event"]
+    keys[rows.index] = np.select(
+        [event == "override", event == "nse", event == "list", event == "list_price", event == "gap",
+         event == "nse_covers"],
+        ["override|" + head + "|" + day, "nse|" + head + "|" + twin_day,
+         "list|" + head + "|" + kind + "|" + _ratio_text(rows["Factor"]), "list_price|" + head + "|" + kind,
+         "gap|" + head + "|" + day, "nse_covers|" + head + "|" + day],
+        default="")
+    return keys
+
+
+def refuse_repeats(decided: pd.DataFrame, exchange: str) -> pd.DataFrame:
+    """Refuse a factor whose event was already applied, and flag a factor the adjusted open does not follow.
+
+    One event, one factor: the version 1 store divided POCL three times. A
+    listed factor whose Event_Key an earlier applied factor of the symbol has,
+    within TWIN_SAME_EVENT, is refused (factor 1, event "refused", flagged); on
+    BSE so is a listed factor within TWIN_SAME_EVENT of an NSE twin factor of
+    the same ratio (the twin rule already applies such a listing once; this is
+    the second guard). Then every applied factor whose day's adjusted gap,
+    |ln(gap / factor)|, is CONTINUITY_LIMIT or more is FLAGGED for a look.
+    The same function runs in the full rebuild and in the incremental
+    maintenance, so both decide alike.
+    """
+    decided = decided.copy()
+    decided["Event_Key"] = event_keys(decided, exchange)
+    applied = decided["Event"].notna() & (decided["Factor"] != 1.0)
+    listed = decided[applied & decided["Event"].isin(["list", "list_price"])]
+    refused: dict = {}
+    for _, group in listed.sort_values("Date").groupby(["Symbol", "Event_Key"]):
+        kept = None
+        for index, day in zip(group.index, group["Date"]):
+            if kept is not None and day - kept[1] <= TWIN_SAME_EVENT:
+                refused[index] = f"{FLAG_REFUSED} on {kept[1]:%Y-%m-%d} ({group.at[kept[0], 'Event_Key']})"
+            else:
+                kept = (index, day)
+    if exchange == "BSE":
+        twins = decided[applied & (decided["Event"] == "nse")]
+        if not twins.empty and not listed.empty:
+            pairs = listed.reset_index(names="Row_Index").merge(twins[["Symbol", "Date", "Factor", "Event_Key"]],
+                                                           on="Symbol", suffixes=("", "_twin"))
+            near = (pairs["Date"] - pairs["Date_twin"]).abs() <= TWIN_SAME_EVENT
+            same = pd.Series(_same_ratio(pairs["Factor"], pairs["Factor_twin"]), index=pairs.index).fillna(False)
+            for row in pairs[near & same.astype(bool)].itertuples():
+                refused.setdefault(row.Row_Index, f"{FLAG_REFUSED} on {row.Date_twin:%Y-%m-%d} ({row.Event_Key_twin})")
+    if refused:
+        index = list(refused)
+        decided.loc[index, "Factor"] = 1.0
+        decided.loc[index, "Event"] = EVENT_REFUSED
+        decided.loc[index, "Flag"] = [refused[i] for i in index]
+        module_logger.warning(f"{exchange}: {len(index)} factor(s) refused as a second application of one event: "
+                              f"{decided.loc[index, ['Symbol', 'Date', 'Flag']].to_dict('records')[:5]}")
+    applied = decided["Event"].notna() & (decided["Factor"] != 1.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        residual = np.abs(np.log(decided["Gap"] / decided["Factor"]))
+    jumpy = applied & decided["Gap"].notna() & (residual >= CONTINUITY_LIMIT) & decided["Flag"].isna()
+    decided.loc[jumpy, "Flag"] = FLAG_CONTINUITY
+    return decided
+
+
+def decide_exchange(exchange: str, raw: pd.DataFrame, actions: pd.DataFrame, securities: pd.DataFrame,
+                    overrides: pd.DataFrame, today: date, first=None, last=None, nse_days: pd.DataFrame | None = None,
+                    frozen: pd.Series | None = None, moving: pd.DataFrame | None = None
+                    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(decided rows, unmatched listings) of `exchange` for the symbols in `raw`, each with its full history.
+
+    Decisions are per symbol given the lists, the overrides, the NSE twin (for
+    BSE: `nse_days`, every NSE day of the twins with its applied Factor and
+    Event) and `frozen` (see decide), so deciding some symbols gives exactly the
+    rows the full rebuild gives them. `first`/`last` are the exchange's stored
+    range (unmatched_listings); `moving` the resolved listed actions, when known.
+    Both rebuild and the incremental maintenance (adjustment_ledger.py) call
+    this, so they cannot decide differently.
+    """
+    moving = _moving_actions(actions, securities, exchange) if moving is None else moving
+    listed = listed_days(actions, securities, raw, exchange, moving)
+    mine = overrides[overrides["Exchange"] == exchange]
+    twin, covered = (twin_inputs(raw, nse_days, securities) if exchange == "BSE" and nse_days is not None
+                     else (None, None))
+    decided = decide(raw, listed, mine, twin, covered, frozen).assign(Exchange=exchange)
+    decided = refuse_repeats(decided, exchange)
+    missed = unmatched_listings(actions, securities, raw, exchange, today, first, last, moving)
+    return decided, missed.assign(Exchange=exchange)
 
 
 def read_overrides(path: Path | None, logger: logging.Logger | None = None) -> pd.DataFrame:
@@ -473,57 +626,15 @@ def check_factors(events: pd.DataFrame, periods: pd.DataFrame) -> None:
 
 def rebuild(conn, overrides_path: Path | None = None, review_path: Path | None = None, today: date | None = None,
             logger: logging.Logger | None = None) -> dict:
-    """Decide every factor from what is stored; rewrite `adjustment_periods` and `price_adjustments` in one transaction."""
-    logger = logger or module_logger
-    today = today or market_today()
-    raw = conn.execute("SELECT * FROM raw_prices").df()
-    securities = conn.execute("SELECT Exchange, Symbol, ISIN, Series, Code FROM securities").df()
-    actions = conn.execute("SELECT * FROM exchange_actions").df()
-    overrides = read_overrides(overrides_path, logger)
-    unmatched_overrides = warn_unmatched_overrides(overrides, raw, logger)
-    decided, unmatched = {}, []
-    for exchange in ("NSE", "BSE"):
-        part = raw[raw["Exchange"] == exchange].drop(columns="Exchange")
-        listed = listed_days(actions, securities, part, exchange)
-        mine = overrides[overrides["Exchange"] == exchange]
-        twin, covered = (twin_inputs(part, decided["NSE"], securities) if exchange == "BSE" and "NSE" in decided
-                         else (None, None))
-        decided[exchange] = decide(part, listed, mine, twin, covered).assign(Exchange=exchange)
-        missed = unmatched_listings(actions, securities, part, exchange, today)
-        if not missed.empty:
-            unmatched.append(missed.assign(Exchange=exchange))
-    frames = [d for d in decided.values() if not d.empty]
-    if not frames:                                                   # an empty store: nothing to decide
-        frames = [pd.DataFrame(columns=EVENT_COLUMNS)]
-    both = pd.concat(frames, ignore_index=True)
-    events = both[both["Event"].notna() | both["Flag"].notna() | both["Listed_Kind"].notna()][EVENT_COLUMNS]
-    if unmatched:
-        events = pd.concat([events] + [m[EVENT_COLUMNS] for m in unmatched], ignore_index=True)
-    events = events.assign(Date=pd.to_datetime(events["Date"]).dt.date)
-    periods = adjustment_periods(events)
-    check_factors(events, periods)                                   # before anything is written
-    conn.register("decided_periods", periods)
-    conn.register("decided_events", events)
-    conn.execute("BEGIN TRANSACTION")
-    try:
-        conn.execute("DELETE FROM adjustment_periods")
-        conn.execute("INSERT INTO adjustment_periods SELECT * FROM decided_periods")
-        conn.execute("DELETE FROM price_adjustments")
-        conn.execute("INSERT INTO price_adjustments SELECT * FROM decided_events")
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    finally:
-        conn.unregister("decided_periods")
-        conn.unregister("decided_events")
-    review = review_list(events, today, securities)
-    if review_path is not None:
-        review.to_csv(review_path, index=False)
-    applied = events[events["Event"].notna() & (events["Factor"] != 1.0)]
-    factors = {f"{exchange} {event}": int(n) for (exchange, event), n in applied.groupby(["Exchange", "Event"]).size().items()}
-    return {"rows": len(both), "factors": factors, "flagged": int(events["Flag"].notna().sum()),
-            "review_rows": len(review), "overrides_unmatched": unmatched_overrides}
+    """Decide every factor from what is stored and write the result in one transaction: the full rebuild.
+
+    It is the oracle the incremental maintenance is held to (adjustment_ledger.py). A version 3 store gets
+    every derived table rewritten (ledger, periods, gap history, eod_prices row for row, state), checked
+    before the commit; a version 2 store its `adjustment_periods` and `price_adjustments`.
+    """
+    import adjustment_ledger                     # it builds on this module's rules
+
+    return adjustment_ledger.rebuild(conn, overrides_path, review_path, today, logger)
 
 
 def adjustment_periods(events: pd.DataFrame) -> pd.DataFrame:
@@ -569,13 +680,16 @@ def review_list(events: pd.DataFrame, today: date, securities: pd.DataFrame | No
 def refresh(conn, nse, logger: logging.Logger, overrides_path: Path | None = None, review_path: Path | None = None,
             today: date | None = None, list_start: date | None = None) -> dict:
     """After a sync: fetch the lists around today (or from `list_start`) and, when due, the whole retained
-    history; then decide and rebuild. `today` is the market's date (IST)."""
+    history; then decide: on a version 3 store only the symbols whose decisions can have changed (and the
+    weekly full verify), on version 2 everything. `today` is the market's date (IST)."""
+    import adjustment_ledger                     # it builds on this module's rules
+
     today = today or market_today()
     start, end = action_lists.window(today)
     lists = action_lists.refresh(conn, nse, list_start or start, end, logger)
     history = action_lists.refresh_history_if_due(conn, nse, today, end, logger)
-    summary = rebuild(conn, overrides_path, review_path, today, logger)
-    logger.info(f"Prices rebuilt from raw: {summary}")
+    summary = adjustment_ledger.maintain(conn, overrides_path, review_path, today, logger)
+    logger.info(f"Corporate-action factors decided ({summary.get('mode')}): {summary}")
     if summary["review_rows"]:
         logger.warning(f"{summary['review_rows']} recent price gaps need a look: {review_path}")
     return {"lists": lists, "history": history, **summary}

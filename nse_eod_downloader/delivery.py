@@ -18,6 +18,7 @@ import duckdb
 import pandas as pd
 
 import config
+from eod_store import rematerialize, schema_version
 
 STOCK_SERIES = ("EQ", "BE", "BZ", "SM", "ST")
 SME_SERIES = ("SM", "ST")
@@ -82,6 +83,12 @@ def store_delivery(report: pd.DataFrame, day: date, database: Path | None = None
                 """,
                 [day],
             )
+            if schema_version(conn) == 3:
+                # The stored adjusted rows of that day take the new figures (decisions read no delivery).
+                conn.execute("CREATE OR REPLACE TEMP TABLE late_delivery_keys AS SELECT DISTINCT 'NSE' AS Exchange, "
+                             "Symbol, CAST(? AS DATE) AS Date FROM late_delivery", [day])
+                rematerialize(conn, "late_delivery_keys", ("Exchange", "Symbol", "Date"))
+                conn.execute("DROP TABLE late_delivery_keys")
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")

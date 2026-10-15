@@ -212,7 +212,8 @@ def test_fill_missing_asks_for_a_known_special_session(data_root, monkeypatch):
     now = datetime(2026, 7, 10, 20, 0, tzinfo=config.MARKET_TIMEZONE)
     assert rebuild.rebuild(logging.getLogger("t"), years=0.02, now=now, nse_factory=FakeNSE, get=fake_get)["swapped"]
     conn = duckdb.connect(str(data_root / "NSE_BSE_EOD.duckdb"))
-    conn.execute("DELETE FROM raw_prices WHERE Date = '2026-07-04' AND Exchange = 'BSE'")
+    for table in ("raw_prices", "eod_prices"):                  # a lost session: neither raw nor adjusted rows
+        conn.execute(f"DELETE FROM {table} WHERE Date = '2026-07-04' AND Exchange = 'BSE'")
     conn.close()
     meta = data_root / "metadata" / "meta.json"
     meta.write_text(json.dumps({**json.loads(meta.read_text()), "special_sessions": ["2026-07-04T00:00:00"]}))
