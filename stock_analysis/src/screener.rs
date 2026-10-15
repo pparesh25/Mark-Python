@@ -239,9 +239,11 @@ fn mark_condition(data: &SymbolData, indicators: &MarkIndicators, index: usize) 
         && close >= low_52w * 1.50
 }
 
-/// Mark Tight is the first 60-session Donchian breakout inside the current
-/// uninterrupted Mark trend. The latest candle must still satisfy Mark and
-/// hold above the breakout level.
+/// Mark Tight is the latest 60-session Donchian breakout inside the current
+/// uninterrupted Mark trend: the most recent candle whose close crossed above
+/// the prior 60-session high (the first candle of the run counts when it is
+/// already above). The latest candle must still satisfy Mark and hold above
+/// that breakout's level.
 fn process_mark_screener(data: &SymbolData, indicators: &MarkIndicators) -> Option<MarkResult> {
     let n = data.closes.len();
     if n < 252 || !mark_condition(data, indicators, n - 1) {
@@ -253,10 +255,14 @@ fn process_mark_screener(data: &SymbolData, indicators: &MarkIndicators) -> Opti
         mark_start -= 1;
     }
 
-    let (breakout_index, breakout_level) = (mark_start..n).find_map(|index| {
+    let above_donchian = |index: usize| {
         let level = indicators.donchian_60[index];
-        (level.is_finite() && data.closes[index] > level).then_some((index, level))
+        level.is_finite() && data.closes[index] > level
+    };
+    let breakout_index = (mark_start..n).rev().find(|&index| {
+        above_donchian(index) && (index == mark_start || !above_donchian(index - 1))
     })?;
+    let breakout_level = indicators.donchian_60[breakout_index];
     if data.closes[n - 1] <= breakout_level {
         return None;
     }
@@ -283,7 +289,50 @@ fn process_mark_screener(data: &SymbolData, indicators: &MarkIndicators) -> Opti
     })
 }
 
-/// Stage 1 ("Flag") -> Stage 2 ("Tight Flag") Hierarchical Screening
+/// Deepest allowed pullback from the pole high between the peak and the
+/// breakout candle (0.20 = the flag's lows stay at or above 80% of the peak).
+pub const MAX_FLAG_DEPTH: f64 = 0.20;
+
+/// Indicators and rules use only the candles of the last this many calendar
+/// days before each exchange's latest session.  The store keeps 730 days, so
+/// every complete store has them, and machines whose stores start on
+/// different days still compute the same SMA-seeded EMAs.
+pub const HISTORY_DAYS: i64 = 700;
+
+/// First date used for indicators, given an exchange's latest session.
+pub fn history_start(latest_session: &str) -> Option<String> {
+    let latest = chrono::NaiveDate::parse_from_str(latest_session, "%Y-%m-%d").ok()?;
+    Some(
+        (latest - chrono::Duration::days(HISTORY_DAYS))
+            .format("%Y-%m-%d")
+            .to_string(),
+    )
+}
+
+/// Whether qualifying pole `candidate` (k, j_peak, low_i, i) beats `current`:
+/// the later breakout wins, then the later peak, then the start with the
+/// lowest low, then the later start.
+fn later_pole(candidate: (usize, usize, f64, usize), current: (usize, usize, f64, usize)) -> bool {
+    let (k, j, low, i) = candidate;
+    let (best_k, best_j, best_low, best_i) = current;
+    if k != best_k {
+        return k > best_k;
+    }
+    if j != best_j {
+        return j > best_j;
+    }
+    if low != best_low {
+        return low < best_low;
+    }
+    i > best_i
+}
+
+/// Stage 1 ("Flag") -> Stage 2 ("Tight Flag") Hierarchical Screening.
+///
+/// `flag_*` describe the first 90%-in-45-candles pole of the lookback window
+/// (the internal stage-1 gate).  Every candidate pole is then checked, and the
+/// qualifying pole whose breakout candle is the most recent supplies the
+/// `tight_*` dates and `breakout_date` (see `later_pole` for ties).
 fn process_flag_screener(
     data: &SymbolData,
     flag_lookback: usize,
@@ -352,6 +401,9 @@ fn process_flag_screener(
             circuit_prefix[index] + usize::from((highs[index] - lows[index]).abs() < 1e-4);
     }
 
+    // The qualifying pole with the latest breakout wins: (k, j_peak, low, i).
+    let mut best: Option<(usize, usize, f64, usize)> = None;
+
     // --- STAGE 1: Flag Pattern Detection (90%+ gain in 45 days) ---
     for i in 0..(n - 1) {
         if lows[i] <= 0.0 {
@@ -410,23 +462,33 @@ fn process_flag_screener(
                         }
 
                         if let Some(k_idx) = breakout_k {
-                            // 5. Breakout Holding Rule: Latest close > Pole Peak High
-                            if closes[n - 1] > highs[j_peak] && !is_tight_flag {
-                                is_tight_flag = true;
-                                tight_flag_date = Some(dates[j_peak].clone());
-                                tight_start_date = Some(dates[i].clone());
-                                tight_peak_date = Some(dates[j_peak].clone());
-                                breakout_date = Some(dates[k_idx].clone());
+                            // 5. Flag depth: no candle between the peak and
+                            // the breakout trades more than MAX_FLAG_DEPTH
+                            // below the pole high.
+                            let depth_floor = highs[j_peak] * (1.0 - MAX_FLAG_DEPTH);
+                            let shallow = lows[j_peak + 1..k_idx]
+                                .iter()
+                                .all(|&low| low >= depth_floor);
+                            // 6. Breakout Holding Rule: Latest close > Pole Peak High
+                            if shallow && closes[n - 1] > highs[j_peak] {
+                                let candidate = (k_idx, j_peak, lows[i], i);
+                                if best.is_none_or(|current| later_pole(candidate, current)) {
+                                    best = Some(candidate);
+                                }
                             }
                         }
                     }
                 }
             }
-
-            if is_flag && is_tight_flag {
-                break;
-            }
         }
+    }
+
+    if let Some((k_idx, j_peak, _, i)) = best {
+        is_tight_flag = true;
+        tight_flag_date = Some(dates[j_peak].clone());
+        tight_start_date = Some(dates[i].clone());
+        tight_peak_date = Some(dates[j_peak].clone());
+        breakout_date = Some(dates[k_idx].clone());
     }
 
     // Flag is only an internal 90%-in-45-days candidate gate. Returning Tight
@@ -591,6 +653,25 @@ pub fn screen_market(
         ))"
         }
     };
+    // Fixed history anchor: every machine starts the indicators on the same
+    // day, whatever the first candle its store happens to hold.
+    let mut history_terms: Vec<String> = freshness
+        .iter()
+        .filter_map(|(exchange, limits)| {
+            history_start(&limits.latest).map(|start| {
+                format!(
+                    "(e.Exchange = '{}' AND e.Date >= DATE '{start}')",
+                    exchange.replace('\'', "''")
+                )
+            })
+        })
+        .collect();
+    history_terms.sort();
+    let history_predicate = if history_terms.is_empty() {
+        "FALSE".to_string()
+    } else {
+        format!("({})", history_terms.join(" OR "))
+    };
     let escaped_fundamental_csv = fundamental_csv.replace('\'', "''");
     let bulk_eod_sql = format!(
         "WITH valid_isins AS (
@@ -611,7 +692,9 @@ pub fn screen_market(
          COALESCE(e.Volume, 0.0) \
          FROM eod_data e
          INNER JOIN valid_isins f ON f.isin = TRIM(UPPER(e.ISIN))
-         WHERE {exchange_predicate} \
+         WHERE {exchange_predicate}
+           AND {history_predicate}
+           AND e.Date <= {date_limit} \
          ORDER BY e.Exchange, e.Symbol, e.Date ASC"
     );
     let mut stmt = conn.prepare(&bulk_eod_sql)?;
@@ -920,9 +1003,184 @@ pub fn run_screener_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error
 #[cfg(test)]
 mod tests {
     use super::{
-        calculate_mark_indicators, ema_series, process_mark_screener, screen_market, ScreenOptions,
-        SymbolData,
+        calculate_mark_indicators, ema_series, history_start, process_flag_screener,
+        process_mark_screener, screen_market, ScreenOptions, SymbolData, HISTORY_DAYS,
+        MAX_FLAG_DEPTH,
     };
+
+    /// Candle builder for Tight Flag layouts: `PREFIX` flat candles at 50,
+    /// then a `LOOKBACK`-candle window addressed by local index.
+    const PREFIX: usize = 200;
+    const LOOKBACK: usize = 200;
+
+    struct Bars {
+        opens: Vec<f64>,
+        highs: Vec<f64>,
+        lows: Vec<f64>,
+        closes: Vec<f64>,
+    }
+
+    impl Bars {
+        fn new() -> Self {
+            let len = PREFIX + LOOKBACK;
+            Self {
+                opens: vec![50.0; len],
+                highs: vec![50.5; len],
+                lows: vec![49.5; len],
+                closes: vec![50.0; len],
+            }
+        }
+
+        fn set(&mut self, local: usize, open: f64, high: f64, low: f64, close: f64) {
+            let index = PREFIX + local;
+            self.opens[index] = open;
+            self.highs[index] = high;
+            self.lows[index] = low;
+            self.closes[index] = close;
+        }
+
+        fn flat(
+            &mut self,
+            locals: std::ops::RangeInclusive<usize>,
+            close: f64,
+            high: f64,
+            low: f64,
+        ) {
+            for local in locals {
+                self.set(local, close, high, low, close);
+            }
+        }
+
+        /// Rising candles whose highs go linearly from `first` to `last`.
+        fn ramp(&mut self, from: usize, to: usize, first: f64, last: f64) {
+            let step = (last - first) / (to - from) as f64;
+            for local in from..=to {
+                let high = first + step * (local - from) as f64;
+                self.set(local, high - 0.5, high, high - 1.0, high - 0.5);
+            }
+        }
+
+        fn data(self) -> SymbolData {
+            let len = self.closes.len();
+            let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+            SymbolData {
+                exchange: "NSE".to_string(),
+                symbol: "FLAG".to_string(),
+                isin: "INE000FLAG".to_string(),
+                dates: (0..len)
+                    .map(|i| {
+                        (start + chrono::Duration::days(i as i64))
+                            .format("%Y-%m-%d")
+                            .to_string()
+                    })
+                    .collect(),
+                opens: self.opens,
+                highs: self.highs,
+                lows: self.lows,
+                closes: self.closes,
+                volumes: vec![0.0; len],
+            }
+        }
+    }
+
+    fn local_date(local: usize) -> Option<String> {
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        Some(
+            (start + chrono::Duration::days((PREFIX + local) as i64))
+                .format("%Y-%m-%d")
+                .to_string(),
+        )
+    }
+
+    /// Pole A: start 0 (low 49.5), peak 40 (high 100), flag 41-47 with lows
+    /// `a_flag_low`, breakout 48.  A >50% gap at 100 walls it off from pole B:
+    /// start 100 (low 158), peak 140 (high 320), flag 141-145 with lows
+    /// `b_flag_low`, breakout 146, then holding at 326.
+    fn two_pole_layout(a_flag_low: f64, b_flag_low: f64) -> Bars {
+        let mut bars = Bars::new();
+        bars.ramp(1, 39, 51.0, 98.0);
+        bars.set(40, 98.0, 100.0, 97.0, 98.0);
+        bars.flat(41..=47, 95.0, 96.0, a_flag_low);
+        bars.set(48, 95.0, 105.0, 94.0, 101.0);
+        bars.flat(49..=99, 102.0, 104.0, 101.0);
+        bars.set(100, 160.0, 162.0, 158.0, 160.0);
+        bars.ramp(101, 139, 165.0, 315.0);
+        bars.set(140, 314.0, 320.0, 310.0, 315.0);
+        bars.flat(141..=145, 290.0, 300.0, b_flag_low);
+        bars.set(146, 300.0, 330.0, 300.0, 325.0);
+        bars.flat(147..=199, 326.0, 328.0, 324.0);
+        bars
+    }
+
+    #[test]
+    fn tight_flag_reports_the_pole_with_the_latest_breakout() {
+        let data = two_pole_layout(90.0, 270.0).data();
+        let result = process_flag_screener(&data, LOOKBACK, None).unwrap();
+
+        // flag_* still describe the first 90% pole of the window.
+        assert_eq!(result.flag_start_date, local_date(0));
+        assert_eq!(result.flag_peak_date, local_date(40));
+        // The older pole A also qualifies (breakout 48); the fresh one wins.
+        assert_eq!(result.tight_start_date, local_date(100));
+        assert_eq!(result.tight_peak_date, local_date(140));
+        assert_eq!(result.tight_flag_date, local_date(140));
+        assert_eq!(result.breakout_date, local_date(146));
+    }
+
+    #[test]
+    fn tight_flag_depth_allows_19_percent_and_rejects_21_percent() {
+        assert_eq!(MAX_FLAG_DEPTH, 0.20);
+        let passing = two_pole_layout(81.0, 320.0 * 0.81).data();
+        let result = process_flag_screener(&passing, LOOKBACK, None).unwrap();
+        assert_eq!(result.breakout_date, local_date(146));
+
+        // Both flags pull back 21%: nothing qualifies.
+        let failing = two_pole_layout(79.0, 320.0 * 0.79).data();
+        assert!(process_flag_screener(&failing, LOOKBACK, None).is_none());
+    }
+
+    #[test]
+    fn a_too_deep_fresh_flag_falls_back_to_an_older_passing_pole() {
+        let data = two_pole_layout(90.0, 320.0 * 0.79).data();
+        let result = process_flag_screener(&data, LOOKBACK, None).unwrap();
+
+        assert_eq!(result.tight_start_date, local_date(0));
+        assert_eq!(result.tight_peak_date, local_date(40));
+        assert_eq!(result.breakout_date, local_date(48));
+    }
+
+    /// After the gap at 100: starts 100-102 see peak 145 (high 320), starts
+    /// 103-105 see peak 148 (high 321); both groups break out at 151.
+    #[test]
+    fn tight_flag_ties_prefer_the_later_peak_then_the_lowest_low_then_the_later_start() {
+        let mut bars = two_pole_layout(90.0, 270.0);
+        bars.set(100, 160.0, 162.0, 158.0, 160.0);
+        bars.set(101, 160.0, 162.0, 150.0, 160.0); // lowest low, earlier peak
+        bars.set(102, 160.0, 162.0, 157.0, 160.0);
+        bars.set(103, 160.0, 162.0, 155.0, 160.0);
+        bars.set(104, 160.0, 162.0, 155.0, 160.0);
+        bars.set(105, 160.0, 162.0, 157.0, 160.0);
+        bars.ramp(106, 144, 165.0, 315.0);
+        bars.set(145, 314.0, 320.0, 310.0, 315.0);
+        bars.flat(146..=147, 290.0, 300.0, 270.0);
+        bars.set(148, 295.0, 321.0, 290.0, 300.0);
+        bars.flat(149..=150, 290.0, 300.0, 270.0);
+        bars.set(151, 300.0, 330.0, 300.0, 325.0);
+        bars.flat(152..=199, 326.0, 328.0, 324.0);
+        let result = process_flag_screener(&bars.data(), LOOKBACK, None).unwrap();
+
+        assert_eq!(result.breakout_date, local_date(151));
+        assert_eq!(result.tight_peak_date, local_date(148));
+        // 103 and 104 share the lowest low of the later-peak group.
+        assert_eq!(result.tight_start_date, local_date(104));
+    }
+
+    #[test]
+    fn history_start_is_a_fixed_number_of_days_before_the_latest_session() {
+        assert_eq!(HISTORY_DAYS, 700);
+        assert_eq!(history_start("2026-10-14").as_deref(), Some("2024-11-13"));
+        assert_eq!(history_start("not a date"), None);
+    }
 
     fn symbol_data(closes: Vec<f64>, highs: Vec<f64>) -> SymbolData {
         let len = closes.len();
@@ -939,8 +1197,9 @@ mod tests {
         }
     }
 
+    /// A close that equals the prior 60-session high is not a breakout.
     #[test]
-    fn records_the_first_real_donchian_breakout_in_the_active_mark_run() {
+    fn records_a_real_donchian_breakout_in_the_active_mark_run() {
         let mut closes = vec![100.0; 270];
         let mut highs = vec![100.0; 270];
         for i in 251..270 {
@@ -954,6 +1213,59 @@ mod tests {
         let result = process_mark_screener(&data, &indicators).unwrap();
 
         assert_eq!(result.mark_tight_date, "2024-251");
+    }
+
+    /// Crossings at 251, 260 and 265 inside one Mark run: the latest wins.
+    #[test]
+    fn mark_tight_reports_the_latest_crossing_in_the_run() {
+        let mut closes = vec![100.0; 270];
+        for (i, close) in closes.iter_mut().enumerate().skip(251) {
+            *close = match i {
+                251..=259 => 200.0,
+                260..=264 => 210.0,
+                _ => 215.0,
+            };
+        }
+        let highs = closes.clone();
+        let data = symbol_data(closes, highs);
+        let indicators = calculate_mark_indicators(&data);
+        let result = process_mark_screener(&data, &indicators).unwrap();
+
+        assert_eq!(result.mark_tight_date, "2024-265");
+    }
+
+    /// Closes rise above the prior 60-session high every day from 251, but a
+    /// 1000 high at index 10 keeps the Mark condition false until it leaves
+    /// the 52-week window at 262.
+    fn streak_from_before_the_run(closes_after_251: &[f64]) -> SymbolData {
+        let mut closes = vec![100.0; 251];
+        closes.extend_from_slice(closes_after_251);
+        let mut highs = closes.clone();
+        highs[10] = 1000.0;
+        symbol_data(closes, highs)
+    }
+
+    #[test]
+    fn mark_tight_counts_the_first_day_of_the_run_inside_an_older_streak() {
+        let rising: Vec<f64> = (0..19).map(|step| 200.0 + step as f64).collect();
+        let data = streak_from_before_the_run(&rising);
+        let indicators = calculate_mark_indicators(&data);
+        let result = process_mark_screener(&data, &indicators).unwrap();
+
+        // The streak began at 251, before the run; later streak days are not
+        // new crossings, so the run's first day is the breakout.
+        assert_eq!(result.mark_tight_date, "2024-262");
+    }
+
+    #[test]
+    fn mark_tight_moves_only_when_the_close_crosses_again() {
+        let mut path: Vec<f64> = (0..15).map(|step| 200.0 + step as f64).collect(); // 251-265
+        path.extend_from_slice(&[205.0, 220.0, 221.0, 222.0]); // 266 below, 267 crosses
+        let data = streak_from_before_the_run(&path);
+        let indicators = calculate_mark_indicators(&data);
+        let result = process_mark_screener(&data, &indicators).unwrap();
+
+        assert_eq!(result.mark_tight_date, "2024-267");
     }
 
     #[test]
@@ -1051,6 +1363,66 @@ mod tests {
         assert_eq!(
             run.datasets["NSE"].latest_session.as_deref(),
             Some("2025-10-27")
+        );
+    }
+
+    /// Screens a one-symbol store whose daily candles run from
+    /// 2025-01-01 + `first_day` to 2025-01-01 + 799.
+    fn screen_store_starting_at(first_day: usize) -> super::ScreenRun {
+        let root = std::env::temp_dir().join(format!(
+            "mark-history-anchor-{}-{}-{}",
+            first_day,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("prices.duckdb");
+        let fundamentals = root.join("fundamentals.csv");
+        std::fs::write(&fundamentals, "Name,ISIN Code\nLong,INE444D01014\n").unwrap();
+        {
+            let conn = duckdb::Connection::open(&database).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE eod_data AS
+                 SELECT CAST(DATE '2025-01-01' + CAST(i AS INTEGER) AS DATE) AS Date,
+                        'LONG' AS Symbol, 'NSE' AS Exchange, 'INE444D01014' AS ISIN,
+                        100 + 20 * SIN(i / 9.0) + i * 0.2 AS Open,
+                        102 + 20 * SIN(i / 9.0) + i * 0.2 AS High,
+                        98 + 20 * SIN(i / 9.0) + i * 0.2 AS Low,
+                        100 + 20 * SIN(i / 9.0) + i * 0.2 AS Close,
+                        1000.0 AS Volume
+                 FROM range({first_day}, 800) AS r(i)"
+            ))
+            .unwrap();
+        }
+        let run = screen_market(
+            database.to_str().unwrap(),
+            fundamentals.to_str().unwrap(),
+            "NSE",
+            &ScreenOptions::default(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        run
+    }
+
+    #[test]
+    fn history_anchor_drops_candles_older_than_history_days() {
+        let full = screen_store_starting_at(0);
+        let pruned = screen_store_starting_at(40);
+
+        let latest = full.datasets["NSE"].latest_session.clone().unwrap();
+        assert_eq!(latest, "2027-03-11");
+        let dates = &full.symbol_datasets[0].dates;
+        assert_eq!(dates.first().cloned(), history_start(&latest));
+        assert_eq!(dates.len() as i64, HISTORY_DAYS + 1);
+        // A store that lost its earliest days screens the same candles.
+        assert_eq!(pruned.symbol_datasets[0].dates, *dates);
+        assert_eq!(
+            pruned.symbol_datasets[0].closes,
+            full.symbol_datasets[0].closes
         );
     }
 }

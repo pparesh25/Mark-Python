@@ -178,6 +178,18 @@ fn format_number(value: f64) -> String {
     }
 }
 
+/// Days_Since_Breakout counts calendar days from the exchange's latest stored
+/// session, so a run on a weekend or holiday gives the same numbers as one on
+/// the last trading day.  The run date is only a fallback for an exchange with
+/// no session at all.
+fn recency_anchor(dataset: &screener::ScreenedDataset, run_date: NaiveDate) -> NaiveDate {
+    dataset
+        .latest_session
+        .as_deref()
+        .and_then(|value| parse_date(value).ok())
+        .unwrap_or(run_date)
+}
+
 fn collect_candidates(
     run_date: NaiveDate,
     fundamental: &FundamentalTable,
@@ -188,6 +200,7 @@ fn collect_candidates(
         let Some(dataset) = datasets.get(exchange) else {
             continue;
         };
+        let latest_session = recency_anchor(dataset, run_date);
         let mut marks = Vec::new();
         for result in &dataset.mark_tight_qualified {
             let Some(fundamental_row) = fundamental.row(&result.isin) else {
@@ -200,7 +213,7 @@ fn collect_candidates(
                 symbol: result.symbol.clone(),
                 isin: result.isin.clone(),
                 breakout,
-                days_since_breakout: (run_date - breakout).num_days(),
+                days_since_breakout: (latest_session - breakout).num_days(),
                 fundamental: fundamental_row.clone(),
                 result: CandidateResult::Mark(result.clone()),
             });
@@ -224,7 +237,7 @@ fn collect_candidates(
                 symbol: result.symbol.clone(),
                 isin: result.isin.clone(),
                 breakout,
-                days_since_breakout: (run_date - breakout).num_days(),
+                days_since_breakout: (latest_session - breakout).num_days(),
                 fundamental: fundamental_row.clone(),
                 result: CandidateResult::Flag(result.clone()),
             });
@@ -442,11 +455,7 @@ fn reset_chart_directories(chart_root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn render_charts(
-    jobs: &[ChartJob],
-    symbol_datasets: &[SymbolData],
-    run_date: NaiveDate,
-) -> Result<(), Box<dyn Error>> {
+fn render_charts(jobs: &[ChartJob], symbol_datasets: &[SymbolData]) -> Result<(), Box<dyn Error>> {
     let data_by_symbol: HashMap<(String, String), &SymbolData> = symbol_datasets
         .iter()
         .map(|data| ((data.exchange.clone(), data.symbol.clone()), data))
@@ -463,6 +472,12 @@ fn render_charts(
             closes: data.closes.clone(),
             volumes: data.volumes.clone(),
         };
+        // The chart ends on the symbol's own last candle, not the run date.
+        let plot_end = data
+            .dates
+            .last()
+            .and_then(|value| parse_date(value).ok())
+            .ok_or_else(|| format!("No valid last date for {} {}", job.exchange, job.symbol))?;
         let output_path = job
             .output_dir
             .join(format!("{}_{}.png", job.index, job.symbol));
@@ -471,7 +486,7 @@ fn render_charts(
             &job.symbol,
             &output_path,
             job.breakout - Duration::days(job.strategy.plot_days()),
-            run_date,
+            plot_end,
             job.pattern_start,
             job.pattern_end,
             Some(job.breakout),
@@ -592,7 +607,7 @@ pub fn run_pipeline_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
     reset_chart_directories(chart_root)?;
     let jobs = prepare_chart_jobs(chart_root, &grouped, &fundamental);
     let chart_started = std::time::Instant::now();
-    render_charts(&jobs, &run.symbol_datasets, run_date)?;
+    render_charts(&jobs, &run.symbol_datasets)?;
     println!(
         "⏱️ Rust charts: {:.2}s ({} images)",
         chart_started.elapsed().as_secs_f64(),
@@ -608,10 +623,11 @@ pub fn run_pipeline_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        output_headers, prepare_chart_jobs, run_date_from_timestamp, sort_candidates,
-        write_watchlist, Candidate, CandidateGroups, CandidateResult, FundamentalTable, Strategy,
+        collect_candidates, output_headers, prepare_chart_jobs, run_date_from_timestamp,
+        sort_candidates, write_watchlist, Candidate, CandidateGroups, CandidateResult,
+        FundamentalTable, Strategy,
     };
-    use crate::screener::{FlagResult, MarkResult};
+    use crate::screener::{FlagResult, MarkResult, ScreenedDataset};
     use chrono::NaiveDate;
     use std::collections::HashMap;
     use std::fs;
@@ -644,11 +660,59 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_date_is_used_for_reproducible_recency() {
+    fn timestamp_date_is_the_fallback_recency_anchor() {
         assert_eq!(
             run_date_from_timestamp("20260730_120000").unwrap(),
             NaiveDate::from_ymd_opt(2026, 7, 30).unwrap()
         );
+    }
+
+    fn dataset_with_latest_session(latest: Option<&str>) -> HashMap<String, ScreenedDataset> {
+        let Candidate {
+            result: CandidateResult::Mark(result),
+            ..
+        } = mark("FRIDAY", "2026-10-05")
+        else {
+            unreachable!()
+        };
+        let dataset = ScreenedDataset {
+            exchange: "NSE".to_string(),
+            fundamental_isins: 1,
+            selected_symbols: 1,
+            history_ready: 1,
+            max_history: 300,
+            latest_session: latest.map(str::to_string),
+            stale_skipped: 0,
+            mark_tight_qualified: vec![result],
+            tight_flag_qualified: Vec::new(),
+        };
+        HashMap::from([("NSE".to_string(), dataset)])
+    }
+
+    #[test]
+    fn days_since_breakout_counts_from_the_exchange_latest_session() {
+        let fundamentals = FundamentalTable {
+            headers: vec!["ISIN Code".to_string()],
+            header_index: HashMap::from([("ISIN Code".to_string(), 0)]),
+            rows_by_isin: HashMap::from([(
+                "ISIN-FRIDAY".to_string(),
+                vec!["ISIN-FRIDAY".to_string()],
+            )]),
+        };
+        let days = |run_date: NaiveDate, latest: Option<&str>| {
+            let grouped =
+                collect_candidates(run_date, &fundamentals, dataset_with_latest_session(latest))
+                    .unwrap();
+            grouped[&("NSE".to_string(), Strategy::MarkTight)][0].days_since_breakout
+        };
+        let friday = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let sunday = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
+
+        // Breakout Monday 2026-10-05, last session Friday 2026-10-09.
+        assert_eq!(days(friday, Some("2026-10-09")), 4);
+        assert_eq!(days(sunday, Some("2026-10-09")), 4);
+        // Only an exchange without any session falls back to the run date.
+        assert_eq!(days(sunday, None), 6);
     }
 
     #[test]

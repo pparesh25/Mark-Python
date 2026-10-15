@@ -184,6 +184,25 @@ optimized two-request HTTP flow.  An older local file is used only when
    by latest breakout and exports all CSVs, OpenTrader Pro watchlists and
    charts. Screening data is reused for charting, so DuckDB is not read again.
 
+### Breakout rules (Rust engine 0.4.0 and later)
+
+- **Mark Tight** reports the latest breakout of the current Mark trend: the
+  most recent day the close crossed above the prior 60-session high. Only the
+  latest close has to stay above that day's level.
+- **Tight Flag** checks every pole of the last 90 candles and reports the
+  qualifying pole with the latest breakout. A flag may pull back at most 20%
+  from the pole high before the breakout.
+- **Days_Since_Breakout** counts calendar days from the exchange's latest
+  stored session, so a weekend or holiday run ranks like the last trading day.
+  Charts end on the symbol's last candle.
+- Indicators use only the last 700 calendar days before each exchange's latest
+  session, so two machines with the same latest session get the same EMAs
+  even when their stores begin on different days.
+
+These rules are in the precompiled engine, so a machine gets them only after
+installing a `rust-v*` release built from version 0.4.0 or later (see
+`RUST_BINARIES.md`); the run log prints the engine version.
+
 ### Prices, splits, bonuses and demergers
 
 The store keeps every session **as the exchange published it** (`raw_prices`,
@@ -208,8 +227,9 @@ of the same company carry the same factor. In order:
    alone and written to `Database/corporate_action_review.csv` for a look.
 
 Volume and delivery are adjusted like prices. Two years of raw prices are kept
-(`config.EOD_RETAIN_YEARS`); a thinly traded stock with fewer than 252 sessions
-in that window is skipped by the screener. `compact_price_database.py --apply`
+(`config.EOD_RETAIN_YEARS`); the engine reads the last 700 days of them, and a
+thinly traded stock with fewer than 252 sessions in that window is skipped by
+the screener. `compact_price_database.py --apply`
 copies the store into a fresh file to give back the space deleted rows hold.
 `run_screener.py --skip-sync` screens a store made elsewhere without touching it.
 

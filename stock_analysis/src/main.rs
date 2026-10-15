@@ -188,12 +188,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::HashMap;
     let mut eod_cache = HashMap::new();
 
-    let mut stmt = conn.prepare("
+    // Same fixed history anchor as the screens, so chart EMAs match the rules.
+    let mut stmt = conn.prepare(&format!(
+        "
         SELECT CAST(Date AS VARCHAR), COALESCE(Open, 0.0), COALESCE(High, 0.0), COALESCE(Low, 0.0), COALESCE(Close, 0.0), COALESCE(Volume, 0.0)
-        FROM eod_data 
-        WHERE Symbol = ? AND Exchange = ? 
+        FROM eod_data
+        WHERE Symbol = ? AND Exchange = ?
+          AND Date >= (SELECT CAST(MAX(Date) - INTERVAL '{} days' AS DATE)
+                       FROM eod_data WHERE Exchange = ?)
         ORDER BY Date ASC
-    ")?;
+    ",
+        screener::HISTORY_DAYS
+    ))?;
 
     for task in &tasks {
         let symbol = &task.symbol;
@@ -209,7 +215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let mut rows = stmt.query([symbol, exchange])?;
+        let mut rows = stmt.query([symbol, exchange, exchange])?;
         let mut dates = Vec::new();
         let mut opens = Vec::new();
         let mut highs = Vec::new();

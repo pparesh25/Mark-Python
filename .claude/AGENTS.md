@@ -124,23 +124,43 @@ Conditions: close > EMA 50 > EMA 150 > EMA 200 AND close >= 80% of 52w high
 AND close >= 150% of 52w low.  EMAs are SMA-seeded and rounded to 2 decimals.
 Walk back from the latest candle to find the start of the active setup.
 
+### History anchor
+All indicators, rules and charts use only candles dated on or after the
+exchange's latest session minus `HISTORY_DAYS` (700 calendar days, a Rust
+constant in `screener.rs`).  The store keeps 730 days, so machines whose stores
+start on different days still seed the EMAs on the same candle.  A series
+needs at least 252 candles in that window.
+
 ### Mark Tight
-First candle inside the active Mark run whose close exceeds the prior
-60-session Donchian high; the latest close must still be above that level.
+The latest breakout inside the active Mark run: the most recent candle whose
+close crossed above the prior 60-session Donchian high (close above it while
+the previous close was not, or the run's first candle when it is already
+above).  Each pullback below the level followed by a new cross starts a new
+breakout.  Only the latest close must still be above that breakout's level.
 That candle's date = `Mark_Tight_Date`.
 
 ### Tight Flag
 Within the last `FLAG_LOOKBACK_DAYS` candles: a 90%+ run-up within 45
 candles (pole longer than 3 candles, no >50% gap, <=40% circuit candles), a
-close above the pole high within 15 candles of the peak, and the latest close
-still above it.  Latest close >= 5, >= EMA 200 and within 45% of the 52w high.
-`flag_*` columns describe the first 90% pole; `tight_*`/`breakout_date` (and
-the chart lines) describe the qualifying pole.
+close above the pole high within 15 candles of the peak, no low between the
+peak and that breakout candle more than `MAX_FLAG_DEPTH` (20%) below the pole
+high, and the latest close still above the pole high.  Latest close >= 5,
+>= EMA 200 and within 45% of the 52w high.  Every candidate pole is checked;
+the qualifying pole with the latest breakout candle is reported (ties: later
+peak, then the start with the lowest low, then the later start).
+`flag_*` columns describe the first 90% pole (stage-1 gate); `tight_*`,
+`breakout_date` and the chart lines describe the reported pole.
 
 ### Ranking
-Each output is sorted by `Days_Since_Breakout` (calendar days from the run
-date), then newer breakout, then symbol.  CSVs add `Last_Date` and all
-Screener.in columns; `EOD_Down_From_52w_High` is computed from EOD data.
+Each output is sorted by `Days_Since_Breakout` (calendar days from the
+exchange's latest stored session to the breakout, so a weekend or holiday run
+gives the same numbers as the last trading day), then newer breakout, then
+symbol.  Charts end on the symbol's last candle.  CSV and watchlist file names
+still use the run timestamp.  CSVs add `Last_Date` and all Screener.in
+columns; `EOD_Down_From_52w_High` is computed from EOD data.
+
+These rules live in the Rust engine (0.4.0 and later); a machine gets them
+only after installing a `rust-v*` release built from it.
 
 ## Known Issues & Gotchas
 
