@@ -29,7 +29,10 @@ OpenTrader Pro watchlists.
 ### Core Pipeline (run_screener.py)
 1. **Step 1** — `screening_readiness.py` decides whether an EOD session is
    missing; if so `nse_eod_downloader/` and `bse_eod_downloader/` update the
-   DuckDB store through `eod_store.py`.  Missing recent sessions are logged.
+   DuckDB store through `eod_store.py`.  Missing sessions over the whole
+   stored range are logged; `rebuild_eod_database.py --fill-missing` adds them.
+   After the sync `eod_maintenance.py` refreshes the action lists and decides
+   the corporate-action factors (`price_adjustments.py`, IST dates).
 2. **Step 2** — `fundamental_downloader.py`: two-request HTTP export from
    screener.in (screen 3427564) into `all-company_YYYYMMDD.csv`.
 3. **Steps 3-4** — `stock_analysis` (Rust) `pipeline` subcommand: ISIN join
@@ -159,7 +162,19 @@ Screener.in columns; `EOD_Down_From_52w_High` is computed from EOD data.
 
 5. **Existing data is not repaired automatically**: gaps from older syncs and
    pre-fix corporate-action or ticker-reuse damage stay in an existing DuckDB
-   until repaired or rebuilt.
+   until repaired or rebuilt (`rebuild_eod_database.py --fill-missing` adds
+   missing sessions in place).
+
+6. **Special sessions**: meta.json learns special sessions only from NSE
+   circulars and keeps the current year's holiday list; sessions from before
+   that are in `screening_readiness.KNOWN_SPECIAL_SESSIONS` (add new budget or
+   Muhurat sessions there when a rebuild must know them). A Muhurat day is in
+   NSE's holiday list as "Laxmi Pujan" and is still a session on both exchanges.
+
+7. **Corporate-action overrides**: `Database/metadata/corporate_action_overrides.csv`
+   rows need Factor as a plain number in [0.001, 1000]; bad or unmatched rows
+   are skipped with a warning, and a non-finite or non-positive factor is
+   refused before anything is written.
 
 ## Git Workflow
 

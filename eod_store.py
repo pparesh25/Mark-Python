@@ -6,6 +6,8 @@ Tables (schema version 2):
     raw_prices         Date, Symbol, Exchange, Open, High, Low, Close, Volume, Total_Trades, Dlv_Qty
                        exactly as the exchange published the day -- never adjusted in place
     exchange_actions   the exchanges' corporate-action lists, as fetched (action_lists.py)
+    action_list_history Exchange, From_Date, To_Date, Fetched_On: the last time each exchange's whole
+                       retained list was fetched (asked again after 30 days)
     price_adjustments  every factor decided and why (price_adjustments.py)
     adjustment_periods Exchange, Symbol, From_Date, Adj: the product of a symbol's later factors, valid
                        from From_Date to the next period -- rewritten by price_adjustments.rebuild
@@ -119,6 +121,16 @@ def create_schema(conn) -> None:
             Kind VARCHAR,
             Factor DOUBLE,
             Fetched_At TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS action_list_history (
+            Exchange VARCHAR NOT NULL,
+            From_Date DATE,
+            To_Date DATE,
+            Fetched_On DATE
         )
         """
     )

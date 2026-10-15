@@ -14,7 +14,7 @@ import pandas as pd
 import requests
 import tzlocal
 import config
-from screening_readiness import clear_session_attempts, presume_session_closed
+from screening_readiness import clear_session_attempts, is_special_session_day, presume_session_closed
 
 from .holidays import load_holidays_from_meta, load_special_sessions_from_meta, is_special_session
 from .stock_data import update_bse_eod
@@ -134,7 +134,11 @@ def sync_database(
         curDt = dates.dt.strftime("%d-%b-%Y")
         is_weekend = dates.dt.weekday() in (5, 6)
         is_holiday = curDt in holidays
-        is_special = is_special_session(dates.dt.replace(tzinfo=None), special_sessions)
+        # A special session (a circular's, a known one) or Muhurat trading, which
+        # NSE's list names a holiday ("Laxmi Pujan"): BSE trades it too. Only the
+        # circular's sessions counted here, so a Muhurat session was skipped.
+        is_special = (is_special_session(dates.dt.replace(tzinfo=None), special_sessions)
+                      or is_special_session_day(dates.dt.date(), holidays, ()))
 
         if is_weekend and not is_special:
             meta["lastUpdate"] = dates.dt.isoformat()

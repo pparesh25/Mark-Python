@@ -201,3 +201,45 @@ def test_a_bse_day_keeps_its_scrip_code_for_matching_actions(tmp_path, monkeypat
     code = conn.execute("SELECT Code FROM securities WHERE Symbol = 'BSEONLY'").fetchone()
     conn.close()
     assert result is True and code == ("500001",)
+
+
+class _MuhuratDates(eod_downloader.Dates):
+    """Walk Saturday 2026-11-07 and Sunday 2026-11-08 (Muhurat trading)."""
+
+    def nextDate(self):
+        self.dt = self.dt + timedelta(1)
+        if self.dt.date() > date(2026, 11, 8):
+            return False
+        self.pandasDt = self.dt.strftime("%Y-%m-%d")
+        return True
+
+
+def test_a_muhurat_session_on_a_listed_holiday_is_stored_not_skipped(tmp_path, monkeypatch):
+    # NSE's list names the Muhurat day a holiday ("Diwali Laxmi Pujan"); the BSE
+    # sync skipped every holiday and weekend not in meta's special sessions.
+    database = tmp_path / "prices.duckdb"
+    _seed_database(database, pd.DataFrame(columns=["Date", "Symbol", "Exchange", "ISIN", "Open", "High", "Low",
+                                                   "Close", "Volume", "Series"]))
+    monkeypatch.setattr(config, "DUCKDB_FILE", database)
+    monkeypatch.setattr(eod_downloader, "Dates", _MuhuratDates)
+    asked = []
+
+    class _Session:
+        headers = {}
+
+        def get(self, url, timeout):
+            asked.append(url)
+            return _Response(200, _bhavcopy_bytes()) if "BhavCopy" in url else _Response(404)
+
+    monkeypatch.setattr(eod_downloader.requests, "Session", _Session)
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    (metadata / "meta.json").write_text(json.dumps({"holidays": {"08-Nov-2026": "Diwali Laxmi Pujan*"},
+                                                    "special_sessions": []}), encoding="utf-8")
+    (metadata / "bse_meta.json").write_text(json.dumps({"lastUpdate": "2026-11-06T00:00:00+05:30"}), encoding="utf-8")
+
+    assert eod_downloader.sync_database(tmp_path / "text", Mock(), metadata, tmp_path / "daily") is True
+    conn = duckdb.connect(str(database), read_only=True)
+    rows = conn.execute("SELECT Symbol, Date FROM raw_prices").fetchall()
+    conn.close()
+    assert rows == [("BSEONLY", date(2026, 11, 8))] and not any("20261107" in url for url in asked)

@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import pandas as pd
 import tzlocal
 import config
-from screening_readiness import EOD_READY_TIME
+from screening_readiness import EOD_READY_TIME, KNOWN_SPECIAL_SESSIONS
 
 from .delivery import update_pending_delivery_data
 from .holidays import (
@@ -138,7 +138,8 @@ def _check_reports_update_status(nse: NSE, dates: Dates) -> Dict[str, bool]:
 def _check_for_holidays(nse: NSE, dates: Dates, meta: dict, logger: logging.Logger) -> bool:
     curDt = dates.dt.strftime("%d-%b-%Y")
 
-    if is_special_session(dates.dt.replace(tzinfo=None), meta.get("special_sessions", [])):
+    if (is_special_session(dates.dt.replace(tzinfo=None), meta.get("special_sessions", []))
+            or dates.dt.date() in KNOWN_SPECIAL_SESSIONS):
         return False
 
     if (
@@ -182,9 +183,9 @@ def _get_muhurat_holiday_info(holidays: Dict[str, List[dict]]) -> dict:
 def _check_special_sessions(nse: NSE, meta: dict, dates: Dates, logger: logging.Logger, tz_IN: ZoneInfo) -> bool:
     last_update_str = meta.get("special_sessions_last_update", None)
 
+    meta.setdefault("special_sessions", [])         # sessions already learnt are kept, never reset
     if last_update_str is None:
         last_update = (dates.dt - timedelta(5)).replace(tzinfo=None)
-        meta["special_sessions"] = []
     else:
         last_update = datetime.fromisoformat(last_update_str)
 

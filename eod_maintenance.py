@@ -1,4 +1,5 @@
-"""After every sync: keep two years, fetch the action lists around today, decide the factors.
+"""After every sync: keep two years, fetch the action lists around today (and the whole retained
+history when it was last fetched more than 30 days ago), decide the factors.
 
     from eod_maintenance import maintain
     maintain(logger)          # run_screener.py calls it after the NSE and BSE syncs
@@ -15,7 +16,7 @@ Database/corporate_action_review.csv for a look.
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime
 
 import duckdb
 
@@ -45,7 +46,12 @@ def open_nse(logger: logging.Logger):
 
 
 def maintain(logger: logging.Logger, nse_factory=open_nse, today: date | None = None) -> dict:
-    """Retention, action lists and factors on the live store; raises on an old (version 1) store."""
+    """Retention, action lists and factors on the live store; raises on an old (version 1) store.
+
+    `today` is the market's date (config.MARKET_TIMEZONE), not the machine's: a run
+    in another time zone must ask for the same list window and review period.
+    """
+    today = today or datetime.now(config.MARKET_TIMEZONE).date()
     conn = duckdb.connect(str(config.DUCKDB_FILE))
     nse = None
     try:
@@ -62,5 +68,5 @@ def maintain(logger: logging.Logger, nse_factory=open_nse, today: date | None = 
         if nse is not None:
             try:
                 nse.exit()
-            except Exception:
-                pass
+            except Exception as error:               # closing the session is best effort
+                logger.debug(f"NSE session did not close cleanly: {error}")

@@ -71,6 +71,18 @@ def test_holiday_decisions_cover_weekend_weekday_and_special_session():
     ) is False
 
 
+def test_a_known_special_session_is_not_skipped_and_learnt_sessions_are_kept():
+    dates = _dates("2025-02-01T00:00:00+05:30")  # Saturday: Union Budget session
+    dates.today = datetime(2025, 2, 2)
+    assert eod._check_for_holidays(Mock(), dates, {"holidays": {}, "year": 2025}, _logger()) is False
+
+    nse = Mock()
+    nse.circulars.return_value = {"data": []}
+    meta = {"special_sessions": ["2026-02-01T00:00:00"]}             # no special_sessions_last_update
+    eod._check_special_sessions(nse, meta, _dates("2026-03-02T00:00:00+05:30"), _logger(), TZ_IN)
+    assert meta["special_sessions"] == ["2026-02-01T00:00:00"]       # used to be reset to []
+
+
 def test_symbol_rename_preserves_duckdb_history_without_text_copy(
     tmp_path, monkeypatch
 ):
@@ -171,7 +183,32 @@ def test_unpublished_delivery_figure_is_stored_as_missing(tmp_path, monkeypatch)
     ]
 
 
-def test_pending_delivery_updates_daily_file_and_cleans_download(tmp_path):
+def _store_with(tmp_path, monkeypatch, rows):
+    """A temporary price store holding `rows` (Symbol, Volume) for NSE 2024-05-02, as the sync stored them."""
+    database = tmp_path / "prices.duckdb"
+    conn = duckdb.connect(str(database))
+    create_compact_schema(conn)
+    for n, (symbol, volume) in enumerate(rows):
+        upsert_daily_prices(conn, pd.DataFrame([{
+            "Date": "2024-05-02", "Symbol": symbol, "Exchange": "NSE", "ISIN": f"INE00000{n}011",
+            "Open": 100, "High": 100, "Low": 90, "Close": 95, "Volume": volume, "Series": "EQ",
+        }]))
+    conn.close()
+    monkeypatch.setattr(config, "DUCKDB_FILE", database)
+    return database
+
+
+def _stored_delivery(database):
+    conn = duckdb.connect(str(database), read_only=True)
+    try:
+        return {s: (t, d) for s, t, d in conn.execute(
+            "SELECT Symbol, Total_Trades, Dlv_Qty FROM raw_prices WHERE Date = '2024-05-02'").fetchall()}
+    finally:
+        conn.close()
+
+
+def test_pending_delivery_updates_daily_file_and_cleans_download(tmp_path, monkeypatch):
+    database = _store_with(tmp_path, monkeypatch, [("ABC", 900)])
     daily = tmp_path / "20240502_BENNY_NSE_EOD.txt"
     pd.DataFrame([{
         "Symbol": "ABC", "Date": "2024-05-02",
@@ -194,11 +231,13 @@ def test_pending_delivery_updates_daily_file_and_cleans_download(tmp_path):
     assert int(result.loc[0, "TOTAL_TRADES"]) == 100
     assert int(result.loc[0, "DLV_QTY"]) == 500
     assert not report.exists()
+    assert _stored_delivery(database) == {"ABC": (100, 500)}       # the store the screener reads has it too
 
 
-def test_pending_delivery_keeps_an_unpublished_figure_empty(tmp_path):
+def test_pending_delivery_keeps_an_unpublished_figure_empty(tmp_path, monkeypatch):
     # NSE writes " -" where a figure is not published; float() on that string
     # used to abort the whole late-delivery update for the day.
+    database = _store_with(tmp_path, monkeypatch, [("ABC", 900), ("NODLV", 400)])
     daily = tmp_path / "20240502_BENNY_NSE_EOD.txt"
     pd.DataFrame([
         {
@@ -232,6 +271,48 @@ def test_pending_delivery_keeps_an_unpublished_figure_empty(tmp_path):
     assert pd.isna(result.loc["NODLV", "QTY_PER_TRADE"])
     assert pd.isna(result.loc["NODLV", "DLV_QTY"])
     assert not report.exists()
+    assert _stored_delivery(database) == {"ABC": (100, 500), "NODLV": (None, None)}
+
+
+def test_a_late_delivery_report_reaches_raw_prices_without_a_text_copy(tmp_path, monkeypatch):
+    # The sync stored the day without delivery; the report came the next day.
+    # It used to rewrite only the optional text file, so the store kept NULLs
+    # forever while the date left DLV_PENDING_DATES.
+    database = _store_with(tmp_path, monkeypatch, [("ABC", 900), ("TFT", 700), ("SMEX_SME", 3000), ("NOTINFILE", 50)])
+    report = tmp_path / "delivery.csv"
+    pd.DataFrame([
+        {"SYMBOL": "ABC", " SERIES": " EQ", " DATE1": " 02-May-2024", " NO_OF_TRADES": 100, " DELIV_QTY": 500},
+        {"SYMBOL": "TFT", " SERIES": " BE", " DATE1": " 02-May-2024", " NO_OF_TRADES": 30, " DELIV_QTY": " -"},
+        {"SYMBOL": "SMEX", " SERIES": " SM", " DATE1": " 02-May-2024", " NO_OF_TRADES": 12, " DELIV_QTY": 2400},
+        {"SYMBOL": "BOND1", " SERIES": " N1", " DATE1": " 02-May-2024", " NO_OF_TRADES": 2, " DELIV_QTY": 10},
+    ]).to_csv(report, index=False)
+    nse = Mock()
+    nse.deliveryBhavcopy.return_value = report
+
+    assert eod._update_pending_delivery_data(nse, "2024-05-02T00:00:00+05:30", None, _logger(), TZ_IN) is True
+    assert _stored_delivery(database) == {"ABC": (100, 500), "TFT": (30, 700),     # trade-for-trade: volume
+                                          "SMEX_SME": (12, 2400), "NOTINFILE": (None, None)}
+    assert not report.exists()
+
+
+def test_a_late_delivery_report_the_store_could_not_take_stays_pending(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DUCKDB_FILE", tmp_path / "missing-folder" / "prices.duckdb")
+    report = tmp_path / "delivery.csv"
+    pd.DataFrame([{"SYMBOL": "ABC", " SERIES": " EQ", " NO_OF_TRADES": 100, " DELIV_QTY": 500}]).to_csv(report, index=False)
+    nse = Mock()
+    nse.deliveryBhavcopy.return_value = report
+    assert eod._update_pending_delivery_data(nse, "2024-05-02T00:00:00+05:30", None, _logger(), TZ_IN) is False
+
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    (tmp_path / "data").mkdir()
+    meta_file = metadata / "meta.json"
+    meta_file.write_text(json.dumps({"lastUpdate": "2024-05-03T00:00:00+05:30",
+                                     "DLV_PENDING_DATES": ["2024-05-02T00:00:00+05:30"]}), encoding="utf-8")
+    deps = _failing_sync_deps(Mock())
+    deps = SyncDependencies(**{**deps.__dict__, "update_pending_delivery": lambda *args: False})
+    sync_database(tmp_path / "data", _logger(), metadata, None, deps)
+    assert json.loads(meta_file.read_text(encoding="utf-8"))["DLV_PENDING_DATES"] == ["2024-05-02T00:00:00+05:30"]
 
 
 def test_index_update_only_adds_normalized_daily_bhavcopy_row(tmp_path):
