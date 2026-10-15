@@ -50,6 +50,8 @@ OpenTrader Pro watchlists.
 | `stock_analysis/src/pipeline.rs` | Fundamentals join, ranking, CSV/watchlist/chart output |
 | `stock_analysis/src/chart.rs` | PNG charts (plotters, embedded DejaVu fonts) |
 | `install_rust_binary.py` | Installs the prebuilt engine from a `rust-v*` release |
+| `run_fingerprint.py` | Per-run input/output fingerprint JSON and the two-run comparison CLI |
+| `run_scheduled.sh`, `schedule_setup.sh`, `Mark_Python.sh` | macOS launchd schedule and interpreter selection |
 
 ### Config Details (config.py)
 - `DATA_ROOT` = `~/Mark EMA and HTF` (or `MARK_DATA_ROOT` / `--data-root`)
@@ -59,7 +61,7 @@ OpenTrader Pro watchlists.
 - Screener screen ID = 3427564
 - Output: `qualified_stocks/<NSE|BSE>/<mark_tight|Tight Flag>/`
 - Charts: `chart_images/<NSE|BSE>/<mark_tight|Tight Flag>/`
-- Logs: `logs/screening_log_{timestamp}.txt`
+- Logs: `logs/screening_log_{timestamp}.txt` and `logs/run_fingerprint_{timestamp}.json`
 - OpenTrader Pro watchlists in `~/.opentrader-pro/databases/<NSE|BSE>_EOD/watchlists/`
 
 ## Setup & Running
@@ -87,7 +89,22 @@ python -m pytest -q tests
 
 # Fundamentals download only (needs Screener login/screener.txt):
 python fundamental_downloader.py
+
+# Compare two runs (e.g. Windows vs Mac) -- see README "Comparing two machines":
+python -m run_fingerprint run_fingerprint_A.json run_fingerprint_B.json
 ```
+
+### Scheduler (macOS)
+- `schedule_setup.sh` generates the LaunchAgent plist (`com.paresh.markscreener`)
+  from its own directory and loads it (`launchctl bootstrap gui/$(id -u)`,
+  fallback `load`); `schedule_uninstall.sh` removes it.  No static plist is tracked.
+- Runs Monday-Friday at 19:30 IST plus at login; `SCHEDULE_HOUR`/`SCHEDULE_MINUTE`/
+  `SCHEDULE_WEEKDAYS` live only in `run_scheduled.sh`.  It runs when the last
+  successful run is older than the latest passed slot; `--force`, `--dry-run`,
+  `MARK_SCHEDULER_NOW` (epoch) for tests.
+- `Mark_Python.sh` picks `$MARK_PYTHON`, then `.venv/bin/python`, then a conda env
+  `mark_screener` under `~/miniforge3`, `~/miniconda3`, `~/anaconda3`,
+  `/opt/homebrew/Caskroom/miniforge/base`; it never relies on `conda` on PATH.
 
 ### Credentials
 - File: `~/Mark EMA and HTF/Screener login/screener.txt`
@@ -157,7 +174,14 @@ Screener.in columns; `EOD_Down_From_52w_High` is computed from EOD data.
 
 4. **Saturday bhavcopy fix**: Weekend check added to skip Saturday (original code only skipped Sunday, causing 404 on Saturday and aborting entire sync loop).
 
-5. **Existing data is not repaired automatically**: gaps from older syncs and
+5. **Two machines, different lists**: the engine is deterministic; differences
+   come from each machine's store (latest session, missing sessions, v1 store,
+   history start) or fundamentals file.  Compare the runs' fingerprint JSONs
+   with `python -m run_fingerprint`; a `RESULTS MAY DIFFER` warning in the log
+   means NSE/BSE as-of dates differed or the run fell back to local data.
+   `requirements.txt` pins duckdb/numpy/pandas exactly for the same reason.
+
+6. **Existing data is not repaired automatically**: gaps from older syncs and
    pre-fix corporate-action or ticker-reuse damage stay in an existing DuckDB
    until repaired or rebuilt.
 

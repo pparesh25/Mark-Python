@@ -41,8 +41,9 @@ Thumbs.db
 /chart_images/
 /qualified_stocks/
 
-# Shell scripts
-/Mark_Python.sh
+# launchd plist: schedule_setup.sh generates it from the project directory
+# and writes it to ~/Library/LaunchAgents; an old static copy is not tracked.
+/com.paresh.markscreener.plist
 
 # EOD Data Folder
 /NSE_EOD/

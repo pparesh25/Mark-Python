@@ -96,6 +96,41 @@ unset GITHUB_TOKEN
 Pass `--skip-rust` to a setup script only when the correct prebuilt
 binary was already installed manually.
 
+### Scheduled runs (macOS)
+
+```bash
+./schedule_setup.sh       # install / reinstall the LaunchAgent
+./schedule_uninstall.sh   # remove it
+```
+
+The pipeline runs **Monday-Friday at 19:30** machine local time (IST), and at
+login.  19:30 rather than 18:00: 18:00 IST is the earliest time a day's EOD
+may be downloaded, and the NSE/BSE files are often published later, so a run
+at exactly 18:00 often screened the previous session from local data.
+`schedule_setup.sh` generates the plist (label `com.paresh.markscreener`) from
+its own directory -- the project can live anywhere -- writes it to
+`~/Library/LaunchAgents` and loads it with `launchctl bootstrap` (falling back
+to `launchctl load` on old macOS).  The time and weekdays are set once, at the
+top of `run_scheduled.sh`.
+
+`run_scheduled.sh` runs the pipeline only when the last successful run
+(`logs/.last_scheduled_run` in the project) is older than the most recent
+scheduled slot that has already passed: Monday 08:00 after Friday's run does
+nothing, Monday 08:00 after a missed Friday runs at once, weekends never run.
+`./run_scheduled.sh --force` runs now; `--dry-run` only prints the decision.
+Scheduler output goes to `logs/scheduler_stdout.log` and `scheduler_stderr.log`.
+
+`Mark_Python.sh` (used by the scheduler) picks the interpreter in this order and
+logs which one it used; launchd's PATH is minimal, so `conda` is never needed
+on PATH:
+
+1. `$MARK_PYTHON`, when set (it must be executable);
+2. `<project>/.venv/bin/python` (made by `setup_macos.sh`);
+3. a conda environment named `mark_screener` under `~/miniforge3`,
+   `~/miniconda3`, `~/anaconda3` or `/opt/homebrew/Caskroom/miniforge/base`.
+
+Otherwise it prints what it looked for and exits with an error.
+
 ## Daily commands
 
 ```text
@@ -220,7 +255,53 @@ three failed runs and three days.  Always check the run log for
 `EOD update incomplete/unavailable` and for `price data is missing ... recent
 session(s)` before treating the database as current.  The log also prints the
 Rust engine version and sha256, so two machines can confirm they run the same
-engine.
+engine.  When NSE and BSE end on different sessions, or the run screens local
+data because a sync stopped, the log shows a `RESULTS MAY DIFFER` warning where
+it happens and again in the final summary.
+
+## Comparing two machines
+
+Two machines on the same commit and engine can still produce different lists:
+the engine is deterministic, but each machine screens its own price store.  A
+run before the day's files are published screens the previous session (one
+session changed 35 of 293 qualifiers in October 2026); missing sessions, an old
+version 1 store, a different history start or a fundamentals file downloaded at
+another time do the same.  Every run therefore writes
+`logs/run_fingerprint_YYYYMMDD_HHMMSS.json` next to its log and prints a short
+`Run fingerprint` block.  To compare:
+
+1. run both machines after 19:30 IST on the same trading day (the schedule does
+   this), so both have the day's NSE and BSE files;
+2. copy one fingerprint to the other machine and run
+
+```bash
+python -m run_fingerprint run_fingerprint_A.json run_fingerprint_B.json        # --all also lists times/paths
+```
+
+It prints only the fields that differ, names the sessions two stores disagree
+on and the symbols only one machine qualified, and exits 1 when anything that
+can change results differs.  The fields:
+
+| Field | Meaning |
+|-------|---------|
+| `run` | run timestamp (IST), the machine's local time and zone, `platform.platform()`, the Python executable -- expected to differ |
+| `packages` | Python, pandas, numpy and duckdb versions (pinned in `requirements.txt`) |
+| `engine` | Rust engine version, full sha256 and path |
+| `settings` | `FLAG_LOOKBACK_DAYS`, `MAX_STALE_SESSIONS`, SME options, the 18:00 EOD cutoff |
+| `data_as_of` | NSE/BSE latest local session, the eligible target, `as_of_mismatch`, `local_fallback` (screened older data than the target), `sync_stopped`, and the warnings |
+| `fundamentals` | file name, sha256, modified time (IST), rows and distinct ISINs |
+| `overrides` | whether `corporate_action_overrides.csv` exists, and its sha256 |
+| `store.schema_version` | 2 for the current store, 1 for an old store that still needs `rebuild_eod_database.py` |
+| `store.exchanges` | per exchange: rows, sessions, first/last date, symbols, and `content_hash` of exactly what the engine reads (`eod_data`: symbol, date, OHLC to 1/10000, volume) |
+| `store.tables` | rows and a content hash of each table (factors, actions, securities); `raw_prices` is only counted |
+| `store.exchange_actions` | rows of the exchanges' corporate-action lists per exchange |
+| `store.sessions` | rows and hash per session -- the comparison names the sessions that differ |
+| `outputs` | per list (`NSE/mark_tight`, ...): count, hash and the (symbol, breakout date) pairs from the written CSVs |
+| `elapsed_seconds` | time the fingerprint took (about 4-8 s on 3.8 million rows) |
+
+The hashes use text whose form does not depend on the OS or the DuckDB
+version, and they ignore row order, so equal hashes mean equal data on Windows,
+macOS and Linux alike.  A failure while fingerprinting only logs a warning.
 
 ## Outputs
 
@@ -230,6 +311,7 @@ All ordinary outputs live below the configured data root:
 qualified_stocks/<exchange>/<strategy>/
 chart_images/<exchange>/<strategy>/
 logs/screening_log_YYYYMMDD_HHMMSS.txt
+logs/run_fingerprint_YYYYMMDD_HHMMSS.json
 ```
 
 CSV files are timestamped.  Strategy chart directories are regenerated on

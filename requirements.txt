@@ -1,9 +1,14 @@
+# duckdb, numpy and pandas compute the stored and adjusted prices, so they are
+# pinned exactly: two machines with different versions can produce different
+# results from the same data.  These are the Mac's working set (2026-10); bump
+# them together, on every machine at once.  numpy 2.2.6 has wheels for Python
+# 3.10-3.13 (the setup scripts prefer 3.11).
 # Cross-platform runtime used by the precompiled Rust pipeline.
-duckdb>=1.3,<2
+duckdb==1.5.4
 # NSE API client used by nse_eod_downloader (server extra provides httpx[http2]).
 nse[server]==3.2.1
-numpy>=2.0,<3
-pandas>=2.2,<3
+numpy==2.2.6
+pandas==2.3.3
 python-dateutil>=2.9,<3
 requests>=2.31,<3
 tzlocal>=5.2,<6

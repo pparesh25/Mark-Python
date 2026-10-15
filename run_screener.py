@@ -23,7 +23,6 @@ Windows and Linux launchers create/use a project-local virtual environment;
 the normal precompiled-Rust path does not require TA-Lib.
 """
 
-import hashlib
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -34,6 +33,7 @@ from datetime import datetime
 from pathlib import Path
 
 import config
+import run_fingerprint
 from screening_readiness import (
     LocalDataError,
     find_missing_sessions,
@@ -190,24 +190,41 @@ def validate_fundamentals(logger):
                       f"{age_min:.0f} min ago)", 'GREEN'))
 
 
-def describe_rust_binary(binary: Path) -> str:
-    """Identify the Rust engine so runs on different machines can be compared."""
-    digest = hashlib.sha256()
-    with open(binary, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+def describe_rust_binary(binary: Path, info: dict | None = None) -> str:
+    """Identify the Rust engine so runs on different machines can be compared.
+
+    The log line keeps a 16-character checksum; the run fingerprint JSON has
+    the full sha256.
+    """
+    info = info or run_fingerprint.engine_info(binary)
+    return f"{info['version']} | sha256 {info['sha256'][:16]} | {info['path']}"
+
+
+def consistency_warning(logger, warnings: list, message: str) -> None:
+    """Log a result-changing data condition prominently; the final summary repeats it.
+
+    Two machines screening different sessions produce different lists (one
+    session flipped 35 of 293 qualifiers in the 2026-10 comparison), so this
+    must not hide among ordinary progress lines.
+    """
+    if message in warnings:
+        return
+    warnings.append(message)
+    banner = '!' * 64
+    logger.warning(color(banner, 'YELLOW'))
+    logger.warning(color(f"  RESULTS MAY DIFFER: {message}", 'YELLOW'))
+    logger.warning(color(banner, 'YELLOW'))
+
+
+def write_run_fingerprint(logger, fingerprint: dict | None) -> None:
+    """Write the fingerprint JSON; any failure is only a warning."""
+    if fingerprint is None:
+        return
     try:
-        version = subprocess.run(
-            [str(binary), "--version"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError) as error:
-        version = f"version unavailable ({error})"
-    return f"{version or 'version unavailable'} | sha256 {digest.hexdigest()[:16]} | {binary}"
+        path = run_fingerprint.write(fingerprint)
+        logger.info(f"  Run fingerprint written: {path}")
+    except Exception as error:  # noqa: BLE001 - never stop the run for a fingerprint
+        logger.warning(f"  Run fingerprint could not be written: {error}")
 
 
 def report_missing_sessions(logger):
@@ -382,6 +399,11 @@ def main():
         logger.info(color("  OpenTrader watchlists: disabled", 'CYAN'))
     logger.info(color('═' * width, 'CYAN'))
 
+    # Conditions that make this run's lists differ from a run on fully
+    # current data; logged where found and repeated in the final summary.
+    consistency_warnings: list[str] = []
+    sync_stopped = False
+
     # --- Step 1: EOD update only when a locally eligible session is missing
     logger.info(color("▶ Step 1/4: EOD Data Update (eod2)", 'BOLD'))
     store_ready = args.skip_sync or ensure_current_store(logger)
@@ -448,9 +470,11 @@ def main():
             fallback_as_of = ", ".join(
                 f"{exchange}={value:%Y-%m-%d}" for exchange, value in after_update.as_of_dates.items()
             )
-            logger.warning(
-                "  EOD update incomplete/unavailable; continuing on local data "
-                f"({fallback_as_of}; target {after_update.target_date:%Y-%m-%d})."
+            sync_stopped = True
+            consistency_warning(
+                logger, consistency_warnings,
+                "EOD update incomplete/unavailable; continuing on local data "
+                f"({fallback_as_of}; target {after_update.target_date:%Y-%m-%d}).",
             )
         else:
             logger.info(color(f"  ✓ EOD update completed in {time.time() - t0:.1f}s", 'GREEN'))
@@ -522,15 +546,75 @@ def main():
             'CYAN',
         )
     )
+    as_of_text = ", ".join(
+        f"{exchange}={value:%Y-%m-%d}" for exchange, value in sorted(readiness.as_of_dates.items())
+    )
+    if len(set(readiness.as_of_dates.values())) > 1:
+        consistency_warning(
+            logger, consistency_warnings,
+            f"NSE and BSE local data end on different sessions ({as_of_text}).",
+        )
+    if readiness.needs_update:
+        consistency_warning(
+            logger, consistency_warnings,
+            f"screening local fallback data ({as_of_text}), older than the eligible "
+            f"target {readiness.target_date:%Y-%m-%d}.",
+        )
 
     # --- Steps 3 & 4: screening -------------------------------------------
+    engine = None
     if config.RUST_BINARY.exists():
-        logger.info(f"  Rust engine: {describe_rust_binary(config.RUST_BINARY)}")
+        try:
+            engine = run_fingerprint.engine_info(config.RUST_BINARY)
+            logger.info(f"  Rust engine: {describe_rust_binary(config.RUST_BINARY, engine)}")
+        except Exception as error:  # noqa: BLE001 - the engine step reports a real failure
+            logger.warning(f"  Rust engine could not be identified: {error}")
+
+    fingerprint = None
+    try:
+        fingerprint = run_fingerprint.collect(
+            engine=engine,
+            readiness=readiness,
+            local_fallback=readiness.needs_update,
+            sync_stopped=sync_stopped,
+            warnings=consistency_warnings,
+            include_sme=args.include_sme,
+            only_sme=args.only_sme,
+        )
+        if (fingerprint.get("store") or {}).get("schema_version") == 1:
+            consistency_warning(
+                logger, consistency_warnings,
+                "the price store is an old version 1 store (not rebuilt); its prices can "
+                "differ from a version 2 store.",
+            )
+        if isinstance(fingerprint.get("data_as_of"), dict):
+            fingerprint["data_as_of"]["warnings"] = list(consistency_warnings)
+        logger.info(color("  Run fingerprint:", 'CYAN'))
+        for line in run_fingerprint.summary_lines(fingerprint):
+            logger.info(f"    {line}")
+    except Exception as error:  # noqa: BLE001 - fingerprinting never stops the run
+        logger.warning(f"  Run fingerprint unavailable: {error}")
+    write_run_fingerprint(logger, fingerprint)
+
     run_all_screening(
         logger,
         include_sme=args.include_sme,
         only_sme=args.only_sme,
     )
+
+    if fingerprint is not None:
+        try:
+            run_fingerprint.add_outputs(fingerprint)
+            if isinstance(fingerprint.get("data_as_of"), dict):
+                fingerprint["data_as_of"]["warnings"] = list(consistency_warnings)
+            outputs = fingerprint.get("outputs") or {}
+            if "error" not in outputs:
+                logger.info("  Run fingerprint outputs: " + (" | ".join(
+                    f"{name} {info['count']} #{info['hash'][:16]}" for name, info in outputs.items()
+                ) or "none written"))
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"  Run fingerprint outputs unavailable: {error}")
+        write_run_fingerprint(logger, fingerprint)
 
     # --- Summary ----------------------------------------------------------
     total = time.time() - workflow_start
@@ -554,7 +638,14 @@ def main():
                 logger.info(
                     f"    {path.relative_to(config.OPENTRADER_ROOT)}"
                 )
+    if consistency_warnings:
+        logger.warning(color(
+            "  RESULTS MAY DIFFER from a run on complete, current data:", 'YELLOW'))
+        for message in consistency_warnings:
+            logger.warning(color(f"    ! {message}", 'YELLOW'))
     logger.info(color(f"  Full log: {config.LOG_FILE}", 'CYAN'))
+    if fingerprint is not None:
+        logger.info(color(f"  Run fingerprint: {run_fingerprint.fingerprint_path()}", 'CYAN'))
     logger.info(color('═' * width, 'CYAN'))
 
 
