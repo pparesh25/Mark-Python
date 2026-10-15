@@ -132,12 +132,16 @@ start on different days still seed the EMAs on the same candle.  A series
 needs at least 252 candles in that window.
 
 ### Mark Tight
-The latest breakout inside the active Mark run: the most recent candle whose
-close crossed above the prior 60-session Donchian high (close above it while
-the previous close was not, or the run's first candle when it is already
-above).  Each pullback below the level followed by a new cross starts a new
-breakout.  Only the latest close must still be above that breakout's level.
-That candle's date = `Mark_Tight_Date`.
+The latest breakout that still holds inside the active Mark run.  A breakout
+is a candle whose close crossed above the prior 60-session Donchian high
+(close above it while the previous close was not, or the run's first candle
+when it is already above); each pullback below the level followed by a new
+cross starts a new breakout.  The reported breakout is the most recent one
+whose level is still below the latest close, so a newer breakout the price
+has fallen back from does not hide an older one that holds.  With none
+holding the symbol does not qualify.  That candle's date = `Mark_Tight_Date`.
+Every symbol the first-breakout rule (0.3.0) qualified still qualifies, with
+the same or a later date, apart from differences the history anchor makes.
 
 ### Tight Flag
 Within the last `FLAG_LOOKBACK_DAYS` candles: a 90%+ run-up within 45

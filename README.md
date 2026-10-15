@@ -186,9 +186,10 @@ optimized two-request HTTP flow.  An older local file is used only when
 
 ### Breakout rules (Rust engine 0.4.0 and later)
 
-- **Mark Tight** reports the latest breakout of the current Mark trend: the
-  most recent day the close crossed above the prior 60-session high. Only the
-  latest close has to stay above that day's level.
+- **Mark Tight** reports the latest breakout of the current Mark trend that
+  still holds: of the days the close crossed above the prior 60-session high,
+  the most recent one whose level is still below the latest close. A newer
+  breakout the price fell back from does not hide an older one that holds.
 - **Tight Flag** checks every pole of the last 90 candles and reports the
   qualifying pole with the latest breakout. A flag may pull back at most 20%
   from the pole high before the breakout.

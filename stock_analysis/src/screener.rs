@@ -239,11 +239,12 @@ fn mark_condition(data: &SymbolData, indicators: &MarkIndicators, index: usize) 
         && close >= low_52w * 1.50
 }
 
-/// Mark Tight is the latest 60-session Donchian breakout inside the current
-/// uninterrupted Mark trend: the most recent candle whose close crossed above
-/// the prior 60-session high (the first candle of the run counts when it is
-/// already above). The latest candle must still satisfy Mark and hold above
-/// that breakout's level.
+/// Mark Tight is the latest 60-session Donchian breakout that still holds
+/// inside the current uninterrupted Mark trend.  A breakout is a candle whose
+/// close crossed above the prior 60-session high (the first candle of the run
+/// counts when it is already above); the reported one is the most recent
+/// breakout whose level is still below the latest close.  The latest candle
+/// must also satisfy Mark.
 fn process_mark_screener(data: &SymbolData, indicators: &MarkIndicators) -> Option<MarkResult> {
     let n = data.closes.len();
     if n < 252 || !mark_condition(data, indicators, n - 1) {
@@ -259,13 +260,14 @@ fn process_mark_screener(data: &SymbolData, indicators: &MarkIndicators) -> Opti
         let level = indicators.donchian_60[index];
         level.is_finite() && data.closes[index] > level
     };
+    let latest_close = data.closes[n - 1];
+    // A newer crossing the price has since fallen back below does not hide
+    // an older one that still holds.
     let breakout_index = (mark_start..n).rev().find(|&index| {
-        above_donchian(index) && (index == mark_start || !above_donchian(index - 1))
+        above_donchian(index)
+            && (index == mark_start || !above_donchian(index - 1))
+            && latest_close > indicators.donchian_60[index]
     })?;
-    let breakout_level = indicators.donchian_60[breakout_index];
-    if data.closes[n - 1] <= breakout_level {
-        return None;
-    }
 
     let down_52w_high = (((indicators.high_52w[n - 1] - data.closes[n - 1])
         / indicators.high_52w[n - 1])
@@ -1234,6 +1236,27 @@ mod tests {
         assert_eq!(result.mark_tight_date, "2024-265");
     }
 
+    /// Same crossings, but the latest close (205) has fallen back below the
+    /// 265 crossing's level (210): the 260 crossing (level 200) still holds.
+    #[test]
+    fn mark_tight_reports_the_latest_crossing_that_still_holds() {
+        let mut closes = vec![100.0; 270];
+        for (i, close) in closes.iter_mut().enumerate().skip(251) {
+            *close = match i {
+                251..=259 => 200.0,
+                260..=264 => 210.0,
+                265..=268 => 215.0,
+                _ => 205.0,
+            };
+        }
+        let highs = closes.clone();
+        let data = symbol_data(closes, highs);
+        let indicators = calculate_mark_indicators(&data);
+        let result = process_mark_screener(&data, &indicators).unwrap();
+
+        assert_eq!(result.mark_tight_date, "2024-260");
+    }
+
     /// Closes rise above the prior 60-session high every day from 251, but a
     /// 1000 high at index 10 keeps the Mark condition false until it leaves
     /// the 52-week window at 262.
@@ -1268,8 +1291,9 @@ mod tests {
         assert_eq!(result.mark_tight_date, "2024-267");
     }
 
+    /// The run's only crossing (252, level 300) no longer holds at 250.
     #[test]
-    fn requires_the_latest_close_to_hold_the_breakout_level() {
+    fn mark_tight_does_not_qualify_when_no_crossing_holds() {
         let mut closes = vec![100.0; 270];
         let mut highs = vec![100.0; 270];
         for high in highs.iter_mut().take(251).skip(191) {

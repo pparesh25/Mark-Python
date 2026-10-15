@@ -32,7 +32,8 @@ stock_analysis/bin/darwin-aarch64/stock_analysis
 
 The screening rules live in this executable, so a rule change reaches a
 machine only when a new `rust-v*` release is tagged and installed. Version
-0.4.0 changes the rules (latest Mark Tight and Tight Flag breakouts, a 20%
+0.4.0 changes the rules (latest holding Mark Tight breakout, latest Tight
+Flag breakout, a 20%
 flag-depth limit, Days_Since_Breakout from the latest session, a fixed
 700-day history window; see README). It takes the same command-line arguments
 as 0.3.0, so the Python launcher works with either version.
