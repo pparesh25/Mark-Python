@@ -18,27 +18,36 @@ import rebuild_eod_database as rebuild
 ISIN = "INE123A01016"
 HOLIDAY = datetime(2026, 7, 8)
 SPLIT_DAY = datetime(2026, 7, 9)
+WEEKEND_SESSIONS: set = set()            # weekend days the fake exchanges traded (a budget Saturday)
+OLD_NAME_ON: dict = {}                   # day -> the ticker NSE used for ISIN that day (before a rename)
 
 
 def price(day: datetime) -> float:
     return 1000.0 if day < SPLIT_DAY else 201.0
 
 
+def closed(day) -> bool:
+    day = day.date() if isinstance(day, datetime) else day
+    return day == HOLIDAY.date() or (day.weekday() >= 5 and day not in WEEKEND_SESSIONS)
+
+
 class FakeNSE:
     def __init__(self):
         self.asked = []
+        self.delivery_asked = []
 
     def equityBhavcopy(self, day, folder):
         self.asked.append(day.date())
-        if day.date() == HOLIDAY.date():
+        if closed(day):
             raise RuntimeError("NSE file is unavailable or not yet updated.")
         p = price(day)
-        pd.DataFrame([{"ISIN": ISIN, "TckrSymb": "SPLITCO", "SctySrs": "EQ", "OpnPric": p, "HghPric": p,
-                       "LwPric": p, "ClsPric": p, "TtlTradgVol": 1000}]).to_csv(
+        pd.DataFrame([{"ISIN": ISIN, "TckrSymb": OLD_NAME_ON.get(day.date(), "SPLITCO"), "SctySrs": "EQ",
+                       "OpnPric": p, "HghPric": p, "LwPric": p, "ClsPric": p, "TtlTradgVol": 1000}]).to_csv(
             folder / f"BhavCopy_NSE_CM_0_0_0_{day:%Y%m%d}_F_0000.csv", index=False)
 
     def deliveryBhavcopy(self, day, folder):
-        if day.date() == HOLIDAY.date():
+        self.delivery_asked.append(day.date())
+        if closed(day):
             raise RuntimeError("NSE file is unavailable or not yet updated.")
         pd.DataFrame([{"SYMBOL": "SPLITCO", " SERIES": " EQ", " DATE1": f" {day:%d-%b-%Y}", " NO_OF_TRADES": 50,
                        " DELIV_QTY": 600}]).to_csv(folder / f"sec_bhavdata_full_{day:%d%m%Y}.csv", index=False)
@@ -58,6 +67,9 @@ class Response:
         self.status_code, self.content, self.text = status, content, text
 
 
+BSE_ASKED: list = []
+
+
 def fake_get(url, headers=None, params=None, timeout=None):
     if "CorpactCSVDownload" in url:
         return Response(200, text="Security Code,Security Name,Company Name,Ex Date,Purpose,Record Date\n")
@@ -65,7 +77,8 @@ def fake_get(url, headers=None, params=None, timeout=None):
     if "SCBSEALL" in url:
         ddmm, year = url.rsplit("SCBSEALL", 1)[1][:4], int(url.split("/gross/")[1][:4])
         day = datetime(year, int(ddmm[2:]), int(ddmm[:2]))
-    if day.date() == HOLIDAY.date():
+    BSE_ASKED.append(day.date())
+    if closed(day):
         return Response(404)
     if "SCBSEALL" in url:
         member = io.BytesIO()
@@ -92,6 +105,9 @@ def data_root(tmp_path, monkeypatch):
         monkeypatch.setattr(config, name, value)
     monkeypatch.setattr(rebuild, "RETRY_WAITS", ())
     monkeypatch.setattr(rebuild, "BSE_PAUSE", 0)
+    WEEKEND_SESSIONS.clear()
+    OLD_NAME_ON.clear()
+    BSE_ASKED.clear()
     old = duckdb.connect(str(database / "NSE_BSE_EOD.duckdb"))            # a version 1 store to replace
     old.execute("CREATE TABLE eod_prices (Date DATE, Symbol VARCHAR, Exchange VARCHAR, Close DOUBLE)")
     old.close()
@@ -103,6 +119,7 @@ def test_a_rebuild_stores_raw_days_decides_the_split_and_swaps_the_old_store_out
     report = rebuild.rebuild(logging.getLogger("t"), years=0.02, now=now, nse_factory=FakeNSE, get=fake_get)
 
     assert report["swapped"] is True and report["holidays"] == ["2026-07-08"] and report["holes"] == []
+    assert report["weekend_sessions"] == []
     assert (data_root / "NSE_BSE_EOD.v1-backup.duckdb").exists()
     conn = duckdb.connect(str(data_root / "NSE_BSE_EOD.duckdb"), read_only=True)
     rows = conn.execute("SELECT Exchange, Date, Close, Volume, Dlv_Qty FROM eod_data ORDER BY Exchange, Date").df()
@@ -117,6 +134,92 @@ def test_a_rebuild_stores_raw_days_decides_the_split_and_swaps_the_old_store_out
     assert meta["lastUpdate"].startswith("2026-07-10") and "equityActions" not in meta
     assert "equityActions" in json.loads((data_root / "metadata" / "meta.json.before-rebuild").read_text())
     assert json.loads((data_root / "metadata" / "bse_meta.json").read_text())["lastUpdate"].startswith("2026-07-10")
+    conn = duckdb.connect(str(data_root / "NSE_BSE_EOD.duckdb"), read_only=True)
+    history = conn.execute("SELECT Exchange, Fetched_On FROM action_list_history ORDER BY Exchange").fetchall()
+    conn.close()
+    # NSE's list came (a split); BSE's answered empty, so its history is asked again by the maintenance
+    assert history == [("NSE", datetime(2026, 7, 10).date())]
+
+
+def _rows(data_root, sql):
+    conn = duckdb.connect(str(data_root / "NSE_BSE_EOD.duckdb"), read_only=True)
+    try:
+        return conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+
+def test_a_saturday_session_no_calendar_lists_is_found_and_stored(data_root):
+    # 2025-02-01 (Union Budget, a Saturday) was in no calendar the first rebuild
+    # had, so it asked neither exchange and both lost the day.
+    saturday, sunday = datetime(2026, 7, 4).date(), datetime(2026, 7, 5).date()
+    WEEKEND_SESSIONS.add(saturday)
+    nse = FakeNSE()
+    now = datetime(2026, 7, 10, 20, 0, tzinfo=config.MARKET_TIMEZONE)
+    report = rebuild.rebuild(logging.getLogger("t"), years=0.02, now=now, nse_factory=lambda: nse, get=fake_get)
+
+    assert report["swapped"] is True and report["weekend_sessions"] == ["2026-07-04"] and report["holes"] == []
+    assert _rows(data_root, "SELECT Exchange, count(*) FROM raw_prices WHERE Date = '2026-07-04' GROUP BY 1 "
+                            "ORDER BY 1") == [("BSE", 1), ("NSE", 1)]
+    # an ordinary Sunday costs one NSE request: no delivery file, no BSE request
+    assert sunday in nse.asked and sunday not in nse.delivery_asked and sunday not in BSE_ASKED
+
+
+def test_fill_missing_adds_a_lost_session_under_todays_symbols_and_decides_again(data_root):
+    saturday = datetime(2026, 7, 4).date()
+    WEEKEND_SESSIONS.add(saturday)
+    OLD_NAME_ON[saturday] = "OLDNAME"                     # NSE's ticker for the ISIN back then
+    now = datetime(2026, 7, 10, 20, 0, tzinfo=config.MARKET_TIMEZONE)
+    assert rebuild.rebuild(logging.getLogger("t"), years=0.02, now=now, nse_factory=FakeNSE, get=fake_get)["swapped"]
+    conn = duckdb.connect(str(data_root / "NSE_BSE_EOD.duckdb"))
+    conn.execute("DELETE FROM raw_prices WHERE Date = '2026-07-04'")        # a store built before the fix
+    conn.close()
+
+    report = rebuild.fill_missing(logging.getLogger("t"), now=now, nse_factory=FakeNSE, get=fake_get)
+
+    assert report["found"] == ["2026-07-04"] and report["failed"] == [] and report["still_missing"] == {}
+    assert report["stored"] == {"2026-07-04 NSE": 1, "2026-07-04 BSE": 1}
+    assert _rows(data_root, "SELECT Exchange, Symbol, Close FROM eod_data WHERE Date = '2026-07-04' ORDER BY 1") == [
+        ("BSE", "SPLITCO", pytest.approx(200.1)), ("NSE", "SPLITCO", pytest.approx(200.0))]   # adjusted, today's name
+    assert _rows(data_root, "SELECT DISTINCT Symbol FROM securities") == [("SPLITCO",)]          # nothing renamed
+    assert _rows(data_root, "SELECT Exchange, Event FROM price_adjustments WHERE Event IS NOT NULL ORDER BY 1") == [
+        ("BSE", "nse"), ("NSE", "list")]
+
+
+class FlakyWeekendNSE(FakeNSE):
+    """NSE drops the connection when asked about Sunday 2026-07-05 (not its "no file" page)."""
+
+    def equityBhavcopy(self, day, folder):
+        if day.date() == datetime(2026, 7, 5).date():
+            self.asked.append(day.date())
+            raise ConnectionError("connection reset by peer")
+        return super().equityBhavcopy(day, folder)
+
+
+def test_a_weekend_nse_could_not_be_asked_about_is_a_failed_day_not_a_weekend_off(data_root):
+    now = datetime(2026, 7, 10, 20, 0, tzinfo=config.MARKET_TIMEZONE)
+    report = rebuild.rebuild(logging.getLogger("t"), years=0.02, now=now, nse_factory=FlakyWeekendNSE, get=fake_get)
+    assert report["swapped"] is False and [f[:10] for f in report["failed"]] == ["2026-07-05"]
+
+    assert rebuild.rebuild(logging.getLogger("t"), years=0.02, now=now, nse_factory=FakeNSE, get=fake_get)["swapped"]
+    filled = rebuild.fill_missing(logging.getLogger("t"), now=now, nse_factory=FlakyWeekendNSE, get=fake_get)
+    assert [f[:10] for f in filled["failed"]] == ["2026-07-05"]
+
+
+def test_fill_missing_asks_for_a_known_special_session(data_root, monkeypatch):
+    saturday = datetime(2026, 7, 4).date()
+    WEEKEND_SESSIONS.add(saturday)
+    now = datetime(2026, 7, 10, 20, 0, tzinfo=config.MARKET_TIMEZONE)
+    assert rebuild.rebuild(logging.getLogger("t"), years=0.02, now=now, nse_factory=FakeNSE, get=fake_get)["swapped"]
+    conn = duckdb.connect(str(data_root / "NSE_BSE_EOD.duckdb"))
+    conn.execute("DELETE FROM raw_prices WHERE Date = '2026-07-04' AND Exchange = 'BSE'")
+    conn.close()
+    meta = data_root / "metadata" / "meta.json"
+    meta.write_text(json.dumps({**json.loads(meta.read_text()), "special_sessions": ["2026-07-04T00:00:00"]}))
+
+    report = rebuild.fill_missing(logging.getLogger("t"), now=now, nse_factory=FakeNSE, get=fake_get)
+    assert report["expected_missing"] == {"2026-07-04": ["BSE"]} and report["stored"] == {"2026-07-04 BSE": 1}
+    assert report["still_missing"] == {}
 
 
 def test_a_day_one_exchange_did_not_answer_keeps_the_old_store(data_root):

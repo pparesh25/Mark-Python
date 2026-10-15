@@ -348,9 +348,9 @@ def write_run_fingerprint(logger, fingerprint: dict | None) -> None:
 
 
 def report_missing_sessions(logger):
-    """Warn about trading sessions that are absent from the local database."""
+    """Warn about trading sessions absent from the local database, over the whole retained range."""
     try:
-        missing = find_missing_sessions(config.DUCKDB_FILE, config.EOD_METADATA_DIR)
+        missing = find_missing_sessions(config.DUCKDB_FILE, config.EOD_METADATA_DIR, lookback_days=None)
     except LocalDataError as error:
         logger.warning(f"  Missing-session check skipped: {error}")
         return
@@ -358,8 +358,9 @@ def report_missing_sessions(logger):
         shown = ", ".join(f"{day:%Y-%m-%d}" for day in days[:10])
         more = f" (+{len(days) - 10} more)" if len(days) > 10 else ""
         logger.warning(color(
-            f"  {exchange} price data is missing {len(days)} recent session(s): "
-            f"{shown}{more}. Results can differ from a machine that has them.",
+            f"  {exchange} price data is missing {len(days)} session(s): "
+            f"{shown}{more}. Results can differ from a machine that has them; "
+            "`python rebuild_eod_database.py --fill-missing` adds them.",
             'YELLOW',
         ))
 

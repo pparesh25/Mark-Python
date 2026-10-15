@@ -6,7 +6,7 @@
 Every sync already keeps only two years of raw prices (config.EOD_RETAIN_YEARS),
 but DuckDB does not shrink a file when rows are deleted. This copies every
 table of the version 2 store (securities, raw_prices within the window,
-exchange_actions, price_adjustments, adjustment_periods) into a new file,
+exchange_actions, price_adjustments, adjustment_periods, action_list_history) into a new file,
 recreates the views, checks the row counts and only then swaps it in.
 """
 
@@ -23,6 +23,7 @@ import config
 from eod_store import create_schema, schema_version
 
 TABLES = ("securities", "raw_prices", "exchange_actions", "price_adjustments", "adjustment_periods")
+OPTIONAL_TABLES = ("action_list_history",)          # absent from stores made before it existed
 
 
 def build_compact_database(source: Path, target: Path, years: float) -> None:
@@ -40,7 +41,9 @@ def build_compact_database(source: Path, target: Path, years: float) -> None:
         create_schema(conn)
         last = conn.execute("SELECT max(Date) FROM source_db.raw_prices").fetchone()[0]
         cutoff = (pd.Timestamp(last) - pd.Timedelta(days=round(365.25 * years))).date() if last else None
-        for table in TABLES:
+        present = {row[0] for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_catalog = 'source_db'").fetchall()}
+        for table in TABLES + tuple(t for t in OPTIONAL_TABLES if t in present):
             where = " WHERE Date >= ?" if table == "raw_prices" and cutoff else ""
             conn.execute(f"INSERT INTO {table} SELECT * FROM source_db.{table}{where}",
                          [cutoff] if where else [])

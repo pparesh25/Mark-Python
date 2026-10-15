@@ -25,6 +25,19 @@ MISSING_SESSION_ATTEMPTS = 3
 MISSING_SESSION_MIN_AGE_DAYS = 3
 MISSING_SESSION_KEY = "missingSessionAttempts"
 SKIPPED_SESSION_KEY = "skippedSessions"
+# Sessions outside the normal Monday-Friday calendar, or on a day NSE's list
+# names a holiday, that both exchanges traded.  meta.json learns special
+# sessions only from NSE circulars published after the downloader first ran,
+# and keeps the holiday list of the current year only, so a rebuild of two
+# years never knew 2025-02-01 (Union Budget, a Saturday) and skipped it.
+# Muhurat sessions on a weekday are listed too, for years whose holiday list
+# (which marks them "Laxmi Pujan") is no longer cached.
+KNOWN_SPECIAL_SESSIONS = frozenset({
+    date(2024, 11, 1),      # Muhurat trading (Diwali), Friday
+    date(2025, 2, 1),       # Union Budget, Saturday
+    date(2025, 10, 21),     # Muhurat trading (Diwali), Tuesday
+    date(2026, 2, 1),       # Union Budget, Sunday
+})
 
 
 class LocalDataError(RuntimeError):
@@ -42,19 +55,22 @@ class EodReadiness:
 
 
 def _read_calendar(metadata_dir: Path) -> tuple[dict[str, str], set[date]]:
-    """Read the cached NSE calendar without contacting the exchange."""
+    """Read the cached NSE calendar without contacting the exchange.
+
+    The special sessions are meta.json's and KNOWN_SPECIAL_SESSIONS.
+    """
     meta_file = metadata_dir / "meta.json"
     if not meta_file.exists():
-        return {}, set()
+        return {}, set(KNOWN_SPECIAL_SESSIONS)
     try:
         meta = json.loads(meta_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {}, set()
+        return {}, set(KNOWN_SPECIAL_SESSIONS)
 
     holidays = meta.get("holidays", {})
     if not isinstance(holidays, dict):
         holidays = {}
-    special_sessions: set[date] = set()
+    special_sessions: set[date] = set(KNOWN_SPECIAL_SESSIONS)
     for value in meta.get("special_sessions", []):
         try:
             special_sessions.add(datetime.fromisoformat(value).date())
@@ -63,13 +79,20 @@ def _read_calendar(metadata_dir: Path) -> tuple[dict[str, str], set[date]]:
     return holidays, special_sessions
 
 
+def is_muhurat(day: date, holidays: Mapping[str, str]) -> bool:
+    """Muhurat trading is stored by NSE as a holiday ("Laxmi Pujan"), but is still a session."""
+    return "laxmi pujan" in str(holidays.get(day.strftime("%d-%b-%Y"), "")).lower()
+
+
+def is_special_session_day(day: date, holidays: Mapping[str, str], special_sessions) -> bool:
+    """A session on a weekend or listed holiday: meta's special sessions, the known ones, or Muhurat."""
+    return day in special_sessions or day in KNOWN_SPECIAL_SESSIONS or is_muhurat(day, holidays)
+
+
 def _is_trading_day(day: date, holidays: Mapping[str, str], special_sessions: set[date]) -> bool:
-    if day in special_sessions:
+    if is_special_session_day(day, holidays, special_sessions):
         return True
     holiday = holidays.get(day.strftime("%d-%b-%Y"), "")
-    # Muhurat trading is stored by NSE as a holiday, but is still a session.
-    if "laxmi pujan" in str(holiday).lower():
-        return True
     return day.weekday() < 5 and not holiday
 
 
@@ -154,13 +177,15 @@ def clear_session_attempts(meta: dict, session: date) -> None:
 def find_missing_sessions(
     database: Path,
     metadata_dir: Path,
-    lookback_days: int = 120,
+    lookback_days: int | None = 120,
 ) -> dict[str, list[date]]:
-    """List recent trading sessions absent from each exchange's price data.
+    """List trading sessions absent from each exchange's price data.
 
-    A session is expected when either exchange stored it, or when the cached
-    NSE calendar says it was a trading day (only for years the cached holiday
-    list covers).  The check never touches the network.
+    `lookback_days` counts back from the store's last day; None checks the
+    whole stored range.  A session is expected when either exchange stored it,
+    when it is a known special session (meta.json's or KNOWN_SPECIAL_SESSIONS),
+    or when the cached NSE calendar says it was a trading day (only for years
+    the cached holiday list covers).  The check never touches the network.
     """
     holidays, special_sessions = _read_calendar(metadata_dir)
     calendar_years = set()
@@ -178,9 +203,10 @@ def find_missing_sessions(
                 SELECT DISTINCT Exchange, Date
                 FROM eod_data
                 WHERE Exchange IN ('NSE', 'BSE')
-                  AND Date >= (SELECT MAX(Date) FROM eod_data) - CAST(? AS INTEGER)
+                  AND (CAST(? AS INTEGER) IS NULL
+                       OR Date >= (SELECT MAX(Date) FROM eod_data) - CAST(? AS INTEGER))
                 """,
-                [lookback_days],
+                [lookback_days, lookback_days],
             ).fetchall()
         finally:
             conn.close()
@@ -198,7 +224,8 @@ def find_missing_sessions(
     last_day = max(max(days) for days in present.values())
     day = first_day
     while day <= last_day:
-        if day.year in calendar_years and _is_trading_day(day, holidays, special_sessions):
+        if (is_special_session_day(day, holidays, special_sessions)
+                or (day.year in calendar_years and _is_trading_day(day, holidays, special_sessions))):
             expected.add(day)
         day += timedelta(days=1)
 

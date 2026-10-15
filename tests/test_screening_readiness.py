@@ -129,3 +129,28 @@ def test_missing_sessions_are_reported_per_exchange(tmp_path):
         "NSE": ["2026-07-28"],
         "BSE": ["2026-07-30"],
     }
+
+
+def test_a_special_session_neither_exchange_stored_is_missing_over_the_whole_range(tmp_path):
+    # The store lacked Saturday 2025-02-01 (Union Budget) on both exchanges, and
+    # nothing said so: the cached calendar covers 2026 only and the check looked
+    # back 120 days.
+    metadata = _metadata(tmp_path, {"26-Jan-2026": "Republic Day"})
+    database = tmp_path / "prices.duckdb"
+    conn = duckdb.connect(str(database))
+    try:
+        create_compact_schema(conn)
+        conn.execute("INSERT INTO securities (Exchange, Symbol, ISIN, Series) VALUES ('NSE', 'NSETEST', 'INE000A', 'EQ'), ('BSE', 'BSETEST', 'INE000B', 'A')")
+        for day in ("2025-01-31", "2025-02-03", "2025-07-30", "2025-07-31"):
+            for symbol, exchange in (("NSETEST", "NSE"), ("BSETEST", "BSE")):
+                conn.execute("INSERT INTO raw_prices (Date, Symbol, Exchange, Open, High, Low, Close, Volume) "
+                             "VALUES (?, ?, ?, 1, 1, 1, 1, 1)", [day, symbol, exchange])
+    finally:
+        conn.close()
+
+    whole = find_missing_sessions(database, metadata, lookback_days=None)
+    assert {exchange: [day.isoformat() for day in days] for exchange, days in whole.items()} == {
+        "NSE": ["2025-02-01"], "BSE": ["2025-02-01"]}
+    assert find_missing_sessions(database, metadata) == {}               # 120 days back from the last day
+    # ...and the calendar the downloaders read treats it as a session
+    assert latest_eligible_eod_date(datetime(2025, 2, 2, 12, 0), metadata).isoformat() == "2025-02-01"
