@@ -9,9 +9,9 @@ C/C++ compiler.
 
 ## Supported runtime
 
-- Windows x64 with 64-bit Python 3.10 or newer (Python 3.11 recommended)
-- Linux x86_64 with Python 3.10 or newer (Ubuntu 22.04+ recommended)
-- Apple Silicon macOS with Python 3.10 or newer (Python 3.11 recommended)
+- Windows x64 with 64-bit Python 3.10-3.13 (Python 3.11 recommended)
+- Linux x86_64 with Python 3.10-3.13 (Ubuntu 22.04+ recommended)
+- Apple Silicon macOS with Python 3.10-3.13 (Python 3.11 recommended)
 
 The published Rust executable does not currently support Windows/Linux ARM64,
 Intel macOS, or Alpine/musl.
@@ -103,22 +103,41 @@ binary was already installed manually.
 ./schedule_uninstall.sh   # remove it
 ```
 
-The pipeline runs **Monday-Friday at 19:30** machine local time (IST), and at
-login.  19:30 rather than 18:00: 18:00 IST is the earliest time a day's EOD
-may be downloaded, and the NSE/BSE files are often published later, so a run
-at exactly 18:00 often screened the previous session from local data.
+The pipeline runs **Monday-Friday at 19:30 India time (IST)**, and at login.
+19:30 rather than 18:00: 18:00 IST is the earliest time a day's EOD may be
+downloaded, and the NSE/BSE files are often published later, so a run at
+exactly 18:00 often screened the previous session from local data.
 `schedule_setup.sh` generates the plist (label `com.paresh.markscreener`) from
 its own directory -- the project can live anywhere -- writes it to
-`~/Library/LaunchAgents` and loads it with `launchctl bootstrap` (falling back
-to `launchctl load` on old macOS).  The time and weekdays are set once, at the
-top of `run_scheduled.sh`.
+`~/Library/LaunchAgents`, loads it with `launchctl bootstrap` (falling back to
+`launchctl load`) and checks with `launchctl print` that it is loaded, failing
+otherwise.  It refuses to reinstall while a run is in progress unless given
+`--force`.  launchd fires calendar slots in the machine's local time, so 19:30
+IST is converted to local time when the plist is generated and printed (on an
+IST machine it stays 19:30); rerun `schedule_setup.sh` after changing the
+machine's time zone or across a local daylight-saving change.  The time, the
+weekdays and the retry window are set once, at the top of `run_scheduled.sh`.
 
-`run_scheduled.sh` runs the pipeline only when the last successful run
-(`logs/.last_scheduled_run` in the project) is older than the most recent
-scheduled slot that has already passed: Monday 08:00 after Friday's run does
-nothing, Monday 08:00 after a missed Friday runs at once, weekends never run.
-`./run_scheduled.sh --force` runs now; `--dry-run` only prints the decision.
-Scheduler output goes to `logs/scheduler_stdout.log` and `scheduler_stderr.log`.
+`run_scheduled.sh` decides in IST whatever the machine's zone.  It runs the
+pipeline only when the last successful run (`logs/.last_scheduled_run` in the
+project: start time as epoch seconds plus IST text) started before the most
+recent scheduled slot that has already passed: Monday 08:00 after Friday's run
+does nothing, Monday 08:00 after a missed Friday runs at once.  Weekends never
+have a slot of their own; a Saturday or Sunday start runs only to catch up a
+missed Friday slot.  A run that screened data that is not current (exit 3: a
+sync stopped, data older than the target, or NSE/BSE as-of dates differ) or
+found another run holding the run lock (exit 4) is not recorded as done: it is
+retried every 30 minutes until 23:30 IST, after which that slot is given up and
+the next slot runs normally.  A manual `run_macos.sh` run always exits 0 in
+those cases (the codes are only reported when `MARK_SCHEDULED=1`, which the
+scheduler sets).  `./run_scheduled.sh --force` runs now; `--dry-run` only prints
+the decision.  Scheduler output goes to `logs/scheduler_stdout.log` and
+`scheduler_stderr.log`.
+
+Only one run at a time: `run_screener.py` holds `<data root>/mark_screener.lock`
+(PID, host and start time) while it runs.  A second run -- a manual run during
+the scheduled one, or two launchers at once -- logs who holds it and exits 4.
+A lock whose process is gone, or older than six hours, is taken over.
 
 `Mark_Python.sh` (used by the scheduler) picks the interpreter in this order and
 logs which one it used; launchd's PATH is minimal, so `conda` is never needed
@@ -285,19 +304,20 @@ can change results differs.  The fields:
 | Field | Meaning |
 |-------|---------|
 | `run` | run timestamp (IST), the machine's local time and zone, `platform.platform()`, the Python executable -- expected to differ |
-| `packages` | Python, pandas, numpy and duckdb versions (pinned in `requirements.txt`) |
+| `packages` | pandas, numpy and duckdb versions (pinned in `requirements.txt`); python, nse and httpx versions are recorded but informational |
 | `engine` | Rust engine version, full sha256 and path |
 | `settings` | `FLAG_LOOKBACK_DAYS`, `MAX_STALE_SESSIONS`, SME options, the 18:00 EOD cutoff |
 | `data_as_of` | NSE/BSE latest local session, the eligible target, `as_of_mismatch`, `local_fallback` (screened older data than the target), `sync_stopped`, and the warnings |
 | `fundamentals` | file name, sha256, modified time (IST), rows and distinct ISINs |
 | `overrides` | whether `corporate_action_overrides.csv` exists, and its sha256 |
-| `store.schema_version` | 2 for the current store, 1 for an old store that still needs `rebuild_eod_database.py` |
-| `store.exchanges` | per exchange: rows, sessions, first/last date, symbols, and `content_hash` of exactly what the engine reads (`eod_data`: symbol, date, OHLC to 1/10000, volume) |
-| `store.tables` | rows and a content hash of each table (factors, actions, securities); `raw_prices` is only counted |
+| `store.kind`, `store.schema_version` | `v2` / 2 for the current store; `v1` / 1 for an old store that still needs `rebuild_eod_database.py`; `external` for a store screened with `--skip-sync` (the lake export keeps adjusted prices in an `eod_prices` table) |
+| `store.engine_input_hash` | one hash of everything the `eod_data` view the engine reads is computed from (prices, `adjustment_periods`, `securities`) -- equal values mean the engine saw the same data |
+| `store.exchanges` | per exchange: rows, sessions, first/last date, symbols, and `content_hash` of the price table (`raw_prices`, or `eod_prices` when that is a table): symbol, OHLC to 1/10^6, volume, per session |
+| `store.tables` | rows and a content hash of each other table (factors, actions, securities; NaN and infinity hashed as text) |
 | `store.exchange_actions` | rows of the exchanges' corporate-action lists per exchange |
 | `store.sessions` | rows and hash per session -- the comparison names the sessions that differ |
 | `outputs` | per list (`NSE/mark_tight`, ...): count, hash and the (symbol, breakout date) pairs from the written CSVs |
-| `elapsed_seconds` | time the fingerprint took (about 4-8 s on 3.8 million rows) |
+| `elapsed_seconds` | time the fingerprint took (about 1 s on 3.8 million rows) |
 
 The hashes use text whose form does not depend on the OS or the DuckDB
 version, and they ignore row order, so equal hashes mean equal data on Windows,

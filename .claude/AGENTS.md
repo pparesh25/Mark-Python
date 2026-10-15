@@ -99,9 +99,14 @@ python -m run_fingerprint run_fingerprint_A.json run_fingerprint_B.json
   from its own directory and loads it (`launchctl bootstrap gui/$(id -u)`,
   fallback `load`); `schedule_uninstall.sh` removes it.  No static plist is tracked.
 - Runs Monday-Friday at 19:30 IST plus at login; `SCHEDULE_HOUR`/`SCHEDULE_MINUTE`/
-  `SCHEDULE_WEEKDAYS` live only in `run_scheduled.sh`.  It runs when the last
-  successful run is older than the latest passed slot; `--force`, `--dry-run`,
-  `MARK_SCHEDULER_NOW` (epoch) for tests.
+  `SCHEDULE_WEEKDAYS`/`SCHEDULE_TZ` and the retry window live only in
+  `run_scheduled.sh`, which decides in IST; `schedule_setup.sh` converts the slot
+  to the machine's local time for launchd.  It runs when the last successful
+  run started before the latest passed slot; `--force`, `--dry-run`,
+  `MARK_SCHEDULER_NOW` (epoch, also the simulated clock for retries) for tests.
+- `run_screener.py` exit codes: 3 = screened data not current (only with
+  `MARK_SCHEDULED=1`), 4 = another run holds `<data root>/mark_screener.lock`.
+  The scheduler retries both every 30 minutes until 23:30 IST.
 - `Mark_Python.sh` picks `$MARK_PYTHON`, then `.venv/bin/python`, then a conda env
   `mark_screener` under `~/miniforge3`, `~/miniconda3`, `~/anaconda3`,
   `/opt/homebrew/Caskroom/miniforge/base`; it never relies on `conda` on PATH.

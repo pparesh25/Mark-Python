@@ -23,12 +23,15 @@ Windows and Linux launchers create/use a project-local virtual environment;
 the normal precompiled-Rust path does not require TA-Lib.
 """
 
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import platform
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -41,6 +44,15 @@ from screening_readiness import (
     rebase_sync_cursor,
 )
 from config import CURRENT_TIMESTAMP
+
+# Exit codes a scheduler acts on (run_scheduled.sh retries both later that evening):
+# the run screened data that is not current (sync stopped, data older than the
+# target, NSE/BSE as-of differ) -- only reported when MARK_SCHEDULED=1, so a
+# manual run still exits 0 -- and another run holding the run lock.
+EXIT_DATA_NOT_CURRENT = 3
+EXIT_BUSY = 4
+# A run lock older than this is stale whatever its process.
+RUN_LOCK_MAX_AGE_SECONDS = 6 * 3600
 
 # ANSI colours for the console (log file gets plain text via strip).
 _C = {
@@ -216,6 +228,114 @@ def consistency_warning(logger, warnings: list, message: str) -> None:
     logger.warning(color(banner, 'YELLOW'))
 
 
+def _pid_alive(pid: int) -> bool:
+    """Whether a process exists on this machine (never signals or stops it)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # os.kill(pid, 0) would terminate the process on Windows.
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED: it exists
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_lock(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _stale_lock_reason(path: Path, holder) -> str | None:
+    """Why an existing run lock can be taken over, or None while its run may be alive."""
+    if not isinstance(holder, dict):
+        try:
+            age = time.time() - path.stat().st_mtime
+        except OSError:
+            return "lock file vanished"
+        return f"unreadable and {age / 3600:.1f} h old" if age > RUN_LOCK_MAX_AGE_SECONDS else None
+    age = time.time() - float(holder.get("started", 0) or 0)
+    if age > RUN_LOCK_MAX_AGE_SECONDS:
+        return f"started {age / 3600:.1f} h ago"
+    if holder.get("host") == platform.node():
+        try:
+            pid = int(holder.get("pid", 0))
+        except (TypeError, ValueError):
+            pid = 0
+        if not _pid_alive(pid):
+            return f"process {pid} is gone"
+    return None
+
+
+def acquire_run_lock(logger, path: Path | None = None):
+    """Take the run lock (an O_EXCL file holding PID and start time); None when another run holds it."""
+    path = Path(path or config.RUN_LOCK_FILE)
+    record = {
+        "pid": os.getpid(),
+        "host": platform.node(),
+        "started": time.time(),
+        "started_ist": datetime.now(config.MARKET_TIMEZONE).isoformat(timespec="seconds"),
+        "run": config.CURRENT_TIMESTAMP,
+        "token": uuid.uuid4().hex,
+    }
+    for attempt in (1, 2):
+        try:
+            descriptor = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            holder = _read_lock(path)
+            reason = _stale_lock_reason(path, holder)
+            if reason and attempt == 1:
+                logger.warning(f"  Removing a stale run lock ({reason}): {path}")
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            holder = holder if isinstance(holder, dict) else {}
+            logger.error(color(
+                f"  ✗ Another Mark Screener run is in progress (pid {holder.get('pid', '?')} on "
+                f"{holder.get('host', '?')}, run {holder.get('run', '?')}, started "
+                f"{holder.get('started_ist', '?')}). Not starting a second one; try again when it "
+                f"has finished. Lock: {path}",
+                'RED',
+            ))
+            return None
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+        return {"path": path, "token": record["token"]}
+    return None
+
+
+def release_run_lock(lock) -> None:
+    """Remove the run lock if it is still this run's."""
+    if not lock:
+        return
+    holder = _read_lock(lock["path"])
+    if isinstance(holder, dict) and holder.get("token") == lock["token"]:
+        try:
+            lock["path"].unlink()
+        except OSError:
+            pass
+
+
 def write_run_fingerprint(logger, fingerprint: dict | None) -> None:
     """Write the fingerprint JSON; any failure is only a warning."""
     if fingerprint is None:
@@ -380,6 +500,19 @@ def main():
 
     os.environ['MARK_SCREENER_TIMESTAMP'] = config.CURRENT_TIMESTAMP
     logger = setup_logging()
+    lock = acquire_run_lock(logger)
+    if lock is None:
+        sys.exit(EXIT_BUSY)
+    try:
+        code = run_pipeline(args, logger)
+    finally:
+        release_run_lock(lock)
+    if code:
+        sys.exit(code)
+
+
+def run_pipeline(args, logger) -> int:
+    """Steps 1-4 under the run lock; the exit code (EXIT_DATA_NOT_CURRENT only for a scheduled run)."""
     workflow_start = time.time()
 
     width = 64
@@ -549,7 +682,8 @@ def main():
     as_of_text = ", ".join(
         f"{exchange}={value:%Y-%m-%d}" for exchange, value in sorted(readiness.as_of_dates.items())
     )
-    if len(set(readiness.as_of_dates.values())) > 1:
+    as_of_mismatch = len(set(readiness.as_of_dates.values())) > 1
+    if as_of_mismatch:
         consistency_warning(
             logger, consistency_warnings,
             f"NSE and BSE local data end on different sessions ({as_of_text}).",
@@ -580,8 +714,11 @@ def main():
             warnings=consistency_warnings,
             include_sme=args.include_sme,
             only_sme=args.only_sme,
+            external_store=args.skip_sync,
         )
-        if (fingerprint.get("store") or {}).get("schema_version") == 1:
+        # A --skip-sync store is made elsewhere (the lake export stores eod_prices
+        # as a table) and is not a version 1 store waiting for a rebuild.
+        if not args.skip_sync and (fingerprint.get("store") or {}).get("kind") == "v1":
             consistency_warning(
                 logger, consistency_warnings,
                 "the price store is an old version 1 store (not rebuilt); its prices can "
@@ -647,6 +784,14 @@ def main():
     if fingerprint is not None:
         logger.info(color(f"  Run fingerprint: {run_fingerprint.fingerprint_path()}", 'CYAN'))
     logger.info(color('═' * width, 'CYAN'))
+
+    data_not_current = sync_stopped or readiness.needs_update or as_of_mismatch
+    if data_not_current and os.environ.get("MARK_SCHEDULED") == "1":
+        logger.warning(color(
+            f"  Scheduled run: the data screened is not current; exit code {EXIT_DATA_NOT_CURRENT} "
+            "so the scheduler tries again later.", 'YELLOW'))
+        return EXIT_DATA_NOT_CURRENT
+    return 0
 
 
 if __name__ == '__main__':

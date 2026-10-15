@@ -192,6 +192,9 @@ SCREENER_SCREEN_ID = '3427564'
 # ---------------------------------------------------------------------------
 # Timestamped log file per run, stored in its own folder.
 LOG_FILE = LOG_DIR / f"screening_log_{CURRENT_TIMESTAMP}.txt"
+# Held while a run is in progress, so a manual run during a scheduled one (or
+# two launchers at once) does not collide on the DuckDB write lock.
+RUN_LOCK_FILE = DATA_ROOT / "mark_screener.lock"
 
 
 def get_watchlist_dir(exchange: str, root: Path | None = None) -> Path:
@@ -227,7 +230,7 @@ def configure_data_root(root: Path) -> None:
     global DATA_ROOT, DATABASE_DIR, DATA_DIR, BSE_DATA_DIR, DUCKDB_FILE
     global FUNDAMENTAL_DIR, FUNDAMENTAL_FILE, OUT_DIR, CHART_DIR, LOG_DIR
     global DAILY_BHAVCOPY_DIR, BSE_DAILY_BHAVCOPY_DIR, EOD_METADATA_DIR, LOG_FILE
-    global SCREENER_CREDS
+    global SCREENER_CREDS, RUN_LOCK_FILE
 
     DATA_ROOT = Path(root).expanduser()
     os.environ["MARK_DATA_ROOT"] = str(DATA_ROOT)
@@ -245,6 +248,7 @@ def configure_data_root(root: Path) -> None:
     EOD_METADATA_DIR = DATABASE_DIR / "metadata"
     SCREENER_CREDS = get_screener_credentials_path(DATA_ROOT)
     LOG_FILE = LOG_DIR / f"screening_log_{CURRENT_TIMESTAMP}.txt"
+    RUN_LOCK_FILE = DATA_ROOT / "mark_screener.lock"
 
 
 def ensure_dirs(include_watchlists: bool | None = None):

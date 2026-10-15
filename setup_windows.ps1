@@ -10,20 +10,36 @@ if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") {
     throw "Unsupported architecture: $env:PROCESSOR_ARCHITECTURE. The prebuilt Rust engine requires Windows x64."
 }
 
+# numpy 2.2.6 (pinned in requirements.txt) has wheels for Python 3.10-3.13 only;
+# 3.11 is preferred, then 3.12.
+$VersionCheck = "import sys; sys.exit(0 if (3, 10) <= sys.version_info[:2] <= (3, 13) else 1)"
+$Created = $false
 if (Get-Command py -ErrorAction SilentlyContinue) {
-    & py -3.11 -c "import sys; assert sys.version_info >= (3, 10), 'Python 3.10+ is required'"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Python 3.11 was not found through the Windows Python launcher."
+    foreach ($Version in @("3.11", "3.12", "3.13", "3.10")) {
+        # No stderr redirect: with ErrorActionPreference Stop it would turn "not installed" into an error.
+        & py "-$Version" -c $VersionCheck
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Using Python $Version through the Windows Python launcher."
+            & py "-$Version" -m venv .venv
+            if ($LASTEXITCODE -ne 0) { throw "Creating the virtual environment with Python $Version failed." }
+            $Created = $true
+            break
+        }
     }
-    & py -3.11 -m venv .venv
-} elseif (Get-Command python -ErrorAction SilentlyContinue) {
-    & python -c "import sys; assert sys.version_info >= (3, 10), 'Python 3.10+ is required'"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Python 3.10 or newer is required."
+}
+if (-not $Created -and (Get-Command python -ErrorAction SilentlyContinue)) {
+    & python -c $VersionCheck
+    if ($LASTEXITCODE -eq 0) {
+        & python -m venv .venv
+        if ($LASTEXITCODE -ne 0) { throw "Creating the virtual environment failed." }
+        $Created = $true
+    } else {
+        $Found = (& python --version)
+        throw "Python 3.10-3.13 is required (found $Found); the pinned numpy 2.2.6 has no wheels for other versions. Install 64-bit Python 3.11 and run this script again."
     }
-    & python -m venv .venv
-} else {
-    throw "Python was not found. Install 64-bit Python 3.11 and run this script again."
+}
+if (-not $Created) {
+    throw "Python 3.10-3.13 was not found. Install 64-bit Python 3.11 and run this script again."
 }
 
 $VenvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"

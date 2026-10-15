@@ -12,11 +12,19 @@ a fundamentals file downloaded at another time.  Every run now writes
 prints which fields differ between two runs (for example one from each
 machine), so the cause of a difference is visible without re-running anything.
 
-The hashes are computed from text whose format does not depend on the
-platform or the DuckDB version: dates as ISO text, prices as integers of
-1/10000 (the ``eod_data`` view rounds to 4 decimals), factors as integers of
-1/10^8, and the first 64 bits of each row's md5 summed modulo 2^64, so the
-row order of a table never matters and a duplicated row is not cancelled out.
+What is hashed: the engine reads the ``eod_data`` view, which is a pure
+function of the base tables -- ``raw_prices``, ``adjustment_periods`` and
+``securities`` in a version 2 store, the ``eod_prices`` table in a version 1
+store or an external (lake) export.  Hashing those base tables directly gives
+the same information as hashing the view, without its ASOF join, in one scan
+(about 1 s for 3.8 million rows instead of 4-10 s).  ``store.engine_input_hash``
+combines them into one value.
+
+The hashes are computed from text whose format does not depend on the platform
+or the DuckDB version: dates as ISO text, prices as integers of 1/10^6, other
+decimals as integers of 1/10^8 (NaN, infinity and out-of-range values spelled
+out instead of failing), and the first 64 bits of each row's md5 summed modulo
+2^64, so the row order never matters and a duplicated row is not cancelled out.
 
 Fingerprinting never stops a run: every section that fails records its error
 and logs a warning.
@@ -33,38 +41,46 @@ import subprocess
 import sys
 import time
 from datetime import date, datetime
+from importlib import metadata
 from pathlib import Path
 
 import config
 
 logger = logging.getLogger(__name__)
 
-FINGERPRINT_VERSION = 1
+FINGERPRINT_VERSION = 2
 EXCHANGES = ("NSE", "BSE")
 _MOD64 = 1 << 64
-# Tables whose content is hashed in full.  raw_prices (and a version 1
-# store's eod_prices table) is covered by the eod_data hash -- that is what
-# the engine reads -- and only counted; securities is
-# hashed on its own because it carries the ISIN join.  Any other table found
-# in the store -- a factor table added or renamed later -- is hashed as well.
-_COUNT_ONLY_TABLES = {"raw_prices", "eod_prices"}
+# Price tables hashed per session in one scan (never through the view).
+_PRICE_TABLES = ("raw_prices", "eod_prices")
 # Columns left out of a table hash because they record when, not what.
 _VOLATILE_COLUMNS = {"fetched_at", "applied_at"}
+# Tables the eod_data view reads besides the price table.
+_VIEW_INPUT_TABLES = ("adjustment_periods", "securities")
+# Any other table larger than this is only counted: such tables (the lake
+# export's eod_delivery, 3.8 million rows) hold columns the engine does not
+# read, and hashing them would double the fingerprint's cost.
+_HASH_ROW_LIMIT = 250_000
 # The two output kinds and the column holding each list's breakout date.
 _BREAKOUT_COLUMNS = ("Mark_Tight_Date", "breakout_date")
+# Distributions whose versions are recorded; python, nse and httpx are
+# informational (they do not compute prices).
+_PACKAGES = ("pandas", "numpy", "duckdb", "nse", "httpx")
 # Fingerprint fields that differ between two machines by nature and say
 # nothing about the inputs; the comparison lists them separately.
 INFORMATIONAL_KEYS = (
     "run.",
     "elapsed_seconds.",
+    "packages.python",
+    "packages.nse",
+    "packages.httpx",
     "store.path",
     "store.size_bytes",
-    "store.eod_hash_seconds",
+    "store.hash_seconds",
     "engine.path",
     "overrides.path",
     "fundamentals.path",
     "fundamentals.mtime_ist",
-    "outputs_dir",
 )
 
 
@@ -127,13 +143,13 @@ def _run_section(timestamp: str) -> dict:
 
 
 def _package_versions() -> dict:
+    """Installed versions, read from package metadata (nothing is imported)."""
     versions = {"python": platform.python_version()}
-    for name in ("pandas", "numpy", "duckdb"):
+    for name in _PACKAGES:
         try:
-            module = __import__(name)
-            versions[name] = getattr(module, "__version__", "unknown")
-        except Exception as error:  # noqa: BLE001
-            versions[name] = f"unavailable ({error})"
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            versions[name] = None
     return versions
 
 
@@ -153,18 +169,35 @@ def _hex64(value) -> str:
     return f"{int(value or 0) % _MOD64:016x}"
 
 
+def _digest16(lines) -> str:
+    return hashlib.sha256("\n".join(sorted(lines)).encode("utf-8")).hexdigest()[:16]
+
+
+def _quote(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _row_hash_sql(expressions: list[str]) -> str:
     """SQL for a row's 64-bit md5 prefix; NULLs are spelled out because concat_ws skips them."""
     body = ", ".join(f"COALESCE(CAST({expr} AS VARCHAR), '\\N')" for expr in expressions)
     return f"CAST('0x' || substr(md5(concat_ws('|', {body})), 1, 16) AS UBIGINT)"
 
 
+def _decimal_sql(column: str, scale: int, integer_type: str, limit: str) -> str:
+    """A decimal column as an integer of 1/scale; NaN, infinity and huge values are spelled out."""
+    return (
+        f"CASE WHEN isfinite({column}) AND abs({column}) < {limit} "
+        f"THEN CAST(CAST(round({column} * {scale}) AS {integer_type}) AS VARCHAR) "
+        f"ELSE 'x' || CAST({column} AS VARCHAR) END"
+    )
+
+
 def _column_expression(name: str, data_type: str) -> str:
     """A platform- and version-stable text form of one column."""
-    quoted = '"' + name.replace('"', '""') + '"'
+    quoted = _quote(name)
     kind = data_type.upper()
     if kind in {"DOUBLE", "FLOAT", "REAL"} or kind.startswith("DECIMAL"):
-        return f"CAST(round({quoted} * 100000000) AS HUGEINT)"
+        return _decimal_sql(f"CAST({quoted} AS DOUBLE)", 100000000, "HUGEINT", "1e20")
     if kind == "DATE":
         return f"strftime({quoted}, '%Y-%m-%d')"
     if kind.startswith("TIMESTAMP"):
@@ -179,28 +212,27 @@ def _table_digest(conn, table: str) -> dict:
         [table],
     ).fetchall()
     used = [(name, kind) for name, kind in columns if name.lower() not in _VOLATILE_COLUMNS]
-    quoted = '"' + table.replace('"', '""') + '"'
-    if table in _COUNT_ONLY_TABLES or not used:
-        return {"rows": conn.execute(f"SELECT count(*) FROM {quoted}").fetchone()[0]}
+    rows = conn.execute(f"SELECT count(*) FROM {_quote(table)}").fetchone()[0]
+    if not used:
+        return {"rows": rows}
+    if rows > _HASH_ROW_LIMIT and table not in _VIEW_INPUT_TABLES:
+        return {"rows": rows, "hash": None, "note": f"over {_HASH_ROW_LIMIT} rows: counted, not hashed"}
     row_hash = _row_hash_sql([_column_expression(name, kind) for name, kind in used])
-    rows, total = conn.execute(f"SELECT count(*), sum({row_hash}) FROM {quoted}").fetchone()
+    rows, total = conn.execute(f"SELECT count(*), sum({row_hash}) FROM {_quote(table)}").fetchone()
     return {"rows": rows, "hash": _hex64(total), "columns": [name for name, _ in used]}
 
 
-# What the engine screens: the eod_data view's prices per symbol and day.
-# Prices are compared to 1/10000 (the view rounds to 4 decimals).
-_EOD_ROW_HASH = _row_hash_sql([
-    "Symbol",
-    "strftime(Date, '%Y-%m-%d')",
-    "CAST(round(Open * 10000) AS BIGINT)",
-    "CAST(round(High * 10000) AS BIGINT)",
-    "CAST(round(Low * 10000) AS BIGINT)",
-    "CAST(round(Close * 10000) AS BIGINT)",
-    "Volume",
-])
+# One price row: symbol, prices to 1/10^6, volume.  The session date and the
+# exchange are the GROUP BY keys and enter the exchange hash with the session.
+_PRICE_ROW_HASH = _row_hash_sql(
+    ["Symbol"]
+    + [_decimal_sql(column, 1000000, "BIGINT", "1e12") for column in ("Open", "High", "Low", "Close")]
+    + ["Volume"]
+)
 
 
-def _store_section(database: Path) -> dict:
+def _store_section(database: Path, external: bool = False) -> dict:
+    """Describe the price store; ``external`` marks a store made elsewhere (``--skip-sync``)."""
     import duckdb
 
     from eod_store import schema_version
@@ -213,49 +245,71 @@ def _store_section(database: Path) -> dict:
     result["size_bytes"] = database.stat().st_size
     conn = duckdb.connect(str(database), read_only=True)
     try:
-        result["schema_version"] = schema_version(conn)
         relations = dict(conn.execute(
             "SELECT table_name, table_type FROM information_schema.tables"
         ).fetchall())
-
-        started = time.perf_counter()
-        per_session = conn.execute(
-            f"""
-            SELECT Exchange, Date, count(*) AS n, sum({_EOD_ROW_HASH}) AS h
-            FROM eod_data
-            WHERE Exchange IN ('NSE', 'BSE')
-            GROUP BY Exchange, Date
-            ORDER BY Exchange, Date
-            """
-        ).fetchall()
-        symbols = dict(conn.execute(
-            "SELECT Exchange, count(DISTINCT Symbol) FROM eod_data "
-            "WHERE Exchange IN ('NSE', 'BSE') GROUP BY Exchange"
-        ).fetchall())
-        result["eod_hash_seconds"] = round(time.perf_counter() - started, 2)
+        base = next((name for name in _PRICE_TABLES if relations.get(name) == "BASE TABLE"), None)
+        if base == "raw_prices":
+            kind = "v2"
+        elif base == "eod_prices":
+            # Adjusted prices stored as a table: an old store, or one exported by
+            # the market-data lake and screened with --skip-sync.
+            kind = "external" if external else "v1"
+        else:
+            kind = "empty"
+        result["kind"] = kind
+        result["schema_version"] = "external" if kind == "external" else schema_version(conn)
+        result["price_table"] = base
 
         exchanges: dict = {}
         sessions: dict = {}
-        for exchange in EXCHANGES:
-            mine = [row for row in per_session if row[0] == exchange]
-            if not mine:
-                exchanges[exchange] = {"rows": 0, "sessions": 0}
-                continue
-            exchanges[exchange] = {
-                "rows": sum(row[2] for row in mine),
-                "sessions": len(mine),
-                "first_date": mine[0][1].isoformat(),
-                "last_date": mine[-1][1].isoformat(),
-                "symbols": symbols.get(exchange, 0),
-                "content_hash": _hex64(sum(int(row[3] or 0) for row in mine)),
-            }
-            sessions[exchange] = {row[1].isoformat(): f"{row[2]}:{_hex64(row[3])}" for row in mine}
+        if base is not None:
+            started = time.perf_counter()
+            per_session = conn.execute(
+                f"""
+                SELECT Exchange, Date, count(*) AS n, sum({_PRICE_ROW_HASH}) AS h
+                FROM {_quote(base)}
+                WHERE Exchange IN ('NSE', 'BSE')
+                GROUP BY Exchange, Date
+                ORDER BY Exchange, Date
+                """
+            ).fetchall()
+            symbols = dict(conn.execute(
+                f"SELECT Exchange, count(DISTINCT Symbol) FROM {_quote(base)} "
+                "WHERE Exchange IN ('NSE', 'BSE') GROUP BY Exchange"
+            ).fetchall())
+            result["hash_seconds"] = round(time.perf_counter() - started, 2)
+            for exchange in EXCHANGES:
+                mine = [row for row in per_session if row[0] == exchange]
+                if not mine:
+                    exchanges[exchange] = {"rows": 0, "sessions": 0}
+                    continue
+                sessions[exchange] = {row[1].isoformat(): f"{row[2]}:{_hex64(row[3])}" for row in mine}
+                exchanges[exchange] = {
+                    "rows": sum(row[2] for row in mine),
+                    "sessions": len(mine),
+                    "first_date": mine[0][1].isoformat(),
+                    "last_date": mine[-1][1].isoformat(),
+                    "symbols": symbols.get(exchange, 0),
+                    "content_hash": _digest16(f"{day} {entry}" for day, entry in sessions[exchange].items()),
+                }
         result["exchanges"] = exchanges
 
         tables: dict = {}
         for table in sorted(name for name, kind in relations.items() if kind == "BASE TABLE"):
-            tables[table] = _section(f"table {table}", _table_digest, conn, table)
+            if table == base:
+                tables[table] = {"rows": sum(info.get("rows", 0) for info in exchanges.values())}
+            else:
+                tables[table] = _section(f"table {table}", _table_digest, conn, table)
         result["tables"] = tables
+        # One value for everything the eod_data view (what the engine reads) is computed from.
+        view_inputs = {
+            "kind": kind,
+            "prices": {exchange: info.get("content_hash") for exchange, info in exchanges.items()},
+        }
+        for table in _VIEW_INPUT_TABLES:
+            view_inputs[table] = (tables.get(table) or {}).get("hash")
+        result["engine_input_hash"] = _digest16([json.dumps(view_inputs, sort_keys=True)])
         if "exchange_actions" in relations:
             result["exchange_actions"] = dict(conn.execute(
                 "SELECT Exchange, count(*) FROM exchange_actions GROUP BY Exchange ORDER BY Exchange"
@@ -270,17 +324,9 @@ def _store_section(database: Path) -> dict:
     return result
 
 
-def _overrides_file() -> Path:
-    try:
-        from eod_maintenance import overrides_file
-
-        return Path(overrides_file())
-    except Exception:  # noqa: BLE001 - the module may be reorganised
-        return config.EOD_METADATA_DIR / "corporate_action_overrides.csv"
-
-
 def _overrides_section() -> dict:
-    path = _overrides_file()
+    # The same file eod_maintenance.overrides_file() reads (not imported: it pulls in pandas).
+    path = config.EOD_METADATA_DIR / "corporate_action_overrides.csv"
     present = path.is_file()
     return {"path": str(path), "present": present, "sha256": sha256_file(path) if present else None}
 
@@ -338,6 +384,7 @@ def collect(
     warnings=(),
     include_sme: bool = False,
     only_sme: bool = False,
+    external_store: bool = False,
 ) -> dict:
     """Fingerprint the inputs of this run (before the engine runs)."""
     timestamp = timestamp or config.CURRENT_TIMESTAMP
@@ -359,12 +406,14 @@ def collect(
         "data_as_of": _section("as-of", _as_of_section, readiness, local_fallback, sync_stopped, warnings),
         "fundamentals": timed("fundamentals", _fundamentals_section, fundamentals or config.FUNDAMENTAL_FILE),
         "overrides": _section("overrides", _overrides_section),
-        "store": timed("store", _store_section, database or config.DUCKDB_FILE),
+        "store": timed("store", _store_section, database or config.DUCKDB_FILE, external_store),
         "outputs": None,
     }
     elapsed["total"] = round(time.perf_counter() - started, 2)
     fingerprint["elapsed_seconds"] = elapsed
     return fingerprint
+
+
 
 
 def _outputs_section(out_dir: Path, timestamp: str) -> dict:
@@ -430,7 +479,7 @@ def summary_lines(fingerprint: dict) -> list[str]:
     store = fingerprint.get("store") or {}
     if "error" in store:
         lines.append(f"store: {store['error']}")
-    parts = [f"store v{store.get('schema_version', '?')}"]
+    parts = [f"store {store.get('kind', '?')} #{store.get('engine_input_hash', '-')}"]
     for exchange, info in (store.get("exchanges") or {}).items():
         parts.append(
             f"{exchange} {info.get('rows', 0)} rows {info.get('sessions', 0)} sessions "
@@ -441,7 +490,7 @@ def summary_lines(fingerprint: dict) -> list[str]:
     tables = store.get("tables") or {}
     factor_parts = [
         f"{name} {info.get('rows', '?')}" + (f" #{info['hash']}" if info.get("hash") else "")
-        for name, info in tables.items() if isinstance(info, dict) and name not in _COUNT_ONLY_TABLES
+        for name, info in tables.items() if isinstance(info, dict) and name not in _PRICE_TABLES
     ]
     actions = store.get("exchange_actions")
     overrides = fingerprint.get("overrides") or {}
