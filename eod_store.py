@@ -58,7 +58,6 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
-import duckdb
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -673,14 +672,23 @@ def apply_retention(conn, years: float) -> int:
     return int(dropped)
 
 
+def in_transaction(conn) -> bool:
+    """True inside an explicit transaction: there txid_current() stays the same from one statement to the next.
+
+    (A BEGIN to find out would not do: in DuckDB a nested BEGIN fails and aborts the caller's transaction.)
+    """
+    first = conn.execute("SELECT txid_current()").fetchone()[0]
+    return conn.execute("SELECT txid_current()").fetchone()[0] == first
+
+
 @contextmanager
 def transaction(conn):
-    """BEGIN ... COMMIT around the block (ROLLBACK on an error); inside an open transaction, just the block."""
-    try:
-        conn.execute("BEGIN TRANSACTION")
-    except duckdb.TransactionException:                 # already inside the caller's transaction
+    """BEGIN ... COMMIT around the block (ROLLBACK on an error); inside the caller's open transaction just the
+    block, which commits or rolls back with it."""
+    if in_transaction(conn):
         yield
         return
+    conn.execute("BEGIN TRANSACTION")
     try:
         yield
         conn.execute("COMMIT")
@@ -734,8 +742,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         ok = adjustment_ledger.downgrade_to_v2(path, eod_maintenance.overrides_file(), eod_maintenance.review_file(),
                                                logger=log)
-    except Exception as error:  # noqa: BLE001 - reported as the exit code
-        log.error(f"Downgrade failed, nothing changed: {error}")
+    except Exception as error:  # noqa: BLE001 - reported as the exit code, with the file's true state
+        version = eod_maintenance._version_of(path)
+        if version == "2":
+            log.warning(f"The downgrade reported {error}, but {path} is a version 2 store now.")
+            return 0
+        log.error(f"Downgrade failed ({error}); {path} is still version {version}.")
         return 1
     return 0 if ok else 1
 

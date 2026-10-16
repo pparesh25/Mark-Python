@@ -279,8 +279,11 @@ more than 30 days old (`action_list_history`). Dates are India's (IST). In order
    another ratio nearby is decided by the list rule and flagged. When NSE was
    away around the event (halted, or days missing from the store) BSE's own
    gap or list takes it, and the twin factor that arrives when NSE is back --
-   on a BSE day whose open does not show it -- is refused and flagged (one 1:1
-   split had become 0.25);
+   on a BSE day whose open does not show it -- is set against the product of
+   BSE's own factors since NSE's last day: refused when it is that product (one
+   1:1 split had become 0.25, a bonus and a split 0.0625), reduced to the rest
+   when BSE's open shows the rest (an event on NSE's first day back), refused
+   otherwise; always flagged;
 3. the exchange's own list -- NSE matched by ISIN, BSE by scrip code only, never
    by today's name -- when the day's open confirms it (within 25%; a 1:10 bonus
    is taken from the list when the open did not gap);

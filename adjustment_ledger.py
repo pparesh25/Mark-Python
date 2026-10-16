@@ -93,10 +93,11 @@ Checks (all tested):
   - adjustment_ledger PRIMARY KEY (Exchange, Symbol, Date) and CHECK (Factor > 0 AND isfinite):
     a second factor on a symbol-day, a factor of 0, below 0 or not finite cannot be stored.
   - price_adjustments.refuse_repeats: one Event_Key (a listed action without its day) twice
-    within 30 days, a BSE listing beside an NSE twin factor of the same ratio, or an NSE twin
-    factor BSE's open does not confirm while BSE's own factor of the same ratio already took the
-    event during NSE's absence, is refused and flagged; a factor whose adjusted open still gaps
-    25% or more is flagged for review.
+    within 30 days, or a BSE listing beside an NSE twin factor of the same ratio, is refused and
+    flagged; an NSE twin factor BSE's open does not confirm is set against the product of BSE's
+    own factors during NSE's absence -- refused when it is that product, reduced to the rest when
+    BSE's open shows the rest, refused otherwise; a factor whose adjusted open still gaps 25% or
+    more is flagged for review.
   - check_prices: every stored adjusted row of the touched symbols is raw x the product of the
     symbol's later ledger factors (to rounding); none missing, none extra.
   - check_factor_days: on each ledger day of a touched symbol the stored adjusted open over the
@@ -104,9 +105,12 @@ Checks (all tested):
     at all shows there. A failed check rolls the maintenance back, names the symbols in the
     review file and runs the full rebuild instead (which writes correct rows: no loop).
   - continuity_violations (the spec's invariant, on the stored adjusted series): on every ledger
-    day |ln(adjusted open / adjusted previous close)| < 0.25 unless the day is flagged. The
-    decision layer flags every such factor, so a hit is logged loudly and put on the review
-    list, never rolled back (the full rebuild would decide the same).
+    day |ln(adjusted open / adjusted previous close)| < 0.25. The decision layer flags every such
+    factor, so an unflagged hit is logged loudly; a flagged one is reported too ("already
+    flagged: ..."), since a factor flagged for another reason can still be a double. Both go to
+    the review list after the commit, never rolled back (the full rebuild would decide the same).
+  - Every step after a commit (review file, markers, reports) only warns when it fails: a
+    committed change is never reported as failed.
   - verify (weekly, `run_screener.py --verify`, after every migration): the oracle is computed
     and every derived table compared with it, eod_prices row for row; a difference is logged
     with its symbols and the derived tables are replaced by the oracle's in one transaction.
@@ -133,7 +137,7 @@ import price_adjustments as pa
 
 module_logger = logging.getLogger(__name__)
 
-RULE_VERSION = 2                       # bump when a decision rule changes: the next run rebuilds in full
+RULE_VERSION = 3                       # bump when a decision rule changes: the next run rebuilds in full
 VERIFY_EVERY_DAYS = 7
 EXCHANGES = ("NSE", "BSE")
 ONE_DAY = pd.Timedelta(days=1)
@@ -588,14 +592,16 @@ def check_factor_days(conn, symbols: pd.DataFrame | None = None) -> list[tuple]:
 
 
 def continuity_violations(conn, symbols: pd.DataFrame | None = None) -> list[tuple]:
-    """(Exchange, Symbol, Date, adjusted gap) of applied factor days whose ADJUSTED gap breaks continuity.
+    """(Exchange, Symbol, Date, adjusted gap, flag) of applied factor days whose ADJUSTED gap breaks continuity.
 
     The spec's invariant, on the stored adjusted series: on every ledger day
-    |ln(adjusted open / adjusted previous close)| < CONTINUITY_LIMIT unless that
-    day's decision is flagged. The decision layer flags every factor that leaves
-    such a jump (price_adjustments.refuse_repeats), so a row here means stored
-    prices and decisions disagree. It is reported loudly and put on the review
-    list -- never rolled back into a loop: the full rebuild would decide the same.
+    |ln(adjusted open / adjusted previous close)| < CONTINUITY_LIMIT. The
+    decision layer flags every factor that leaves such a jump
+    (price_adjustments.refuse_repeats), so an unflagged row (flag None) means
+    stored prices and decisions disagree; a flagged one is reported too, with its
+    flag, since a factor flagged for another reason can still be a double. Both
+    are reported and put on the review list -- never rolled back into a loop: the
+    full rebuild would decide the same.
     """
     if symbols is not None and symbols.empty:
         return []
@@ -607,13 +613,13 @@ def continuity_violations(conn, symbols: pd.DataFrame | None = None) -> list[tup
             WITH e AS (SELECT Exchange, Symbol, Date, Open,
                               lag(Close) OVER (PARTITION BY Exchange, Symbol ORDER BY Date) AS Prev_Close
                        FROM {eod_rows})
-            SELECT l.Exchange, l.Symbol, l.Date, e.Open / e.Prev_Close AS Adjusted_Gap
+            SELECT l.Exchange, l.Symbol, l.Date, e.Open / e.Prev_Close AS Adjusted_Gap,
+                   (SELECT string_agg(p.Flag, '; ') FROM price_adjustments p WHERE p.Exchange = l.Exchange
+                     AND p.Symbol = l.Symbol AND p.Date = l.Date AND p.Flag IS NOT NULL) AS Flag
             FROM adjustment_ledger l
             JOIN e ON e.Exchange = l.Exchange AND e.Symbol = l.Symbol AND e.Date = l.Date
             WHERE e.Prev_Close >= {CHECK_MIN_PRICE} AND e.Open >= {CHECK_MIN_PRICE}
               AND abs(ln(e.Open / e.Prev_Close)) >= {pa.CONTINUITY_LIMIT}
-              AND NOT EXISTS (SELECT 1 FROM price_adjustments p WHERE p.Exchange = l.Exchange
-                              AND p.Symbol = l.Symbol AND p.Date = l.Date AND p.Flag IS NOT NULL)
             ORDER BY 1, 2, 3""").fetchall()
     finally:
         if symbols is not None:
@@ -622,15 +628,23 @@ def continuity_violations(conn, symbols: pd.DataFrame | None = None) -> list[tup
 
 
 def _report_continuity(conn, violations: list[tuple], logger: logging.Logger) -> pd.DataFrame:
-    """Log continuity violations loudly; the review rows for them."""
+    """Log continuity violations (unflagged ones loudly); the review rows for them."""
     if not violations:
         return _empty(["Exchange", "Symbol", "Date", "Flag"])
-    logger.error(f"CONTINUITY INVARIANT BROKEN on {len(violations)} unflagged factor day(s) -- the adjusted open "
-                 f"still jumps {pa.CONTINUITY_LIMIT:.0%} or more; put on the review list: "
-                 f"{[f'{e} {s} {d} gap {g:.3f}' for e, s, d, g in violations[:10]]}")
+    unflagged = [v for v in violations if v[4] is None]
+    flagged = [v for v in violations if v[4] is not None]
+    if unflagged:
+        logger.error(f"CONTINUITY INVARIANT BROKEN on {len(unflagged)} unflagged factor day(s) -- the adjusted open "
+                     f"still jumps {pa.CONTINUITY_LIMIT:.0%} or more; put on the review list: "
+                     f"{[f'{e} {s} {d} gap {g:.3f}' for e, s, d, g, _ in unflagged[:10]]}")
+    if flagged:
+        logger.warning(f"Continuity: {len(flagged)} flagged factor day(s) where the adjusted open still jumps "
+                       f"{pa.CONTINUITY_LIMIT:.0%} or more (on the review list): "
+                       f"{[f'{e} {s} {d} gap {g:.3f}' for e, s, d, g, _ in flagged[:10]]}")
     return pd.DataFrame([{"Exchange": e, "Symbol": s, "Date": d,
-                          "Flag": f"continuity: adjusted open {g:.3f}x the adjusted previous close after the factor"}
-                         for e, s, d, g in violations])
+                          "Flag": (f"continuity: adjusted open {g:.3f}x the adjusted previous close after the factor"
+                                   + (f" (already flagged: {flag})" if flag else ""))}
+                         for e, s, d, g, flag in violations])
 
 
 def _eod_differences(conn, periods: pd.DataFrame) -> list[tuple]:
@@ -779,10 +793,28 @@ def rebuild(conn, overrides_path: Path | None = None, review_path: Path | None =
     except Exception:
         conn.execute("ROLLBACK")
         raise
-    violations = continuity_violations(conn) if version == 3 else []
-    review_rows = write_review(conn, review_path, today, _report_continuity(conn, violations, logger))
+    violations = _after_commit(logger, "the continuity check", lambda: continuity_violations(conn), [],
+                               ) if version == 3 else []
+    review_rows = _after_commit(logger, "the review file", lambda: write_review(
+        conn, review_path, today, _report_continuity(conn, violations, logger)), 0)
     return _summary(conn, "full", review_rows, unmatched, started, ledger=decisions.ledger,
-                    continuity_violations=len(violations))
+                    **_continuity_counts(violations))
+
+
+def _continuity_counts(violations: list[tuple]) -> dict:
+    return {"continuity_violations": sum(v[4] is None for v in violations),
+            "continuity_flagged": sum(v[4] is not None for v in violations)}
+
+
+def _after_commit(logger: logging.Logger, what: str, step, default=None):
+    """Run a step that follows a commit (the review file, a marker, a report): a failure is a warning, never
+    a failure of what was already committed (a review CSV open in Excel on Windows, a missing folder)."""
+    try:
+        return step()
+    except Exception as error:  # noqa: BLE001 - the committed work stands; only this side effect is lost
+        logger.warning(f"After the commit, {what} failed ({type(error).__name__}: {error}); the store itself is "
+                       "written and consistent.")
+        return default
 
 
 # --- the daily, incremental maintenance -------------------------------------------------------------------
@@ -999,8 +1031,10 @@ def incremental(conn, overrides_path: Path | None, review_path: Path | None, tod
         raise
     finally:
         conn.execute("DROP TABLE IF EXISTS symbol_changes")
-    violations = continuity_violations(conn, continuity)
-    review_rows = write_review(conn, review_path, today, _report_continuity(conn, violations, logger))
+    # Committed: nothing below may turn this run into a failure (the maintenance would rebuild in full).
+    violations = _after_commit(logger, "the continuity check", lambda: continuity_violations(conn, continuity), [])
+    review_rows = _after_commit(logger, "the review file", lambda: write_review(
+        conn, review_path, today, _report_continuity(conn, violations, logger)), 0)
     reasons = {exchange: affected.counts(exchange) for exchange in EXCHANGES}
     shown = {exchange: sorted(affected.symbols(exchange))[:12] for exchange in EXCHANGES}
     logger.info(f"Incremental maintenance: decided again NSE {len(nse_set)}, BSE {len(bse_set)} symbols "
@@ -1009,7 +1043,7 @@ def incremental(conn, overrides_path: Path | None, review_path: Path | None, tod
     return _summary(conn, "incremental", review_rows, unmatched, started,
                     decided={"NSE": len(nse_set), "BSE": len(bse_set)}, reasons=reasons,
                     rewritten_symbols=len(full_scope), vanished=sum(len(v) for v in vanished.values()),
-                    continuity_violations=len(violations))
+                    **_continuity_counts(violations))
 
 
 def _appended_rules(inputs: Inputs, exchange: str, appended: pd.DataFrame, affected: _Affected) -> None:
@@ -1249,7 +1283,8 @@ def maintain(conn, overrides_path: Path | None, review_path: Path | None, today:
             summary["check_failed"] = [list(problem) for problem in error.problems[:50]]
             extra = pd.DataFrame([{"Exchange": e, "Symbol": s, "Date": today, "Flag": f"stored-price check: {w}"}
                                   for e, s, w in error.problems])
-            summary["review_rows"] = write_review(conn, review_path, today, extra)
+            summary["review_rows"] = _after_commit(logger, "the review file",
+                                                   lambda: write_review(conn, review_path, today, extra), 0)
         except Exception as error:                   # an incremental run that cannot finish: decide everything
             logger.error(f"INCREMENTAL MAINTENANCE FAILED ({type(error).__name__}: {error}); it was rolled back "
                          "and the full rebuild runs instead.")
@@ -1313,7 +1348,7 @@ def verify(conn, overrides_path: Path | None, review_path: Path | None, today: d
         except Exception:
             conn.execute("ROLLBACK")
             raise
-        write_review(conn, review_path, today)
+        _after_commit(logger, "the review file", lambda: write_review(conn, review_path, today))
         logger.warning("Full verify: the derived tables were replaced by the full rebuild's.")
         result["status"] = "repaired"
     result["seconds"] = round(time.perf_counter() - started, 2)
@@ -1435,14 +1470,20 @@ def migrate(path: Path, overrides_path: Path | None, review_path: Path | None, t
             logger.error(f"PRICE STORE MIGRATION TO VERSION 3 FAILED AND WAS ROLLED BACK ({error}); the store "
                          "keeps working as version 2 and the migration is tried again tomorrow.")
             return False
-        marker.unlink(missing_ok=True)
-        changed = _changed_periods(old_periods, decisions.periods,
-                                   _concat([old_periods, decisions.periods], ["Exchange", "Symbol"]).drop_duplicates())
-        if not changed.empty:
-            logger.info(f"Migration: {len(changed)} symbol(s) decided differently from the version 2 store's last "
-                        f"run (lists or rules changed since): {changed.head(20).values.tolist()}")
-        write_review(conn, review_path, today)
+        # Committed: the store is version 3 whatever happens below.
         logger.info(f"Price store migrated to version 3 in {time.perf_counter() - started:.1f}s and verified.")
+        _after_commit(logger, "removing the failure marker", lambda: marker.unlink(missing_ok=True))
+
+        def report_changes():
+            changed = _changed_periods(old_periods, decisions.periods,
+                                       _concat([old_periods, decisions.periods], ["Exchange", "Symbol"])
+                                       .drop_duplicates())
+            if not changed.empty:
+                logger.info(f"Migration: {len(changed)} symbol(s) decided differently from the version 2 store's "
+                            f"last run (lists or rules changed since): {changed.head(20).values.tolist()}")
+
+        _after_commit(logger, "the comparison with the version 2 decisions", report_changes)
+        _after_commit(logger, "the review file", lambda: write_review(conn, review_path, today))
         return True
     finally:
         conn.close()
@@ -1499,9 +1540,10 @@ def downgrade_to_v2(path: Path, overrides_path: Path | None, review_path: Path |
         except Exception:
             conn.execute("ROLLBACK")
             raise
-        conn.execute("CHECKPOINT")
-        write_review(conn, review_path, today)
+        # Committed: the file is version 2 whatever happens below.
         logger.info(f"{path} is a version 2 store again (raw prices untouched, factors decided by the full rebuild).")
+        _after_commit(logger, "the checkpoint", lambda: conn.execute("CHECKPOINT"))
+        _after_commit(logger, "the review file", lambda: write_review(conn, review_path, today))
         return True
     finally:
         conn.close()

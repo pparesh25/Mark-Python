@@ -72,6 +72,7 @@ class Market:
         self.replays: list = []          # (delivery session, Series, session, open multiplier)
         self.overrides: dict = {}        # session -> overrides file text from that session on
         self.years = YEARS               # retention
+        self.truth: dict = {}            # (exchange, symbol) -> factor product, where not the company's jumps
         self.odd_days: list = []         # (delivery session, Series, session priced like, day)
         self.retractions: dict = {}      # session -> (exchange, session whose stored rows a writer removes)
 
@@ -532,6 +533,29 @@ def away_market() -> Market:
     for ex in (25, 33):
         m.lists.append(dict(exchange="NSE", symbol="TWICE", isin="INE306A01011", ex=ex, published=ex - 5,
                             purpose="Bonus 1:1"))
+    # NSE's one factor on its return covers more than one BSE factor:
+    # (i) a bonus and a split both while NSE is away, BSE lists both: BSE 0.5 x 0.5, NSE 0.25 on its return.
+    longer = set(range(28, 36))
+    m.company("TWOEV", 800, {29: 0.5, 32: 0.5})
+    q("NSE", "TWOEV", "INE307A01011", "TWOEV", sessions=set(range(60)) - longer)
+    q("BSE", "TWOEV", "INE307A01011", "TWOEV", code="530007")
+    m.lists.append(dict(exchange="BSE", symbol="TWOEV", code="530007", ex=29, published=25, purpose="Bonus issue 1:1"))
+    m.lists.append(dict(exchange="BSE", symbol="TWOEV", code="530007", ex=32, published=25,
+                        purpose="Stock  Split From Rs.10/- to Rs.5/-"))
+    # (ii) a bonus while NSE is away and a split on NSE's first day back: BSE's gap 0.5, then the remaining
+    # 0.5 of NSE's 0.25 on that day, which BSE's open shows.
+    m.company("RETEV", 700, {30: 0.5, 34: 0.5})
+    q("NSE", "RETEV", "INE308A01011", "RETEV", sessions=set(range(60)) - away)
+    q("BSE", "RETEV", "INE308A01011", "RETEV", code="530008")
+    # (iii) a split while NSE is away and the price drifts 20% before NSE is back: NSE's gap rule snaps its
+    # 0.40 open to 2/5; BSE took the 1:2 split and the rest (0.8) does not show on BSE: refused. NSE's own
+    # 0.4 is its gap rule's limit (it cannot tell the drift from the split), not a double.
+    m.company("DRIFT", 500, {30: 0.5})
+    for day, move in ((31, 0.93), (32, 0.93), (33, 0.93)):
+        m.values["DRIFT"][day:] *= move
+    q("NSE", "DRIFT", "INE309A01011", "DRIFT", sessions=set(range(60)) - away)
+    q("BSE", "DRIFT", "INE309A01011", "DRIFT", code="530009")
+    m.truth = {("NSE", "DRIFT"): 0.4}
     m.years = 5
     return m
 
@@ -544,13 +568,19 @@ def test_one_event_gets_one_factor_on_both_exchanges_when_nse_is_away(tmp_path, 
             product = dict(((e, s), f) for e, s, f in conn.execute(
                 "SELECT Exchange, Symbol, product(Factor) FROM adjustment_ledger GROUP BY ALL").fetchall())
             for series in market.series:
-                expected = market.factor(series.company, market.n - 1)
+                expected = market.truth.get((series.exchange, series.symbol),
+                                            market.factor(series.company, market.n - 1))
                 assert product.get((series.exchange, series.symbol), 1.0) == pytest.approx(expected), series.symbol
             refused = {s for s, in conn.execute(
                 "SELECT Symbol FROM price_adjustments WHERE Exchange = 'BSE' AND Event = ? AND starts_with(Flag, ?)",
                 [pa.EVENT_REFUSED, pa.FLAG_TWIN_TAKEN]).fetchall()}
-            assert refused == {"HALTSPLIT", "HALTLIST", "HOLE", "BSELIST"}
-            assert al.continuity_violations(conn) == []
+            assert refused == {"HALTSPLIT", "HALTLIST", "HOLE", "BSELIST", "TWOEV", "DRIFT"}
+            reduced = conn.execute("SELECT Symbol, Date, Factor FROM adjustment_ledger WHERE Exchange = 'BSE' "
+                                   "AND Event = 'nse' AND Symbol = 'RETEV'").fetchall()
+            assert reduced == [("RETEV", day_of(34), pytest.approx(0.5))]
+            assert conn.execute("SELECT Flag FROM price_adjustments WHERE Exchange = 'BSE' AND Symbol = 'RETEV' "
+                                "AND Date = ?", [day_of(34)]).fetchone()[0].startswith(pa.FLAG_TWIN_REST)
+            assert [v for v in al.continuity_violations(conn) if v[4] is None] == []
         events = dict(((s, d), e) for s, d, e in oracle.execute(
             "SELECT Symbol, Date, Event FROM adjustment_ledger WHERE Exchange = 'BSE'").fetchall())
         assert events[("HALTSPLIT", day_of(30))] == "gap" and events[("BSELIST", day_of(30))] == "list"
@@ -570,6 +600,8 @@ def test_the_continuity_invariant_is_reported_not_looped(tmp_path, monkeypatch, 
     assert summary["mode"] == "incremental" and summary["continuity_violations"] == 0
     assert conn.execute("SELECT Flag FROM price_adjustments WHERE Exchange = 'NSE' AND Date = ?",
                         [day_of(10)]).fetchone()[0] == pa.FLAG_CONTINUITY
+    # a flagged factor day that still jumps is reported too (it may be a double flagged for another reason)
+    assert summary["continuity_flagged"] >= 1 and "already flagged: " + pa.FLAG_CONTINUITY in review.read_text()
     # ... and when the flag is missing the stored series breaks the invariant: logged, reviewed, not rolled back.
     real = pa.refuse_repeats
     monkeypatch.setattr(pa, "refuse_repeats", lambda d, e: real(d, e).assign(
@@ -953,6 +985,48 @@ def test_each_days_adjusted_rows_are_written_once(tmp_path, pocl_template, monke
         al.maintain(conn, overrides, None, day_of(session), LOG)
         assert written and sum(written) == 0                       # the maintenance found them right
     assert al.verify(conn, overrides, None, day_of(31), LOG, repair=False)["status"] == "ok"
+    conn.close()
+
+
+def test_retention_inside_the_callers_transaction_joins_it(tmp_path, pocl_template):
+    conn, market, overrides = small_store(tmp_path, pocl_template)
+    before = snapshot(conn)
+    assert not eod_store.in_transaction(conn)
+    conn.execute("BEGIN TRANSACTION")
+    assert eod_store.in_transaction(conn)
+    assert apply_retention(conn, 60 / 365.25) > 0                  # no nested BEGIN: the caller's stays usable
+    assert conn.execute("SELECT count(*) FROM symbol_state WHERE Pruned_Before IS NOT NULL").fetchone()[0] == 2
+    conn.execute("ROLLBACK")                                         # ... and it rolls back with it
+    assert snapshot(conn) == before
+    conn.execute("BEGIN TRANSACTION")
+    apply_retention(conn, 60 / 365.25)
+    conn.execute("COMMIT")
+    assert conn.execute("SELECT count(*) FROM symbol_state WHERE Pruned_Before IS NOT NULL").fetchone()[0] == 2
+    conn.close()
+
+
+def test_a_failure_after_the_commit_never_reports_a_committed_change_as_failed(tmp_path, pocl_template,
+                                                                                 v2_template, monkeypatch, caplog):
+    # The review file cannot be written (its folder is gone; on Windows: open in Excel).
+    def locked(*args, **kwargs):
+        raise PermissionError("corporate_action_review.csv is open in another program")
+
+    monkeypatch.setattr(al, "write_review", locked)
+    conn, market, overrides = small_store(tmp_path, pocl_template)
+    conn.close()
+    with caplog.at_level(logging.WARNING):
+        assert eod_store.main(["--downgrade-to-v2", str(tmp_path / "store.duckdb")]) == 0
+    assert "After the commit, the review file failed" in caplog.text
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"), read_only=True)
+    assert schema_version(conn) == 2
+    conn.close()
+    path, overrides = v2_store(tmp_path, v2_template)
+    assert al.migrate(path, overrides, tmp_path / "missing" / "review.csv", day_of(59), LOG, backup=False) is True
+    conn = duckdb.connect(str(path))
+    assert schema_version(conn) == 3
+    summary = al.maintain(conn, overrides, None, day_of(59), LOG)
+    assert summary["mode"] == "incremental" and summary["review_rows"] == 0      # not a fallback to the rebuild
+    assert pa.rebuild(conn, overrides, None, day_of(59), LOG)["mode"] == "full"
     conn.close()
 
 

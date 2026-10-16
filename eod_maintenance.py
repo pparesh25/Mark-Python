@@ -75,7 +75,8 @@ def maintain(logger: logging.Logger, nse_factory=open_nse, today: date | None = 
         try:
             adjustment_ledger.migrate(path, overrides_file(), review_file(), today, logger)
         except Exception as error:                   # the backup copy or the file itself failed
-            logger.error(f"PRICE STORE MIGRATION TO VERSION 3 NOT DONE ({error}); it stays version 2.")
+            logger.error(f"PRICE STORE MIGRATION TO VERSION 3 STOPPED ({error}); the store is version "
+                         f"{_version_of(path)} now.")
     conn = duckdb.connect(str(path))
     nse = None
     try:
@@ -90,6 +91,18 @@ def maintain(logger: logging.Logger, nse_factory=open_nse, today: date | None = 
                 nse.exit()
             except Exception as error:               # closing the session is best effort
                 logger.debug(f"NSE session did not close cleanly: {error}")
+
+
+def _version_of(path) -> str:
+    """The store's schema version as it is on disk, for a message after an error ("unknown" if unreadable)."""
+    try:
+        conn = duckdb.connect(str(path), read_only=True)
+        try:
+            return str(schema_version(conn))
+        finally:
+            conn.close()
+    except Exception as error:  # noqa: BLE001 - only for a message
+        return f"unknown ({error})"
 
 
 def verify_store(logger: logging.Logger, today: date | None = None) -> dict:
