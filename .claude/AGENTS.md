@@ -214,18 +214,27 @@ Screener.in columns; `EOD_Down_From_52w_High` is computed from EOD data.
    refused before anything is written.
 
 8. **Stored adjustments (store v3)**: `eod_prices` is a table, not a view.
-   Anything that writes `raw_prices` must keep it in step: `upsert_daily_prices`
+   Anything that writes `raw_prices` should keep it in step: `upsert_daily_prices`
    writes the day's adjusted rows itself, renames move every derived table
    (`eod_store.DERIVED_TABLES`), a reused ticker drops them, `apply_retention`
-   updates `symbol_state`; any other writer must call `eod_store.rematerialize`
-   for its rows or rely on the next maintenance (it finds the change through
-   `symbol_state` and decides the symbol again). Correctness is defined as
+   updates `symbol_state` (one transaction); another writer calls
+   `eod_store.rematerialize` for its rows, or leaves it to the next maintenance:
+   `symbol_state` sums a hash of every stored raw column per symbol, so any
+   change to a stored row is found -- a day, open or close decides the symbol
+   again, any other column only rewrites its adjusted rows. Correctness is defined as
    "equal to `price_adjustments.rebuild()`": a new dependency between symbols or
    days needs a rule in `adjustment_ledger.py` (see its docstring) and a case in
    `tests/test_adjustment_ledger.py`'s simulation; when unsure, decide more
    symbols. Bump `adjustment_ledger.RULE_VERSION` when a decision rule changes,
    so the next run rebuilds in full. The migration needs free disk for a copy
-   of the store plus ~1.5x its size (v3 is ~65% larger than v2).
+   of the store plus ~1.5x its size (v3 is ~80% larger than v2); a failed one is
+   retried at most once a day (`<stem>.migration-failed.json`).
+
+9. **Rollout of store v3**: code before v3 breaks on a v3 file (CatalogException:
+   eod_prices is a table; its upserts write raw only and eod_data goes stale).
+   Merge into `main` (the scheduler's checkout) before the new code runs on the
+   default data root, and update all machines sharing it together. Roll back
+   with `python -m eod_store --downgrade-to-v2 [PATH]` before starting old code.
 
 ## Git Workflow
 

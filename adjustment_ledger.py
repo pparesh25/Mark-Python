@@ -20,11 +20,13 @@ gap_history, eod_prices (a table), symbol_state, maintenance_state.
 Daily flow (`maintain`, from price_adjustments.refresh after the lists were fetched):
 
   1. symbol_state holds, per symbol, the raw rows the last decision saw (count,
-     last day, the sum of a hash of each row's day, open and close) and a digest
-     of its other inputs. One aggregate over raw_prices classifies each symbol:
-     same, append (only rows after its last day), rewritten (a backfilled, replayed
-     with other prices, or removed row -- any row on or before its last day
-     changed), new, or vanished.
+     last day, the sum of a hash of each row's day, open and close -- Digest --
+     and of every stored column -- Row_Digest) and a digest of its other inputs.
+     One aggregate over raw_prices classifies each symbol: same, append (only rows
+     after its last day), rewritten (a day, open or close on or before its last
+     day changed: a backfill, a replay with other prices, a removed row), restated
+     (only another column of such a row changed: its adjusted rows are compared
+     with raw again, nothing is decided), new, or vanished.
   2. The affected symbols are collected by the dependency rules below. A backfill
      is never an append: a new day changes its neighbours' gaps.
   3. They are decided again on their full history with the same function the
@@ -32,18 +34,22 @@ Daily flow (`maintain`, from price_adjustments.refresh after the lists were fetc
      NSE twins' new factors.
   4. In ONE transaction: their price_adjustments, ledger (Decided_At kept for an
      unchanged factor), gap_history and periods rows are replaced; eod_prices is
-     rewritten from raw for every symbol whose periods changed or whose raw rows
-     were rewritten, and the appended rows of all others are written with their
-     ledger's factors (normally none after a new day, never assumed); then the
-     checks run, and any failure rolls everything back.
+     compared with raw x periods for every symbol whose periods changed or whose
+     raw rows were rewritten, restated or new, and for the appended rows of all
+     others (the upsert wrote them already with the ledger's factors, never assumed
+     ones); only rows that differ are written, so a day's rows are written once.
+     symbol_state rows are written only where they changed. Then the checks run,
+     and any failure rolls everything back. CHECKPOINT at the end.
 
 Dependency rules (the reasons logged; when unsure a rule takes more symbols, never fewer):
 
   rewritten        raw rows on or before the symbol's last decided day changed or went (fill-missing,
                    a replayed or re-sent day with other prices, a ticker reused by another issuer)
-  new              a series without state: a new listing, both names of a rename (the upsert moves
+  (new)            a series without state -- a new listing, both names of a rename (the upsert moves
                    the derived rows with the raw rows, gap history included, and drops both states,
-                   since NSE lists match by name and overrides are written per name)
+                   since NSE lists match by name and overrides are written per name) -- has no stored
+                   inputs digest, so `inputs` always takes it; the separate rule was redundant (the
+                   rule ablation could not make it matter) and is gone
   vanished         no raw rows left (renamed away, all aged out): every derived row is deleted
   gap              an appended day whose open gaps below 0.80 or at 1.8 and up (priced from Rs 5):
                    the gap rules, the noise count and gap_history
@@ -53,6 +59,8 @@ Dependency rules (the reasons logged; when unsure a rule takes more symbols, nev
   listing_day      a listed action with an ex-date an appended day can be the first day within 10 of
   listing_due      a listed action whose "no trade within 10 days" check comes due: ex-date + 10 days
                    reached by the exchange's last stored day or by today; or the exchange's first day moved
+                   (an older day of another symbol brings an old listing into the stored range -- the
+                   only case `halt` does not also cover)
   inputs           the digest of the symbol's resolved list rows (a list replacement can add or remove
                    rows; a full history refresh too; NSE resolves by ISIN, prefix or today's name, so
                    securities changes count), its overrides (in file order), and for BSE its NSE twin
@@ -74,7 +82,9 @@ Dependency rules (the reasons logged; when unsure a rule takes more symbols, nev
                    day; their periods are recomputed (the remaining factors multiply in the same order,
                    so their adjusted prices stay bit for bit). gap_history keeps the aged-out gaps, so
                    the noise count does not change.
-  range_back       the exchange's last stored day moved back: all its symbols
+  range_back       the exchange's last stored day moved back: all its symbols. Kept as cheap insurance;
+                   the only decision that reads the last day (an unmatched listing) can only change for a
+                   symbol that traded on the removed day, which is `rewritten` anyway
 
 A DuckDB or rule version change, or a store never maintained, takes the full rebuild.
 
@@ -83,14 +93,20 @@ Checks (all tested):
   - adjustment_ledger PRIMARY KEY (Exchange, Symbol, Date) and CHECK (Factor > 0 AND isfinite):
     a second factor on a symbol-day, a factor of 0, below 0 or not finite cannot be stored.
   - price_adjustments.refuse_repeats: one Event_Key (a listed action without its day) twice
-    within 30 days, or a BSE listing beside an NSE twin factor of the same ratio, is refused
-    and flagged; a factor whose adjusted open still gaps 25% or more is flagged for review.
+    within 30 days, a BSE listing beside an NSE twin factor of the same ratio, or an NSE twin
+    factor BSE's open does not confirm while BSE's own factor of the same ratio already took the
+    event during NSE's absence, is refused and flagged; a factor whose adjusted open still gaps
+    25% or more is flagged for review.
   - check_prices: every stored adjusted row of the touched symbols is raw x the product of the
     symbol's later ledger factors (to rounding); none missing, none extra.
-  - check_continuity: on each ledger day of a touched symbol the stored adjusted open over the
-    stored previous close is the raw gap over the factor -- a factor applied twice or not at all
-    shows there. A failed check rolls the maintenance back, names the symbols in the review
-    file and runs the full rebuild instead.
+  - check_factor_days: on each ledger day of a touched symbol the stored adjusted open over the
+    stored previous close is the raw gap over the factor -- a factor materialized twice or not
+    at all shows there. A failed check rolls the maintenance back, names the symbols in the
+    review file and runs the full rebuild instead (which writes correct rows: no loop).
+  - continuity_violations (the spec's invariant, on the stored adjusted series): on every ledger
+    day |ln(adjusted open / adjusted previous close)| < 0.25 unless the day is flagged. The
+    decision layer flags every such factor, so a hit is logged loudly and put on the review
+    list, never rolled back (the full rebuild would decide the same).
   - verify (weekly, `run_screener.py --verify`, after every migration): the oracle is computed
     and every derived table compared with it, eod_prices row for row; a difference is logged
     with its symbols and the derived tables are replaced by the oracle's in one transaction.
@@ -99,6 +115,7 @@ Checks (all tested):
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import shutil
 import time
@@ -116,7 +133,7 @@ import price_adjustments as pa
 
 module_logger = logging.getLogger(__name__)
 
-RULE_VERSION = 1                       # bump when a decision rule changes: the next run rebuilds in full
+RULE_VERSION = 2                       # bump when a decision rule changes: the next run rebuilds in full
 VERIFY_EVERY_DAYS = 7
 EXCHANGES = ("NSE", "BSE")
 ONE_DAY = pd.Timedelta(days=1)
@@ -127,7 +144,7 @@ PERIOD_COLUMNS = ["Exchange", "Symbol", "From_Date", "Adj"]
 CONTINUITY_TOLERANCE = 0.02            # |ln| between a stored adjusted gap and the raw gap over the factor
 CHECK_MIN_PRICE = 0.01                 # below this the 4-place rounding is too coarse to check a gap
 MIGRATION_HEADROOM = 256 * 1024 * 1024
-REASONS = ("rewritten", "new", "gap", "halt", "override_day", "listing_day", "listing_due", "inputs",
+REASONS = ("rewritten", "gap", "halt", "override_day", "listing_day", "listing_due", "inputs",
            "twin_pending", "twin_covered", "twin_rewritten", "retention", "range_back")
 
 
@@ -383,19 +400,41 @@ def _overrides_hash(overrides: pd.DataFrame) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:20]
 
 
-def _write_symbol_state(conn, digests: pd.DataFrame, source: str = "raw") -> None:
-    """symbol_state from the raw aggregates (`source` "raw": computed now; else a temp table of them)."""
-    aggregates = (f"(SELECT Exchange, Symbol, count(*) AS Rows, min(Date) AS First_Date, max(Date) AS Last_Date, "
-                  f"sum({eod_store.row_hash()}) AS Digest FROM raw_prices GROUP BY Exchange, Symbol)"
-                  if source == "raw" else source)
+RAW_AGGREGATES = (f"(SELECT Exchange, Symbol, count(*) AS Rows, min(Date) AS First_Date, max(Date) AS Last_Date, "
+                  f"sum({eod_store.decision_hash()}) AS Digest, sum({eod_store.row_hash()}) AS Row_Digest "
+                  "FROM raw_prices GROUP BY Exchange, Symbol)")
+
+
+def _write_symbol_state(conn, digests: pd.DataFrame, source: str = RAW_AGGREGATES, changed_only: bool = False) -> None:
+    """symbol_state from raw aggregates (`source`: computed now, or a temp table of them) and the digests.
+
+    `changed_only` writes only the rows that differ (and deletes those of symbols gone).
+    """
+    columns = ", ".join(eod_store.STATE_COLUMNS)
     conn.register("symbol_digests", digests[["Exchange", "Symbol", "Inputs_Digest"]])
     try:
-        conn.execute("DELETE FROM symbol_state")
         conn.execute(f"""
-            INSERT INTO symbol_state
-            SELECT a.Exchange, a.Symbol, a.Rows, a.First_Date, a.Last_Date, a.Digest, d.Inputs_Digest, NULL
-            FROM {aggregates} a
+            CREATE OR REPLACE TEMP TABLE new_state AS
+            SELECT a.Exchange, a.Symbol, a.Rows, a.First_Date, a.Last_Date, a.Digest, a.Row_Digest,
+                   d.Inputs_Digest, CAST(NULL AS DATE) AS Pruned_Before
+            FROM {source} a
             LEFT JOIN symbol_digests d ON d.Exchange = a.Exchange AND d.Symbol = a.Symbol""")
+        if changed_only:
+            conn.execute(f"""
+                CREATE OR REPLACE TEMP TABLE changed_state AS
+                SELECT DISTINCT Exchange, Symbol FROM (
+                    (SELECT {columns} FROM symbol_state EXCEPT SELECT {columns} FROM new_state)
+                    UNION ALL (SELECT {columns} FROM new_state EXCEPT SELECT {columns} FROM symbol_state))""")
+            conn.execute("DELETE FROM symbol_state s USING changed_state c "
+                         "WHERE s.Exchange = c.Exchange AND s.Symbol = c.Symbol")
+            picked = ", ".join("n." + column for column in eod_store.STATE_COLUMNS)
+            conn.execute(f"INSERT INTO symbol_state ({columns}) SELECT {picked} FROM new_state n "
+                         "JOIN changed_state c ON n.Exchange = c.Exchange AND n.Symbol = c.Symbol")
+            conn.execute("DROP TABLE changed_state")
+        else:
+            conn.execute("DELETE FROM symbol_state")
+            conn.execute(f"INSERT INTO symbol_state ({columns}) SELECT {columns} FROM new_state")
+        conn.execute("DROP TABLE new_state")
     finally:
         conn.unregister("symbol_digests")
 
@@ -515,7 +554,7 @@ def check_prices(conn, scope: pd.DataFrame | None = None) -> list[tuple]:
     return [tuple(row) for row in rows]
 
 
-def check_continuity(conn, symbols: pd.DataFrame | None = None) -> list[tuple]:
+def check_factor_days(conn, symbols: pd.DataFrame | None = None) -> list[tuple]:
     """(Exchange, Symbol, what) where the stored adjusted gap on a ledger day is not the raw gap over its factor.
 
     A factor stored twice divides the history again and leaves the gap at gap / factor^2; a factor
@@ -546,6 +585,52 @@ def check_continuity(conn, symbols: pd.DataFrame | None = None) -> list[tuple]:
         problems.append((exchange, symbol, f"{day}: stored adjusted gap {stored_gap:.4f}, expected "
                          f"{gap / factor:.4f} (factor {factor:g}){' -- applied twice' if twice else ''}"))
     return problems
+
+
+def continuity_violations(conn, symbols: pd.DataFrame | None = None) -> list[tuple]:
+    """(Exchange, Symbol, Date, adjusted gap) of applied factor days whose ADJUSTED gap breaks continuity.
+
+    The spec's invariant, on the stored adjusted series: on every ledger day
+    |ln(adjusted open / adjusted previous close)| < CONTINUITY_LIMIT unless that
+    day's decision is flagged. The decision layer flags every factor that leaves
+    such a jump (price_adjustments.refuse_repeats), so a row here means stored
+    prices and decisions disagree. It is reported loudly and put on the review
+    list -- never rolled back into a loop: the full rebuild would decide the same.
+    """
+    if symbols is not None and symbols.empty:
+        return []
+    if symbols is not None:
+        conn.register("invariant_scope", symbols[["Exchange", "Symbol"]].assign(After=pd.NaT))
+    try:
+        eod_rows = _scope_sql("eod_prices", "invariant_scope" if symbols is not None else None)
+        rows = conn.execute(f"""
+            WITH e AS (SELECT Exchange, Symbol, Date, Open,
+                              lag(Close) OVER (PARTITION BY Exchange, Symbol ORDER BY Date) AS Prev_Close
+                       FROM {eod_rows})
+            SELECT l.Exchange, l.Symbol, l.Date, e.Open / e.Prev_Close AS Adjusted_Gap
+            FROM adjustment_ledger l
+            JOIN e ON e.Exchange = l.Exchange AND e.Symbol = l.Symbol AND e.Date = l.Date
+            WHERE e.Prev_Close >= {CHECK_MIN_PRICE} AND e.Open >= {CHECK_MIN_PRICE}
+              AND abs(ln(e.Open / e.Prev_Close)) >= {pa.CONTINUITY_LIMIT}
+              AND NOT EXISTS (SELECT 1 FROM price_adjustments p WHERE p.Exchange = l.Exchange
+                              AND p.Symbol = l.Symbol AND p.Date = l.Date AND p.Flag IS NOT NULL)
+            ORDER BY 1, 2, 3""").fetchall()
+    finally:
+        if symbols is not None:
+            conn.unregister("invariant_scope")
+    return [tuple(row) for row in rows]
+
+
+def _report_continuity(conn, violations: list[tuple], logger: logging.Logger) -> pd.DataFrame:
+    """Log continuity violations loudly; the review rows for them."""
+    if not violations:
+        return _empty(["Exchange", "Symbol", "Date", "Flag"])
+    logger.error(f"CONTINUITY INVARIANT BROKEN on {len(violations)} unflagged factor day(s) -- the adjusted open "
+                 f"still jumps {pa.CONTINUITY_LIMIT:.0%} or more; put on the review list: "
+                 f"{[f'{e} {s} {d} gap {g:.3f}' for e, s, d, g in violations[:10]]}")
+    return pd.DataFrame([{"Exchange": e, "Symbol": s, "Date": d,
+                          "Flag": f"continuity: adjusted open {g:.3f}x the adjusted previous close after the factor"}
+                         for e, s, d, g in violations])
 
 
 def _eod_differences(conn, periods: pd.DataFrame) -> list[tuple]:
@@ -599,11 +684,12 @@ def differences(conn, decisions: Decisions) -> dict:
     conn.register("oracle_digests", decisions.digests)
     try:
         pairs = conn.execute(f"""
-            WITH x AS (SELECT a.Exchange, a.Symbol, a.Rows, a.First_Date, a.Last_Date, a.Digest, d.Inputs_Digest
-                       FROM (SELECT Exchange, Symbol, count(*) AS Rows, min(Date) AS First_Date, max(Date) AS Last_Date,
-                                    sum({eod_store.row_hash()}) AS Digest FROM raw_prices GROUP BY Exchange, Symbol) a
+            WITH x AS (SELECT a.Exchange, a.Symbol, a.Rows, a.First_Date, a.Last_Date, a.Digest, a.Row_Digest,
+                              d.Inputs_Digest
+                       FROM {RAW_AGGREGATES} a
                        LEFT JOIN oracle_digests d ON d.Exchange = a.Exchange AND d.Symbol = a.Symbol),
-                 s AS (SELECT Exchange, Symbol, Rows, First_Date, Last_Date, Digest, Inputs_Digest FROM symbol_state)
+                 s AS (SELECT Exchange, Symbol, Rows, First_Date, Last_Date, Digest, Row_Digest, Inputs_Digest
+                       FROM symbol_state)
             SELECT DISTINCT Exchange, Symbol FROM ((SELECT * FROM s EXCEPT ALL SELECT * FROM x)
                                                     UNION ALL (SELECT * FROM x EXCEPT ALL SELECT * FROM s))
             ORDER BY 1, 2""").fetchall()
@@ -655,7 +741,7 @@ def _summary(conn, mode: str, review_rows: int, unmatched: int, started: float, 
 
 
 def _full_checks(conn, decisions: Decisions | None = None) -> list[tuple]:
-    problems = check_prices(conn) + check_continuity(conn)
+    problems = check_prices(conn) + check_factor_days(conn)
     if decisions is not None:
         for table, pairs in differences(conn, decisions).items():
             problems += [(exchange, symbol, f"{table} differs from the full rebuild") for exchange, symbol in pairs]
@@ -681,7 +767,7 @@ def rebuild(conn, overrides_path: Path | None = None, review_path: Path | None =
     try:
         if version == 3:
             write_all(conn, decisions, datetime.now(pa.MARKET_TZ).replace(tzinfo=None))
-            problems = check_prices(conn) + check_continuity(conn)
+            problems = check_prices(conn) + check_factor_days(conn)
             if problems:
                 raise LedgerCheckError(problems)
         else:
@@ -693,8 +779,10 @@ def rebuild(conn, overrides_path: Path | None = None, review_path: Path | None =
     except Exception:
         conn.execute("ROLLBACK")
         raise
-    review_rows = write_review(conn, review_path, today)
-    return _summary(conn, "full", review_rows, unmatched, started, ledger=decisions.ledger)
+    violations = continuity_violations(conn) if version == 3 else []
+    review_rows = write_review(conn, review_path, today, _report_continuity(conn, violations, logger))
+    return _summary(conn, "full", review_rows, unmatched, started, ledger=decisions.ledger,
+                    continuity_violations=len(violations))
 
 
 # --- the daily, incremental maintenance -------------------------------------------------------------------
@@ -724,19 +812,24 @@ def _classify(conn) -> pd.DataFrame:
         CREATE OR REPLACE TEMP TABLE symbol_changes AS
         WITH agg AS (
             SELECT r.Exchange, r.Symbol, count(*) AS Rows, min(r.Date) AS First_Date, max(r.Date) AS Last_Date,
-                   sum({eod_store.row_hash('r.')}) AS Digest,
+                   sum({eod_store.decision_hash('r.')}) AS Digest, sum({eod_store.row_hash('r.')}) AS Row_Digest,
                    count(*) FILTER (WHERE r.Date <= s.Last_Date) AS Old_Rows,
-                   sum({eod_store.row_hash('r.')}) FILTER (WHERE r.Date <= s.Last_Date) AS Old_Digest
+                   sum({eod_store.decision_hash('r.')}) FILTER (WHERE r.Date <= s.Last_Date) AS Old_Digest,
+                   sum({eod_store.row_hash('r.')}) FILTER (WHERE r.Date <= s.Last_Date) AS Old_Row_Digest
             FROM raw_prices r LEFT JOIN symbol_state s ON s.Exchange = r.Exchange AND s.Symbol = r.Symbol
             GROUP BY r.Exchange, r.Symbol)
         SELECT COALESCE(a.Exchange, s.Exchange) AS Exchange, COALESCE(a.Symbol, s.Symbol) AS Symbol,
-               a.Rows, a.First_Date, a.Last_Date, a.Digest,
+               a.Rows, a.First_Date, a.Last_Date, a.Digest, a.Row_Digest,
                s.Last_Date AS Prev_Last, s.Inputs_Digest AS Prev_Inputs, s.Pruned_Before,
+               a.Rows > COALESCE(a.Old_Rows, 0) AS Has_New,
+               -- rewritten: a day, open or close on or before the last decided day changed (decide again);
+               -- restated: only another column of such a row (a late delivery figure): write the rows again
                CASE WHEN a.Symbol IS NULL THEN 'vanished'
                     WHEN s.Symbol IS NULL THEN 'new'
-                    WHEN a.Old_Rows = s.Rows AND a.Old_Digest IS NOT DISTINCT FROM s.Digest
-                         THEN CASE WHEN a.Rows = s.Rows THEN 'same' ELSE 'append' END
-                    ELSE 'rewritten' END AS Kind
+                    WHEN a.Old_Rows <> s.Rows OR a.Old_Digest IS DISTINCT FROM s.Digest THEN 'rewritten'
+                    WHEN a.Old_Row_Digest IS DISTINCT FROM s.Row_Digest THEN 'restated'
+                    WHEN a.Rows = s.Rows THEN 'same'
+                    ELSE 'append' END AS Kind
         FROM agg a FULL OUTER JOIN symbol_state s ON s.Exchange = a.Exchange AND s.Symbol = a.Symbol""")
     return _frame(conn, "SELECT Exchange, Symbol, Rows, First_Date, Last_Date, Prev_Last, Prev_Inputs, "
                         "Pruned_Before, Kind FROM symbol_changes")
@@ -746,7 +839,8 @@ def _appended(conn) -> pd.DataFrame:
     """Per appended symbol: its new days' range, whether one gaps the way a rule decides, whether one
     comes after a halt (computed against the last stored day)."""
     return _frame(conn, f"""
-        WITH s AS (SELECT Exchange, Symbol, Prev_Last FROM symbol_changes WHERE Kind = 'append'),
+        WITH s AS (SELECT Exchange, Symbol, Prev_Last FROM symbol_changes
+                   WHERE Kind = 'append' OR (Kind = 'restated' AND Has_New)),
         g AS (SELECT r.Exchange, r.Symbol, r.Date, r.Open, s.Prev_Last,
                      lag(r.Close) OVER w AS Prev_Close, lag(r.Date) OVER w AS Prev_Date
               FROM raw_prices r JOIN s ON s.Exchange = r.Exchange AND s.Symbol = r.Symbol
@@ -842,7 +936,6 @@ def incremental(conn, overrides_path: Path | None, review_path: Path | None, tod
         present[exchange] = set(mine.loc[mine["Kind"] != "vanished", "Symbol"])
         vanished[exchange] = set(mine.loc[mine["Kind"] == "vanished", "Symbol"])
         affected.add(exchange, mine.loc[mine["Kind"] == "rewritten", "Symbol"], "rewritten")
-        affected.add(exchange, mine.loc[mine["Kind"] == "new", "Symbol"], "new")
         _appended_rules(inputs, exchange, appended[appended["Exchange"] == exchange], affected)
         _range_rules(inputs, state, exchange, present[exchange], affected)
 
@@ -879,7 +972,9 @@ def incremental(conn, overrides_path: Path | None, review_path: Path | None, tod
     new_periods = periods_of(periods_ledger)
     old_periods = _frame(conn, "SELECT * FROM adjustment_periods")
     changed_periods = _changed_periods(old_periods, new_periods, periods_scope)
-    rewritten = changes[changes["Kind"].isin(["rewritten", "new"])][pair]
+    # Rewritten or new series, and series whose non-price columns changed (restated), get every
+    # adjusted row compared with raw again; only rows that differ are written.
+    rewritten = changes[changes["Kind"].isin(["rewritten", "new", "restated"])][pair]
     full_scope = _concat([changed_periods, rewritten], pair).drop_duplicates()
     after_scope = _without(appended[pair + ["Prev_Last"]].rename(columns={"Prev_Last": "After"}), full_scope)
     now = datetime.now(pa.MARKET_TZ).replace(tzinfo=None)
@@ -889,12 +984,13 @@ def incremental(conn, overrides_path: Path | None, review_path: Path | None, tod
     try:
         _apply(conn, inputs, parts, decided, vanished, stored_ledger, periods_scope, new_periods, full_scope,
                after_scope, changes, now)
-        _write_symbol_state(conn, all_digests, source="(SELECT * FROM symbol_changes WHERE Kind <> 'vanished')")
+        _write_symbol_state(conn, all_digests, source="(SELECT * FROM symbol_changes WHERE Kind <> 'vanished')",
+                            changed_only=True)
         _write_state(conn, inputs, verified=False, overrides_hash=_overrides_hash(inputs.overrides))
         checked = _concat([full_scope.assign(After=pd.NaT), after_scope], pair + ["After"])
         problems = check_prices(conn, checked)
         continuity = _concat([decided, full_scope], pair).drop_duplicates()
-        problems += check_continuity(conn, continuity)
+        problems += check_factor_days(conn, continuity)
         if problems:
             raise LedgerCheckError(problems)
         conn.execute("COMMIT")
@@ -903,7 +999,8 @@ def incremental(conn, overrides_path: Path | None, review_path: Path | None, tod
         raise
     finally:
         conn.execute("DROP TABLE IF EXISTS symbol_changes")
-    review_rows = write_review(conn, review_path, today)
+    violations = continuity_violations(conn, continuity)
+    review_rows = write_review(conn, review_path, today, _report_continuity(conn, violations, logger))
     reasons = {exchange: affected.counts(exchange) for exchange in EXCHANGES}
     shown = {exchange: sorted(affected.symbols(exchange))[:12] for exchange in EXCHANGES}
     logger.info(f"Incremental maintenance: decided again NSE {len(nse_set)}, BSE {len(bse_set)} symbols "
@@ -911,7 +1008,8 @@ def incremental(conn, overrides_path: Path | None, review_path: Path | None, tod
                 f"{len(after_scope)}; e.g. {shown}")
     return _summary(conn, "incremental", review_rows, unmatched, started,
                     decided={"NSE": len(nse_set), "BSE": len(bse_set)}, reasons=reasons,
-                    rewritten_symbols=len(full_scope), vanished=sum(len(v) for v in vanished.values()))
+                    rewritten_symbols=len(full_scope), vanished=sum(len(v) for v in vanished.values()),
+                    continuity_violations=len(violations))
 
 
 def _appended_rules(inputs: Inputs, exchange: str, appended: pd.DataFrame, affected: _Affected) -> None:
@@ -1159,6 +1257,7 @@ def maintain(conn, overrides_path: Path | None, review_path: Path | None, today:
             summary["mode"] = f"full (the incremental run failed: {type(error).__name__})"
     if verify_due(read_state(conn), today):
         summary["verify"] = verify(conn, overrides_path, review_path, today, logger)
+    conn.execute("CHECKPOINT")                       # the freed blocks are reused by the next run's rows
     return summary
 
 
@@ -1178,7 +1277,7 @@ def verify(conn, overrides_path: Path | None, review_path: Path | None, today: d
     decisions = decide_all(conn, inputs, history=version == 3)
     if version == 3:
         found = differences(conn, decisions)
-        independent = check_prices(conn) + check_continuity(conn)
+        independent = check_prices(conn) + check_factor_days(conn)
         if independent:
             found["checks"] = sorted({(e, s) for e, s, _ in independent})
     else:
@@ -1242,6 +1341,21 @@ def differences_v2(conn, decisions: Decisions) -> dict:
     return found
 
 
+def _read_marker(marker: Path) -> dict | None:
+    try:
+        return json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else None
+    except (OSError, ValueError) as error:
+        module_logger.warning(f"Unreadable migration marker {marker} ({error}); ignored.")
+        return None
+
+
+def _write_marker(marker: Path, today: date, error: str) -> None:
+    try:
+        marker.write_text(json.dumps({"date": today.isoformat(), "error": error}), encoding="utf-8")
+    except OSError as failure:
+        module_logger.warning(f"Could not write the migration marker {marker} ({failure}).")
+
+
 def migrate(path: Path, overrides_path: Path | None, review_path: Path | None, today: date | None = None,
             logger: logging.Logger | None = None, backup: bool = True) -> bool:
     """Turn a version 2 store into version 3 in one transaction; False (and the store still version 2) on failure.
@@ -1249,21 +1363,35 @@ def migrate(path: Path, overrides_path: Path | None, review_path: Path | None, t
     First the file is copied to <stem>.v2-backup.duckdb beside it (unless `backup` is False), when the disk
     has room for the copy and the new tables. raw_prices is never written. Inside the transaction the
     tables are created, everything is decided (the full rebuild), eod_prices is filled, and the full
-    verify runs; any failure rolls it all back.
+    verify runs; any failure rolls it all back. A failed migration is tried again at most once a day
+    (<stem>.migration-failed.json beside the store says when and why; every run warns until it succeeds).
     """
     logger = logger or module_logger
     today = today or pa.market_today()
     path = Path(path)
+    marker = path.with_name(f"{path.stem}.migration-failed.json")
     conn = duckdb.connect(str(path))
     try:
         version = eod_store.schema_version(conn)
+        # A migration killed half-way leaves its rows in the WAL or the file: replay and reclaim them
+        # before the disk is measured.
+        conn.execute("CHECKPOINT")
     finally:
         conn.close()                                      # a closed file has no pending WAL to miss in the copy
     if version != 2:
         return version == 3
+    failed = _read_marker(marker)
+    if failed and failed.get("date") == today.isoformat():
+        logger.error(f"PRICE STORE STILL VERSION 2: the migration to version 3 failed today ({failed.get('error')}); "
+                     f"it is tried again tomorrow ({marker.name}). The store keeps working as version 2.")
+        return False
+    if failed:
+        logger.warning(f"The last migration to version 3 failed on {failed.get('date')} ({failed.get('error')}); "
+                       "trying again.")
     size = path.stat().st_size
+    target = path.with_name(f"{path.stem}.v2-backup{path.suffix}")
     need = (size if backup else 0) + int(size * 1.5) + MIGRATION_HEADROOM
-    free = shutil.disk_usage(path.parent).free
+    free = shutil.disk_usage(path.parent).free + (target.stat().st_size if backup and target.exists() else 0)
     if free < need:
         logger.error(f"PRICE STORE NOT MIGRATED TO VERSION 3: {free / 1e6:.0f} MB free on the disk, about "
                      f"{need / 1e6:.0f} MB needed (backup and new tables). It keeps working as version 2; "
@@ -1271,8 +1399,14 @@ def migrate(path: Path, overrides_path: Path | None, review_path: Path | None, t
         return False
     started = time.perf_counter()
     if backup:
-        target = path.with_name(f"{path.stem}.v2-backup{path.suffix}")
-        shutil.copy2(path, target)
+        try:
+            shutil.copy2(path, target)
+        except OSError as error:
+            _write_marker(marker, today, f"backup copy failed: {error}")
+            logger.error(f"PRICE STORE MIGRATION TO VERSION 3 NOT STARTED: the backup copy failed ({error}); "
+                         "the store keeps working as version 2.")
+            target.unlink(missing_ok=True)
+            return False
         logger.info(f"Version 2 price store kept as {target.name} before the migration "
                     f"({time.perf_counter() - started:.1f}s).")
     conn = duckdb.connect(str(path))
@@ -1296,9 +1430,12 @@ def migrate(path: Path, overrides_path: Path | None, review_path: Path | None, t
             conn.execute("COMMIT")
         except Exception as error:
             conn.execute("ROLLBACK")
+            conn.execute("CHECKPOINT")
+            _write_marker(marker, today, f"{type(error).__name__}: {str(error)[:300]}")
             logger.error(f"PRICE STORE MIGRATION TO VERSION 3 FAILED AND WAS ROLLED BACK ({error}); the store "
-                         "keeps working as version 2 and the next run tries again.")
+                         "keeps working as version 2 and the migration is tried again tomorrow.")
             return False
+        marker.unlink(missing_ok=True)
         changed = _changed_periods(old_periods, decisions.periods,
                                    _concat([old_periods, decisions.periods], ["Exchange", "Symbol"]).drop_duplicates())
         if not changed.empty:
@@ -1306,6 +1443,65 @@ def migrate(path: Path, overrides_path: Path | None, review_path: Path | None, t
                         f"run (lists or rules changed since): {changed.head(20).values.tolist()}")
         write_review(conn, review_path, today)
         logger.info(f"Price store migrated to version 3 in {time.perf_counter() - started:.1f}s and verified.")
+        return True
+    finally:
+        conn.close()
+
+
+V3_ONLY_TABLES = ("adjustment_ledger", "gap_history", "symbol_state", "maintenance_state")
+
+
+def downgrade_to_v2(path: Path, overrides_path: Path | None, review_path: Path | None, today: date | None = None,
+                    logger: logging.Logger | None = None) -> bool:
+    """Turn a version 3 store back into version 2 (views over raw prices) for code that predates version 3.
+
+    Code before version 3 cannot use a version 3 file: its create_schema fails on the eod_prices table and its
+    upserts write raw rows only, so eod_data would stay stale. In one transaction the version 3 tables and
+    the eod_prices table are dropped, the views created again and adjustment_periods and price_adjustments
+    decided by the full rebuild (version 2 rules: the gap count over the stored rows); raw_prices is checked
+    unchanged and the version 2 tables against that decision. True when the file is version 2 afterwards.
+    """
+    logger = logger or module_logger
+    today = today or pa.market_today()
+    conn = duckdb.connect(str(path))
+    raw_sql = ("SELECT count(*), sum(hash(Date, Symbol, Exchange, Open, High, Low, Close, Volume, Total_Trades, "
+               "Dlv_Qty)) FROM raw_prices")
+    try:
+        version = eod_store.schema_version(conn)
+        if version == 2:
+            logger.info(f"{path} is already a version 2 store.")
+            return True
+        if version != 3:
+            raise RuntimeError(f"{path} is not a version 3 store (version {version})")
+        raw_before = conn.execute(raw_sql).fetchone()
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            conn.execute("DROP VIEW IF EXISTS eod_data")
+            conn.execute("DROP TABLE eod_prices")
+            for table in V3_ONLY_TABLES:
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+            eod_store.create_schema(conn, 2)
+            inputs = read_inputs(conn, overrides_path, today, logger)
+            decisions = decide_all(conn, inputs, history=False)
+            pa.check_factors(decisions.events, decisions.periods)
+            conn.execute("DELETE FROM adjustment_periods")
+            _insert(conn, "adjustment_periods", decisions.periods, PERIOD_COLUMNS)
+            conn.execute("DELETE FROM price_adjustments")
+            _insert(conn, "price_adjustments", decisions.events, pa.EVENT_COLUMNS)
+            problems = [f"{table}: {pairs[:5]}" for table, pairs in differences_v2(conn, decisions).items()]
+            if eod_store.schema_version(conn) != 2:
+                problems.append("the file did not become version 2")
+            if conn.execute(raw_sql).fetchone() != raw_before:
+                problems.append("raw_prices changed")
+            if problems:
+                raise RuntimeError("; ".join(problems))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("CHECKPOINT")
+        write_review(conn, review_path, today)
+        logger.info(f"{path} is a version 2 store again (raw prices untouched, factors decided by the full rebuild).")
         return True
     finally:
         conn.close()

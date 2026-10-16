@@ -52,8 +52,13 @@ as it is and never written.
 
 from __future__ import annotations
 
+import argparse
 import logging
+import sys
+from contextlib import contextmanager
+from pathlib import Path
 
+import duckdb
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -70,9 +75,17 @@ DERIVED_TABLES = ("eod_prices", "adjustment_ledger", "adjustment_periods", "pric
 ISIN_ISSUER_PREFIX_LENGTH = 7
 
 
-def row_hash(alias: str = "") -> str:
+def decision_hash(alias: str = "") -> str:
     """SQL hash of a raw row's day, open and close -- all a decision reads; symbol_state.Digest sums it."""
     return f"hash({alias}Date, {alias}Open, {alias}Close)"
+
+
+def row_hash(alias: str = "") -> str:
+    """SQL hash of every column of a raw row the store keeps; symbol_state.Row_Digest sums it, so any change
+    to a stored raw row (a late delivery figure, a corrected volume) rewrites that symbol's adjusted rows."""
+    columns = ", ".join(f"{alias}{c}" for c in ("Date", "Open", "High", "Low", "Close", "Volume", "Total_Trades",
+                                                 "Dlv_Qty"))
+    return f"hash({columns})"
 
 
 def relations(conn) -> dict:
@@ -274,12 +287,31 @@ def _create_version_3(conn) -> None:
             Digest HUGEINT,
             Inputs_Digest VARCHAR,
             Pruned_Before DATE,
-            PRIMARY KEY (Exchange, Symbol)
+            Row_Digest HUGEINT
         )
         """
     )
+    # No primary key: nearly every row changes every day, and DuckDB does not give back the space of
+    # deleted rows in a table with an index (20 daily runs left 196,000 dead rows, 12 MB). The rows are
+    # written only from a GROUP BY (Exchange, Symbol).
+    _drop_state_key(conn)
+    conn.execute("ALTER TABLE symbol_state ADD COLUMN IF NOT EXISTS Row_Digest HUGEINT")    # a store from 6d39495
     conn.execute("CREATE TABLE IF NOT EXISTS maintenance_state (Key VARCHAR PRIMARY KEY, Value VARCHAR)")
     conn.execute(EOD_DATA_VIEW)
+
+
+def _drop_state_key(conn) -> None:
+    """Recreate a symbol_state made with a primary key (stores from 6d39495) without it."""
+    keyed = conn.execute("SELECT count(*) FROM duckdb_constraints() WHERE table_name = 'symbol_state' "
+                         "AND constraint_type = 'PRIMARY KEY' AND database_name = current_database()").fetchone()[0]
+    if keyed:
+        conn.execute("CREATE TABLE symbol_state_new AS SELECT * FROM symbol_state")
+        conn.execute("DROP TABLE symbol_state")
+        conn.execute("ALTER TABLE symbol_state_new RENAME TO symbol_state")
+
+
+STATE_COLUMNS = ["Exchange", "Symbol", "Rows", "First_Date", "Last_Date", "Digest", "Row_Digest", "Inputs_Digest",
+                 "Pruned_Before"]
 
 
 # The old name, kept for callers of the compact store.
@@ -294,22 +326,45 @@ _SCOPES = {
 }
 
 
-def rematerialize(conn, scope: str | None = None, columns: tuple = ("Exchange", "Symbol")) -> None:
-    """Rewrite eod_prices rows from raw_prices and adjustment_periods (version 3).
+def rematerialize(conn, scope: str | None = None, columns: tuple = ("Exchange", "Symbol")) -> int:
+    """Bring eod_prices rows in step with raw_prices and adjustment_periods (version 3).
 
     `scope` names a registered frame or temp table with `columns`: (Exchange,
-    Symbol) rewrites every row of those symbols, (Exchange, Symbol, After) their
+    Symbol) covers every row of those symbols, (Exchange, Symbol, After) their
     rows after After (all when NULL), (Exchange, Symbol, Date) those keys; None
-    rewrites the whole table. Rows raw_prices no longer holds are deleted.
+    fills an empty table (or replaces every row). Within a scope only the rows
+    that differ from raw x periods are deleted and written again, and rows
+    raw_prices no longer holds are deleted: a row already right is never
+    rewritten, so a day's rows are written once (DuckDB keeps a rewritten row's
+    old space until it reuses it, and the file grew by each day's rows twice).
     """
     if scope is None:
+        # In day order, as raw_prices is: retention then deletes whole row groups at the head, which
+        # DuckDB gives back. The ASOF join's own (symbol) order spread every day's deletes over all row
+        # groups, none of which ever emptied -- the file grew by about a session's rows a day.
         conn.execute("DELETE FROM eod_prices")
-        conn.execute(f"INSERT INTO eod_prices {eod_select()}")
-        return
+        conn.execute(f"INSERT INTO eod_prices SELECT * FROM ({eod_select()}) ORDER BY Date, Exchange, Symbol")
+        return conn.execute("SELECT count(*) FROM eod_prices").fetchone()[0]
     match = _SCOPES[tuple(columns)]
-    conn.execute(f"DELETE FROM eod_prices e USING {scope} k WHERE {match.format(t='e')}")
     source = f"(SELECT p.* FROM raw_prices p JOIN {scope} k ON {match.format(t='p')})"
-    conn.execute(f"INSERT INTO eod_prices {eod_select(source)}")
+    conn.execute(f"CREATE OR REPLACE TEMP TABLE wanted_rows AS {eod_select(source)}")
+    conn.execute(f"""
+        CREATE OR REPLACE TEMP TABLE stale_keys AS
+        SELECT DISTINCT Exchange, Symbol, Date FROM (
+            (SELECT e.* FROM eod_prices e JOIN {scope} k ON {match.format(t='e')} EXCEPT ALL SELECT * FROM wanted_rows)
+            UNION ALL
+            (SELECT * FROM wanted_rows EXCEPT ALL SELECT e.* FROM eod_prices e JOIN {scope} k ON {match.format(t='e')}))
+        """)
+    stale = conn.execute("SELECT count(*) FROM stale_keys").fetchone()[0]
+    if stale:
+        conn.execute("DELETE FROM eod_prices e USING stale_keys s "
+                     "WHERE e.Exchange = s.Exchange AND e.Symbol = s.Symbol AND e.Date = s.Date")
+        conn.execute("INSERT INTO eod_prices SELECT w.* FROM wanted_rows w JOIN stale_keys s "
+                     "ON w.Exchange = s.Exchange AND w.Symbol = s.Symbol AND w.Date = s.Date "
+                     "ORDER BY w.Date, w.Exchange, w.Symbol")
+    conn.execute("DROP TABLE wanted_rows")
+    conn.execute("DROP TABLE stale_keys")
+    return stale
 
 
 def delete_derived(conn, targets: str) -> None:
@@ -599,7 +654,9 @@ def apply_retention(conn, years: float) -> int:
     state forgets the dropped rows and remembers the cutoff (Pruned_Before):
     the maintenance then decides again only the symbols whose decisions near
     the new first day can change (adjustment_ledger.py). The gap history and
-    the ledger keep their rows until then.
+    the ledger keep their rows until then. All of it is one transaction (the
+    caller's, when one is open): a crash between the state update and the
+    deletes made every touched symbol look rewritten.
     """
     last = conn.execute("SELECT max(Date) FROM raw_prices").fetchone()[0]
     if last is None:
@@ -608,11 +665,28 @@ def apply_retention(conn, years: float) -> int:
     dropped = conn.execute("SELECT count(*) FROM raw_prices WHERE Date < ?", [cutoff]).fetchone()[0]
     if not dropped:
         return 0
-    if schema_version(conn) == 3:
-        forget_rows_before(conn, cutoff)
-        conn.execute("DELETE FROM eod_prices WHERE Date < ?", [cutoff])
-    conn.execute("DELETE FROM raw_prices WHERE Date < ?", [cutoff])
+    with transaction(conn):
+        if schema_version(conn) == 3:
+            forget_rows_before(conn, cutoff)
+            conn.execute("DELETE FROM eod_prices WHERE Date < ?", [cutoff])
+        conn.execute("DELETE FROM raw_prices WHERE Date < ?", [cutoff])
     return int(dropped)
+
+
+@contextmanager
+def transaction(conn):
+    """BEGIN ... COMMIT around the block (ROLLBACK on an error); inside an open transaction, just the block."""
+    try:
+        conn.execute("BEGIN TRANSACTION")
+    except duckdb.TransactionException:                 # already inside the caller's transaction
+        yield
+        return
+    try:
+        yield
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def forget_rows_before(conn, cutoff, source: str = "raw_prices") -> None:
@@ -625,9 +699,10 @@ def forget_rows_before(conn, cutoff, source: str = "raw_prices") -> None:
     conn.execute(
         f"""
         UPDATE symbol_state s
-           SET Rows = s.Rows - d.Rows, Digest = s.Digest - d.Digest,
+           SET Rows = s.Rows - d.Rows, Digest = s.Digest - d.Digest, Row_Digest = s.Row_Digest - d.Row_Digest,
                Pruned_Before = greatest(COALESCE(s.Pruned_Before, ?::DATE), ?::DATE)
-          FROM (SELECT p.Exchange, p.Symbol, count(*) AS Rows, sum({row_hash('p.')}) AS Digest
+          FROM (SELECT p.Exchange, p.Symbol, count(*) AS Rows, sum({decision_hash('p.')}) AS Digest,
+                       sum({row_hash('p.')}) AS Row_Digest
                   FROM {source} p JOIN symbol_state k ON k.Exchange = p.Exchange AND k.Symbol = p.Symbol
                  WHERE p.Date < ? AND p.Date <= k.Last_Date
                  GROUP BY p.Exchange, p.Symbol) d
@@ -635,3 +710,35 @@ def forget_rows_before(conn, cutoff, source: str = "raw_prices") -> None:
         """,
         [cutoff, cutoff, cutoff],
     )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """python -m eod_store --downgrade-to-v2 [PATH]: make a version 3 store usable by code before version 3."""
+    parser = argparse.ArgumentParser(prog="python -m eod_store", description=main.__doc__)
+    parser.add_argument("--downgrade-to-v2", nargs="?", const="", metavar="PATH", default=None,
+                        help="the store to downgrade (default: the data root's NSE_BSE_EOD.duckdb)")
+    parser.add_argument("--data-root", type=Path, help="override the default ~/Mark EMA and HTF data root")
+    args = parser.parse_args(argv)
+    if args.downgrade_to_v2 is None:
+        parser.print_help()
+        return 2
+    import adjustment_ledger
+    import config
+    import eod_maintenance
+
+    if args.data_root:
+        config.configure_data_root(args.data_root)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log = logging.getLogger("downgrade")
+    path = Path(args.downgrade_to_v2) if args.downgrade_to_v2 else config.DUCKDB_FILE
+    try:
+        ok = adjustment_ledger.downgrade_to_v2(path, eod_maintenance.overrides_file(), eod_maintenance.review_file(),
+                                               logger=log)
+    except Exception as error:  # noqa: BLE001 - reported as the exit code
+        log.error(f"Downgrade failed, nothing changed: {error}")
+        return 1
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

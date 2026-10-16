@@ -276,7 +276,11 @@ more than 30 days old (`action_list_history`). Dates are India's (IST). In order
    after NSE's day however late, flagged when BSE's open does not show it. A
    BSE listing of the same ratio within 30 days is the same event, applied once
    (on the listing's day when only BSE's open there shows it); a listing of
-   another ratio nearby is decided by the list rule and flagged;
+   another ratio nearby is decided by the list rule and flagged. When NSE was
+   away around the event (halted, or days missing from the store) BSE's own
+   gap or list takes it, and the twin factor that arrives when NSE is back --
+   on a BSE day whose open does not show it -- is refused and flagged (one 1:1
+   split had become 0.25);
 3. the exchange's own list -- NSE matched by ISIN, BSE by scrip code only, never
    by today's name -- when the day's open confirms it (within 25%; a 1:10 bonus
    is taken from the list when the open did not gap);
@@ -324,10 +328,29 @@ A version 2 store is migrated by its first run: the file is first copied to
 checked in one transaction (about 30 s); the raw prices are not touched, and on
 any failure the store stays version 2 and the log says so. The migration needs
 free disk for the copy plus about 1.5 times the store (the adjusted rows make
-the file about 65% larger: 124 MB became 203 MB); with less it waits and says
+the file about 80% larger: 124 MB became 221 MB, stored in day order like the
+raw prices so that the days retention removes free whole blocks again; over 40
+simulated daily runs it moved within 205-211 MB); with less it waits and says
 so. The screener reads the same `eod_data` as before -- on a copy of the live
 store the released engine wrote byte-identical CSVs and charts from the version
-2 and the migrated version 3 file.
+2 and the migrated version 3 file. A migration that fails is rolled back and
+tried again at most once a day (`NSE_BSE_EOD.migration-failed.json` says when
+and why; every run warns until it succeeds).
+
+**Rollout order.** Code from before version 3 cannot use a version 3 file (its
+`create_schema` stops on the `eod_prices` table; its sync would store raw rows
+that `eod_data` never shows, so scheduled runs would screen stale data). So:
+merge this into `main` -- the checkout the scheduler runs -- before any run of
+the new code on the default data root, and update every machine that shares
+the data root at the same time. To go back to older code, first turn the store
+back into version 2 with the old code stopped:
+
+```bash
+python -m eod_store --downgrade-to-v2                 # the data root's store; or give a path
+```
+
+It drops the version 3 tables in one transaction, recreates the views and
+decides the factors with the full rebuild; the raw prices are not touched.
 
 An EOD network failure is logged and screening may continue against local
 data.  A session whose file could not be downloaded is retried on the next run

@@ -99,6 +99,7 @@ FLAG_NO_TRADE = f"listed, no trade within {LAG.days} days"
 # Double application (POCL, divided three times by the version 1 store): one event, two factors.
 EVENT_REFUSED = "refused"
 FLAG_REFUSED = "refused: the same event was already applied"
+FLAG_TWIN_TAKEN = "refused: NSE twin's factor, the event is already in BSE's own factor"
 # After a factor, the adjusted open should sit near the adjusted previous close.
 CONTINUITY_LIMIT = 0.25
 FLAG_CONTINUITY = f"adjusted open still gaps more than {CONTINUITY_LIMIT:.0%} after the factor"
@@ -309,8 +310,9 @@ def _twin_meets_listing(df: pd.DataFrame, twin: pd.DataFrame | None):
     differs[pairs.loc[~pairs["index"].isin(same_rows["index"]), "index"].unique()] = True
     if not twin.empty:
         agg = {"Factor": ("Factor", "prod")}
-        if "NSE_Date" in twin.columns:
-            agg["NSE_Date"] = ("NSE_Date", "min")
+        for column in ("NSE_Date", "NSE_Prev"):
+            if column in twin.columns:
+                agg[column] = (column, "min")
         twin = twin.groupby(["Symbol", "Date"]).agg(**agg).reset_index()
     return twin, covers, differs
 
@@ -341,11 +343,13 @@ def decide(raw: pd.DataFrame, listed: pd.DataFrame, overrides: pd.DataFrame, twi
     twin, nse_covers, twin_differs = _twin_meets_listing(df, twin)
     df["_twin"] = np.nan
     df["Twin_Date"] = pd.NaT
+    df["Twin_Prev"] = pd.NaT
     if twin is not None and not twin.empty:                                # a left merge keeps the row order
         twin = twin.rename(columns={"Factor": "_twin"})
         twin["Twin_Date"] = pd.to_datetime(twin["NSE_Date"]) if "NSE_Date" in twin.columns else twin["Date"]
-        df = df.drop(columns=["_twin", "Twin_Date"]).merge(twin[["Symbol", "Date", "_twin", "Twin_Date"]],
-                                                           on=["Symbol", "Date"], how="left")
+        twin["Twin_Prev"] = pd.to_datetime(twin["NSE_Prev"]) if "NSE_Prev" in twin.columns else pd.NaT
+        df = df.drop(columns=["_twin", "Twin_Date", "Twin_Prev"]).merge(
+            twin[["Symbol", "Date", "_twin", "Twin_Date", "Twin_Prev"]], on=["Symbol", "Date"], how="left")
         df["_twin"] = pd.to_numeric(df["_twin"], errors="coerce")
     nse_covers = pd.Series(nse_covers.to_numpy(), index=df.index)
     twin_differs = pd.Series(twin_differs.to_numpy(), index=df.index)
@@ -424,8 +428,18 @@ def twin_inputs(bse_raw: pd.DataFrame, nse_decided: pd.DataFrame, securities: pd
     events = nse_decided[nse_decided["Event"].notna() & (nse_decided["Factor"] != 1.0)][["Symbol", "Date", "Factor"]]
     events = events.rename(columns={"Symbol": "Twin", "Date": "NSE_Date"})
     events["NSE_Date"] = pd.to_datetime(events["NSE_Date"])
+    nse_days = nse_decided[["Symbol", "Date"]].rename(columns={"Symbol": "Twin", "Date": "NSE_Date"})
+    nse_days = nse_days.assign(NSE_Date=pd.to_datetime(nse_days["NSE_Date"]))
+    if not events.empty:
+        # NSE's previous trading day before each event: how long NSE was away around it (refuse_repeats).
+        before = pd.merge_asof(events.reset_index().sort_values("NSE_Date"),
+                               nse_days.rename(columns={"NSE_Date": "NSE_Prev"}).sort_values("NSE_Prev")
+                               .assign(_on=lambda d: d["NSE_Prev"]),
+                               left_on="NSE_Date", right_on="_on", by="Twin", direction="backward",
+                               allow_exact_matches=False)
+        events = events.assign(NSE_Prev=before.set_index("index")["NSE_Prev"].reindex(events.index))
     days = rows.dropna(subset=["Twin"])
-    twin = pd.DataFrame(columns=["Symbol", "Date", "Factor", "NSE_Date"])
+    twin = pd.DataFrame(columns=["Symbol", "Date", "Factor", "NSE_Date", "NSE_Prev"])
     if not events.empty and not days.empty:
         pairs = events.merge(days[["Symbol", "Twin"]].drop_duplicates(), on="Twin")       # one row per BSE symbol
         if not pairs.empty:
@@ -435,10 +449,9 @@ def twin_inputs(bse_raw: pd.DataFrame, nse_decided: pd.DataFrame, securities: pd
             # A BSE series that starts after NSE's day has no row before the event: nothing to scale.
             first_bse = days.groupby("Symbol")["Date"].min()
             hit = hit[hit["Date"].notna() & (hit["Symbol"].map(first_bse) < hit["NSE_Date"])]
-            twin = (hit.groupby(["Symbol", "Date"]).agg(Factor=("Factor", "prod"), NSE_Date=("NSE_Date", "min"))
+            twin = (hit.groupby(["Symbol", "Date"]).agg(Factor=("Factor", "prod"), NSE_Date=("NSE_Date", "min"),
+                                                        NSE_Prev=("NSE_Prev", "min"))
                        .reset_index())
-    nse_days = nse_decided[["Symbol", "Date"]].rename(columns={"Symbol": "Twin", "Date": "NSE_Date"})
-    nse_days = nse_days.assign(NSE_Date=pd.to_datetime(nse_days["NSE_Date"]))
     probe = rows.reset_index().dropna(subset=["Twin"]).sort_values("Date")
     covered = pd.Series(False, index=rows.index)
     if not probe.empty and not nse_days.empty:
@@ -479,16 +492,53 @@ def event_keys(decided: pd.DataFrame, exchange: str) -> pd.Series:
     return keys
 
 
+def _twin_already_taken(decided: pd.DataFrame, applied: pd.Series) -> dict:
+    """{row: flag} of BSE twin factors to refuse: the event is already in BSE's own factors.
+
+    While NSE does not trade -- halted, or days missing from the store -- BSE's
+    own rules see the event (a gap BSE's open shows, BSE's list); NSE then
+    decides it on its first day back and the twin factor lands on BSE's next
+    day, whose open no longer shows it: one 1:1 split became 0.25. A twin factor
+    BSE's open on its landing day does not confirm is refused when BSE already
+    applied a factor of the same ratio (gap, list, list_price, override) after
+    NSE's previous trading day before the event and up to the landing day -- a
+    window as long as NSE was actually away, not a fixed 30 days.
+    """
+    twins = decided[applied & (decided["Event"] == "nse")]
+    own = decided[applied & decided["Event"].isin(["gap", "list", "list_price", "override"])]
+    if twins.empty or own.empty:
+        return {}
+    with np.errstate(divide="ignore", invalid="ignore"):
+        confirmed = twins["Gap"].notna() & pd.Series(_agrees(twins["Gap"], twins["Factor"]), index=twins.index)
+    twins = twins[~confirmed.astype(bool)]
+    if twins.empty:
+        return {}
+    since = pd.to_datetime(twins["Twin_Prev"]).fillna(pd.to_datetime(twins["Twin_Date"]) - TWIN_SAME_EVENT)
+    pairs = twins.assign(Since=since).reset_index(names="Row_Index").merge(
+        own[["Symbol", "Date", "Factor", "Event"]], on="Symbol", suffixes=("", "_own"))
+    inside = (pairs["Date_own"] > pairs["Since"]) & (pairs["Date_own"] <= pairs["Date"])
+    same = pd.Series(_same_ratio(pairs["Factor_own"], pairs["Factor"]), index=pairs.index).fillna(False)
+    refused = {}
+    for row in pairs[inside & same.astype(bool)].sort_values("Date_own").itertuples():
+        refused.setdefault(row.Row_Index, (f"{FLAG_TWIN_TAKEN}: BSE's {row.Event_own} on {row.Date_own:%Y-%m-%d} "
+                                           f"(NSE away from {row.Since:%Y-%m-%d} to {row.Twin_Date:%Y-%m-%d})"))
+    return refused
+
+
 def refuse_repeats(decided: pd.DataFrame, exchange: str) -> pd.DataFrame:
     """Refuse a factor whose event was already applied, and flag a factor the adjusted open does not follow.
 
     One event, one factor: the version 1 store divided POCL three times. A
     listed factor whose Event_Key an earlier applied factor of the symbol has,
     within TWIN_SAME_EVENT, is refused (factor 1, event "refused", flagged); on
-    BSE so is a listed factor within TWIN_SAME_EVENT of an NSE twin factor of
-    the same ratio (the twin rule already applies such a listing once; this is
-    the second guard). Then every applied factor whose day's adjusted gap,
-    |ln(gap / factor)|, is CONTINUITY_LIMIT or more is FLAGGED for a look.
+    BSE an NSE twin factor BSE's open does not confirm is refused when BSE's own
+    factor of the same ratio already took the event while NSE was away
+    (_twin_already_taken), and a listed factor within TWIN_SAME_EVENT of an NSE
+    twin factor of the same ratio is refused (the twin rule already applies such
+    a listing once; this is the second guard). Then every applied factor whose
+    day's adjusted gap, |ln(gap / factor)| -- the adjusted open over the adjusted
+    previous close -- is CONTINUITY_LIMIT or more is FLAGGED for review: the
+    continuity invariant holds for every unflagged factor day by construction.
     The same function runs in the full rebuild and in the incremental
     maintenance, so both decide alike.
     """
@@ -505,7 +555,8 @@ def refuse_repeats(decided: pd.DataFrame, exchange: str) -> pd.DataFrame:
             else:
                 kept = (index, day)
     if exchange == "BSE":
-        twins = decided[applied & (decided["Event"] == "nse")]
+        refused.update(_twin_already_taken(decided, applied & ~decided.index.isin(list(refused))))
+        twins = decided[applied & (decided["Event"] == "nse") & ~decided.index.isin(list(refused))]
         if not twins.empty and not listed.empty:
             pairs = listed.reset_index(names="Row_Index").merge(twins[["Symbol", "Date", "Factor", "Event_Key"]],
                                                            on="Symbol", suffixes=("", "_twin"))

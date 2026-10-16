@@ -51,7 +51,7 @@ def build_compact_database(source: Path, target: Path, years: float) -> None:
         tables = TABLES + (STORED_TABLES if stored else ()) + tuple(t for t in OPTIONAL_TABLES if t in present)
         for table in tables:
             where = " WHERE Date >= ?" if table in WINDOWED_TABLES and cutoff else ""
-            conn.execute(f"INSERT INTO {table} SELECT * FROM source_db.{table}{where}",
+            conn.execute(f"INSERT INTO {table} BY NAME SELECT * FROM source_db.{table}{where}",
                          [cutoff] if where else [])
         if stored and cutoff:
             forget_rows_before(conn, cutoff, "source_db.raw_prices")

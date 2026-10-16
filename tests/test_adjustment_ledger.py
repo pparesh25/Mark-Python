@@ -13,6 +13,7 @@ import shutil
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
 
 import duckdb
 import numpy as np
@@ -71,6 +72,8 @@ class Market:
         self.replays: list = []          # (delivery session, Series, session, open multiplier)
         self.overrides: dict = {}        # session -> overrides file text from that session on
         self.years = YEARS               # retention
+        self.odd_days: list = []         # (delivery session, Series, session priced like, day)
+        self.retractions: dict = {}      # session -> (exchange, session whose stored rows a writer removes)
 
     def company(self, name: str, base: float, jumps: dict | None = None) -> str:
         steps = self.rng.normal(0, 0.01, self.n)
@@ -110,6 +113,8 @@ class Market:
                     self._arrivals.setdefault(arrives, []).append(self.row(series, traded))
             for arrives, series, traded, multiplier in self.replays:
                 self._arrivals.setdefault(arrives, []).append(self.row(series, traded, multiplier))
+            for arrives, series, traded, day in self.odd_days:      # a row dated off the session grid
+                self._arrivals.setdefault(arrives, []).append({**self.row(series, traded), "Date": day})
         rows = self._arrivals.get(session, [])
         if not rows:
             return []
@@ -117,14 +122,17 @@ class Market:
         return [part for _, part in frame.groupby(["Date", "Exchange"], sort=True)]
 
     def list_rows(self, exchange: str, session: int, start: date, end: date) -> pd.DataFrame:
+        def ex_day(r):                                   # a session's day, or a day of its own
+            return r.get("ex_date") or day_of(r["ex"])
+
         published = [r for r in self.lists if r["exchange"] == exchange and r["published"] <= session
-                     < r.get("withdrawn", 10 ** 6) and start <= day_of(r["ex"]) <= end]
+                     < r.get("withdrawn", 10 ** 6) and start <= ex_day(r) <= end]
         if exchange == "NSE":
             return action_lists.nse_rows([{"symbol": r["symbol"], "series": "EQ", "isin": r["isin"], "comp": "Co",
-                                           "exDate": day_of(r["ex"]).strftime("%d-%b-%Y"), "subject": r["purpose"]}
+                                           "exDate": ex_day(r).strftime("%d-%b-%Y"), "subject": r["purpose"]}
                                           for r in published], "equities")
         text = "Security Code,Security Name,Company Name,Ex Date,Purpose,Record Date\n" + "".join(
-            f"{r['code']},{r['symbol']},Co,{day_of(r['ex']):%d %b %Y},{r['purpose']},{day_of(r['ex']):%d %b %Y}\n"
+            f"{r['code']},{r['symbol']},Co,{ex_day(r):%d %b %Y},{r['purpose']},{ex_day(r):%d %b %Y}\n"
             for r in published)
         return action_lists.bse_rows(text)
 
@@ -258,6 +266,16 @@ def scripted_market() -> Market:
     q("BSE", "COVBACK", "INE220A01011", "COVBACK", code="500220", open_shock={61: 0.45})
     for s in (59, 60, 61, 62):
         m.withheld[("NSE", "COVBACK", s)] = 65
+    # A listed split two days before the store's first day for a symbol that only starts trading at session 3:
+    # not flagged while the store starts after it -- until session 30 brings an older day of another symbol
+    # (PLAIN0, two days before the ex-date). Then the listing is inside the stored range and, no trade within
+    # 10 days, flagged: nothing about DUEX changed, only the exchange's first day (listing_due).
+    m.company("DUEX", 75, {})
+    q("NSE", "DUEX", "INE221A01011", "DUEX", sessions=range(3, 140))
+    m.lists.append(dict(exchange="NSE", symbol="DUEX", isin="INE221A01011", ex=0, ex_date=START - timedelta(days=2),
+                        published=29, purpose="Face Value Split (Sub-Division) - From Rs 10/- Per Share To Rs 5/- "
+                                              "Per Share"))
+    m.odd_days.append((30, m.series[0], 0, START - timedelta(days=4)))
     # Never trades again after a listed split: nothing to flag.
     m.company("GONE", 80, {25: 0.5})
     q("NSE", "GONE", "INE215A01011", "GONE", sessions=range(0, 20))
@@ -269,6 +287,14 @@ def scripted_market() -> Market:
     q("BSE", "EARLY", "INE216A01011", "EARLY", code="500216")
     m.lists.append(dict(exchange="NSE", symbol="EARLY", isin="INE216A01011", ex=3, published=0,
                         purpose="Face Value Split (Sub-Division) - From Rs 10/- Per Share To Rs 5/- Per Share"))
+    # A writer removes BSE's stored day 70 at session 71, when BSE's day 71 is late too: BSE's last day moves
+    # back (range_back); both days come at 72.
+    m.retractions[71] = ("BSE", 70)
+    for series in [s for s in m.series if s.exchange == "BSE"]:
+        if 71 in series.sessions:
+            m.withheld[("BSE", series.symbol, 71)] = 72
+        if 70 in series.sessions:
+            m.replays.append((72, series, 70, 1.0))
     return m
 
 
@@ -354,7 +380,11 @@ def assert_same(incremental: dict, oracle: dict, session: int) -> None:
 
 def feed(conn, market: Market, session: int, overrides_path) -> None:
     """One day's input, identical for both stores: upserts, retention, the list answers (window, and the
-    whole history every 30 sessions), the overrides file."""
+    whole history every 30 sessions), the overrides file -- and a writer removing a stored day (a retraction)."""
+    if session in market.retractions:
+        exchange, retracted = market.retractions[session]
+        for table in ("raw_prices", "eod_prices")[:2 if schema_version(conn) == 3 else 1]:
+            conn.execute(f"DELETE FROM {table} WHERE Exchange = ? AND Date = ?", [exchange, day_of(retracted)])
     for batch in market.deliveries(session):
         conn.execute("BEGIN TRANSACTION")
         upsert_daily_prices(conn, batch)
@@ -407,7 +437,7 @@ def simulate(tmp_path, market: Market, monkeypatch, verify_every: int = 20, prob
 SEEN_SQL = """
     SELECT Exchange || ' ' || Symbol || ' ' || COALESCE(Event, '-') || ' ' || COALESCE(Flag, '-')
     FROM price_adjustments WHERE Symbol IN ('COVCUT', 'RELIST', 'RELIST2', 'HALT2', 'PAUSE', 'EARLY', 'NOISY',
-                                            'COVBACK', 'TWINGAP', 'OVERRIDE')
+                                            'COVBACK', 'TWINGAP', 'OVERRIDE', 'DUEX')
 """
 
 
@@ -433,8 +463,8 @@ def test_daily_incremental_maintenance_equals_the_full_rebuild_after_every_day(t
         assert seen.get("BSE COVBACK gap -") == {61, 62, 63, 64}            # covered once NSE's days came
         assert min(seen["BSE TWINGAP nse -"]) == 51
         assert min(seen["NSE OVERRIDE override -"]) == 45 and 90 in seen["NSE OVERRIDE override -"]
-        # Every rule was exercised (range_back needs a store whose last day moves back).
-        assert set(al.REASONS) - {"range_back"} <= set(reasons), set(al.REASONS) - set(reasons)
+        assert set(al.REASONS) <= set(reasons), set(al.REASONS) - set(reasons)       # every rule was exercised
+        assert seen.get(f"NSE DUEX - {pa.FLAG_NO_TRADE}") and min(seen[f"NSE DUEX - {pa.FLAG_NO_TRADE}"]) == 30
         ledger = {(e, s, ev) for e, s, ev in oracle.execute("SELECT Exchange, Symbol, Event FROM adjustment_ledger")
                   .fetchall()}
         assert ("BSE", "SPLIT", "nse") in ledger and ("NSE", "NEWNAME", "list") not in ledger    # aged out
@@ -460,6 +490,98 @@ def test_daily_incremental_maintenance_equals_the_full_rebuild_after_every_day(t
     finally:
         incremental.close()
         oracle.close()
+
+
+def away_market() -> Market:
+    """One 1:1 split per company while NSE is away from it; each series must carry exactly one factor of 0.5."""
+    m = Market(60, seed=5)
+    q = m.quote
+    away = set(range(28, 34))                                   # 30 days without NSE, the split on 30
+    # (a) NSE halted across the split, no list: BSE's open shows it on 30, NSE's on its return (34).
+    m.company("HALTSPLIT", 640, {30: 0.5})
+    q("NSE", "HALTSPLIT", "INE300A01011", "HALTSPLIT", sessions=set(range(60)) - away)
+    q("BSE", "HALTSPLIT", "INE300A01011", "HALTSPLIT", code="530000")
+    # (a') the same with the split in NSE's list (no NSE trade within 10 days of the ex-date: flagged).
+    m.company("HALTLIST", 420, {30: 0.5})
+    q("NSE", "HALTLIST", "INE301A01011", "HALTLIST", sessions=set(range(60)) - away)
+    q("BSE", "HALTLIST", "INE301A01011", "HALTLIST", code="530001")
+    m.lists.append(dict(exchange="NSE", symbol="HALTLIST", isin="INE301A01011", ex=30, published=25,
+                        purpose="Face Value Split (Sub-Division) - From Rs 10/- Per Share To Rs 5/- Per Share"))
+    # (b) NSE traded, but the store never got those days (a hole).
+    m.company("HOLE", 310, {30: 0.5})
+    q("NSE", "HOLE", "INE302A01011", "HOLE")
+    q("BSE", "HOLE", "INE302A01011", "HOLE", code="530002")
+    for s in away:
+        m.withheld[("NSE", "HOLE", s)] = 10 ** 6
+    # (c) BSE's list confirms the bonus on 30; NSE comes back 50 days later (40), beyond the 30-day pairing.
+    m.company("BSELIST", 260, {30: 0.5})
+    q("NSE", "BSELIST", "INE303A01011", "BSELIST", sessions=set(range(60)) - set(range(28, 40)))
+    q("BSE", "BSELIST", "INE303A01011", "BSELIST", code="530003")
+    m.lists.append(dict(exchange="BSE", symbol="BSELIST", code="530003", ex=30, published=25,
+                        purpose="Bonus issue 1:1"))
+    # Controls: an ordinary twin split, an NSE-only split, and two genuine 1:1 bonuses 40 days apart
+    # (both kept: NSE trades through both, so BSE's open confirms each twin factor).
+    m.company("NORMAL", 900, {30: 0.5})
+    q("NSE", "NORMAL", "INE304A01011", "NORMAL")
+    q("BSE", "NORMAL", "INE304A01011", "NORMAL", code="530004")
+    m.company("NSEONLY", 500, {30: 0.5})
+    q("NSE", "NSEONLY", "INE305A01011", "NSEONLY")
+    m.company("TWICE", 800, {25: 0.5, 33: 0.5})
+    q("NSE", "TWICE", "INE306A01011", "TWICE")
+    q("BSE", "TWICE", "INE306A01011", "TWICE", code="530006")
+    for ex in (25, 33):
+        m.lists.append(dict(exchange="NSE", symbol="TWICE", isin="INE306A01011", ex=ex, published=ex - 5,
+                            purpose="Bonus 1:1"))
+    m.years = 5
+    return m
+
+
+def test_one_event_gets_one_factor_on_both_exchanges_when_nse_is_away(tmp_path, monkeypatch):
+    market = away_market()
+    reasons, incremental, oracle = simulate(tmp_path, market, monkeypatch, verify_every=30)
+    try:
+        for conn in (incremental, oracle):
+            product = dict(((e, s), f) for e, s, f in conn.execute(
+                "SELECT Exchange, Symbol, product(Factor) FROM adjustment_ledger GROUP BY ALL").fetchall())
+            for series in market.series:
+                expected = market.factor(series.company, market.n - 1)
+                assert product.get((series.exchange, series.symbol), 1.0) == pytest.approx(expected), series.symbol
+            refused = {s for s, in conn.execute(
+                "SELECT Symbol FROM price_adjustments WHERE Exchange = 'BSE' AND Event = ? AND starts_with(Flag, ?)",
+                [pa.EVENT_REFUSED, pa.FLAG_TWIN_TAKEN]).fetchall()}
+            assert refused == {"HALTSPLIT", "HALTLIST", "HOLE", "BSELIST"}
+            assert al.continuity_violations(conn) == []
+        events = dict(((s, d), e) for s, d, e in oracle.execute(
+            "SELECT Symbol, Date, Event FROM adjustment_ledger WHERE Exchange = 'BSE'").fetchall())
+        assert events[("HALTSPLIT", day_of(30))] == "gap" and events[("BSELIST", day_of(30))] == "list"
+        assert events[("TWICE", day_of(25))] == "nse" and events[("TWICE", day_of(33))] == "nse"
+    finally:
+        incremental.close()
+        oracle.close()
+
+
+def test_the_continuity_invariant_is_reported_not_looped(tmp_path, monkeypatch, pocl_template, caplog):
+    conn, market, overrides = small_store(tmp_path, pocl_template)
+    review = tmp_path / "review.csv"
+    assert al.continuity_violations(conn) == []
+    # An override whose factor the open does not show is flagged by the decision layer ...
+    overrides.write_text(f"Exchange,Symbol,Date,Factor,Note\nNSE,POCL,{day_of(10)},0.5,hand\n", encoding="utf-8")
+    summary = al.maintain(conn, overrides, review, day_of(market.n - 1), LOG)
+    assert summary["mode"] == "incremental" and summary["continuity_violations"] == 0
+    assert conn.execute("SELECT Flag FROM price_adjustments WHERE Exchange = 'NSE' AND Date = ?",
+                        [day_of(10)]).fetchone()[0] == pa.FLAG_CONTINUITY
+    # ... and when the flag is missing the stored series breaks the invariant: logged, reviewed, not rolled back.
+    real = pa.refuse_repeats
+    monkeypatch.setattr(pa, "refuse_repeats", lambda d, e: real(d, e).assign(
+        Flag=lambda f: f["Flag"].where(f["Flag"] != pa.FLAG_CONTINUITY)))
+    with caplog.at_level(logging.ERROR):
+        summary = pa.rebuild(conn, overrides, review, day_of(market.n - 1), LOG)
+    assert summary["continuity_violations"] == 1 and "CONTINUITY INVARIANT BROKEN" in caplog.text
+    assert "continuity: adjusted open" in review.read_text()
+    conn.execute("UPDATE symbol_state SET Inputs_Digest = 'stale' WHERE Exchange = 'NSE'")
+    summary = al.maintain(conn, overrides, review, day_of(market.n - 1), LOG)
+    assert summary["mode"] == "incremental" and summary["continuity_violations"] == 1
+    conn.close()
 
 
 @pytest.mark.parametrize("seed", [11, 23, 37])
@@ -595,7 +717,7 @@ def test_a_factor_stored_twice_fails_the_checks_rolls_back_and_the_full_rebuild_
 
 def test_the_checks_catch_a_stored_row_out_of_step_with_raw_and_the_ledger(tmp_path, pocl_template):
     conn, _, _ = small_store(tmp_path, pocl_template)
-    assert al.check_prices(conn) == [] and al.check_continuity(conn) == []
+    assert al.check_prices(conn) == [] and al.check_factor_days(conn) == []
     conn.execute("UPDATE eod_prices SET Close = Close + 1 WHERE Exchange = 'BSE' AND Date = ?", [day_of(3)])
     conn.execute("DELETE FROM eod_prices WHERE Exchange = 'NSE' AND Date = ?", [day_of(4)])
     problems = al.check_prices(conn)
@@ -792,7 +914,114 @@ def test_a_rename_moves_the_ledger_and_the_gap_history_with_the_raw_rows(tmp_pat
     assert conn.execute("SELECT count(*) FROM gap_history WHERE Symbol = 'POCLNEW'").fetchone()[0] == gaps == 2
     assert conn.execute("SELECT count(*) FROM eod_prices WHERE Exchange = 'NSE' AND Symbol = 'POCL'").fetchone()[0] == 0
     summary = al.maintain(conn, overrides, None, day_of(market.n), LOG)
-    assert summary["reasons"]["NSE"].get("new") == 1
+    assert summary["reasons"]["NSE"].get("inputs") == 1          # no state under the new name: decided again
     assert al.verify(conn, overrides, None, day_of(market.n), LOG, repair=False)["status"] == "ok"
     assert al.check_prices(conn) == []
+    conn.close()
+
+
+def test_any_change_to_a_stored_raw_row_rewrites_its_adjusted_rows_without_deciding_again(tmp_path, pocl_template):
+    conn, market, overrides = small_store(tmp_path, pocl_template)
+    # A writer that does not keep eod_prices in step (it changes volume and delivery, not the day's prices).
+    conn.execute("UPDATE raw_prices SET Volume = 7776, Dlv_Qty = 998 WHERE Exchange = 'NSE' AND Date = ?",
+                 [day_of(5)])
+    summary = al.maintain(conn, overrides, None, day_of(market.n - 1), LOG)
+    assert summary["mode"] == "incremental" and summary["decided"] == {"NSE": 0, "BSE": 0}
+    assert summary["rewritten_symbols"] == 1
+    assert conn.execute("SELECT Volume, Dlv_Qty FROM eod_prices WHERE Exchange = 'NSE' AND Date = ?",
+                        [day_of(5)]).fetchone() == (19440, 2495)                   # divided by the 0.4 split
+    assert al.verify(conn, overrides, None, day_of(market.n - 1), LOG, repair=False)["status"] == "ok"
+    conn.close()
+
+
+def test_each_days_adjusted_rows_are_written_once(tmp_path, pocl_template, monkeypatch):
+    conn, market, overrides = small_store(tmp_path, pocl_template)
+    extended = pocl_market(32)
+    real = eod_store.rematerialize
+    written = []
+
+    def counting(c, scope=None, columns=("Exchange", "Symbol")):
+        written.append(real(c, scope, columns))
+        return written[-1]
+
+    monkeypatch.setattr(eod_store, "rematerialize", counting)
+    for session in (30, 31):
+        written.clear()
+        feed(conn, extended, session, overrides)
+        assert written == [1, 1]                                   # the upsert wrote each exchange's row
+        written.clear()
+        al.maintain(conn, overrides, None, day_of(session), LOG)
+        assert written and sum(written) == 0                       # the maintenance found them right
+    assert al.verify(conn, overrides, None, day_of(31), LOG, repair=False)["status"] == "ok"
+    conn.close()
+
+
+def test_retention_is_one_transaction(tmp_path, pocl_template, monkeypatch):
+    conn, market, overrides = small_store(tmp_path, pocl_template)
+    before = snapshot(conn)
+    forget = eod_store.forget_rows_before
+
+    def forget_then_crash(c, cutoff, source="raw_prices"):
+        forget(c, cutoff, source)
+        raise KeyboardInterrupt("killed after the state update")
+
+    monkeypatch.setattr(eod_store, "forget_rows_before", forget_then_crash)
+    with pytest.raises(KeyboardInterrupt):
+        apply_retention(conn, 60 / 365.25)
+    assert snapshot(conn) == before                                  # nothing half done
+    assert conn.execute("SELECT count(*) FROM symbol_state WHERE Pruned_Before IS NOT NULL").fetchone()[0] == 0
+    monkeypatch.undo()
+    assert apply_retention(conn, 60 / 365.25) > 0
+    assert conn.execute("SELECT count(*) FROM symbol_state WHERE Pruned_Before IS NOT NULL").fetchone()[0] == 2
+    conn.close()
+
+
+def test_a_v3_store_can_be_turned_back_into_version_2(tmp_path, pocl_template):
+    conn, market, overrides = small_store(tmp_path, pocl_template)
+    view = conn.execute("SELECT * FROM eod_data ORDER BY ALL").fetchall()
+    raw = conn.execute(RAW_HASH).fetchone()
+    conn.close()
+    assert eod_store.main(["--downgrade-to-v2", str(tmp_path / "store.duckdb")]) == 0
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    assert schema_version(conn) == 2 and eod_store.relations(conn)["eod_prices"] == "VIEW"
+    assert not set(al.V3_ONLY_TABLES) & set(eod_store.relations(conn))
+    assert conn.execute("SELECT * FROM eod_data ORDER BY ALL").fetchall() == view          # same prices, as views
+    assert conn.execute(RAW_HASH).fetchone() == raw
+    create_schema(conn)                                                                      # what v2 code does
+    upsert_daily_prices(conn, pd.DataFrame([{**market.row(market.series[0], 29), "Date": day_of(30)}]))
+    assert conn.execute("SELECT max(Date) FROM eod_data").fetchone()[0] == day_of(30)       # views: at once
+    assert eod_store.main(["--downgrade-to-v2", str(tmp_path / "store.duckdb")]) == 0       # already v2
+    conn.close()
+
+
+def test_a_failing_migration_backs_off_for_the_day_and_reclaims_space(tmp_path, monkeypatch, caplog, v2_template):
+    path, overrides = v2_store(tmp_path, v2_template)
+    copies = []
+    monkeypatch.setattr(al.shutil, "copy2", lambda a, b: copies.append(b) or shutil.copyfile(a, b))
+    monkeypatch.setattr(al, "write_all", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk gave up")))
+    assert al.migrate(path, overrides, None, day_of(59), LOG) is False and len(copies) == 1
+    marker = path.with_name("v2.migration-failed.json")
+    assert marker.exists() and "disk gave up" in marker.read_text()
+    with caplog.at_level(logging.ERROR):
+        assert al.migrate(path, overrides, None, day_of(59), LOG) is False
+    assert len(copies) == 1 and "tried again tomorrow" in caplog.text           # not again today, still loud
+    monkeypatch.undo()
+    assert al.migrate(path, overrides, None, day_of(60), LOG) is True           # the next day
+    assert not marker.exists()
+
+
+def test_a_killed_migration_leaves_a_version_2_store_and_its_space_is_reclaimed(tmp_path, v2_template):
+    import subprocess
+    import sys
+
+    path, overrides = v2_store(tmp_path, v2_template)
+    project = Path(__file__).resolve().parents[1]
+    script = (f"import sys, os; sys.path.insert(0, {str(project)!r}); import duckdb, eod_store\n"
+              f"c = duckdb.connect({str(path)!r}); c.execute('BEGIN TRANSACTION'); eod_store.create_schema(c, 3)\n"
+              "c.execute('INSERT INTO eod_prices SELECT * FROM raw_prices'); os._exit(9)\n")
+    assert subprocess.run([sys.executable, "-c", script]).returncode == 9                 # killed mid-transaction
+    assert al.migrate(path, overrides, None, day_of(59), LOG, backup=False)
+    assert not path.with_name(path.name + ".wal").exists()                                 # checkpointed
+    conn = duckdb.connect(str(path), read_only=True)
+    assert schema_version(conn) == 3 and al.check_prices(conn) == []
     conn.close()
