@@ -30,6 +30,14 @@ stock_analysis/bin/windows-x86_64/stock_analysis.exe
 stock_analysis/bin/darwin-aarch64/stock_analysis
 ```
 
+The screening rules live in this executable, so a rule change reaches a
+machine only when a new `rust-v*` release is tagged and installed. Version
+0.4.0 changes the rules (latest holding Mark Tight breakout, a Tight Flag
+pole of 4-45 candles reported by its latest breakout, a 20% flag-depth limit,
+Days_Since_Breakout from the latest session, a fixed 700-day history window;
+see README). It takes the same command-line arguments
+as 0.3.0, so the Python launcher works with either version.
+
 `config.py` discovers that path automatically. `MARK_RUST_BINARY` can still be
 used to select a different executable explicitly.
 

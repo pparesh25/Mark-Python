@@ -7,6 +7,7 @@ mod screener;
 use chrono::NaiveDate;
 use rayon::prelude::*;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -119,6 +120,63 @@ fn clean_opt_date(opt: &Option<String>) -> Option<&str> {
     }
 }
 
+/// Candles of one symbol from its exchange's history start (third parameter).
+const CHART_EOD_SQL: &str = "
+    SELECT CAST(Date AS VARCHAR), COALESCE(Open, 0.0), COALESCE(High, 0.0), COALESCE(Low, 0.0), COALESCE(Close, 0.0), COALESCE(Volume, 0.0)
+    FROM eod_data
+    WHERE Symbol = ? AND Exchange = ? AND Date >= CAST(? AS DATE)
+    ORDER BY Date ASC
+";
+
+/// First chart date per exchange: the same fixed history anchor as the
+/// screens, so chart EMAs match the rules.  Computed once per run.
+fn chart_history_starts(
+    conn: &duckdb::Connection,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    let mut stmt = conn
+        .prepare("SELECT Exchange, CAST(MAX(Date) AS VARCHAR) FROM eod_data GROUP BY Exchange")?;
+    let mut rows = stmt.query([])?;
+    let mut starts = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let exchange: String = row.get(0)?;
+        let latest: String = row.get(1)?;
+        if let Some(start) = screener::history_start(&latest) {
+            starts.insert(exchange, start);
+        }
+    }
+    Ok(starts)
+}
+
+fn load_chart_eod(
+    stmt: &mut duckdb::Statement<'_>,
+    history_starts: &HashMap<String, String>,
+    symbol: &str,
+    exchange: &str,
+) -> Result<chart::EodData, Box<dyn std::error::Error>> {
+    // An exchange without any candle has no start and therefore no rows.
+    let start = history_starts
+        .get(exchange)
+        .map_or("9999-12-31", String::as_str);
+    let mut rows = stmt.query([symbol, exchange, start])?;
+    let mut eod = chart::EodData {
+        dates: Vec::new(),
+        opens: Vec::new(),
+        highs: Vec::new(),
+        lows: Vec::new(),
+        closes: Vec::new(),
+        volumes: Vec::new(),
+    };
+    while let Some(row) = rows.next()? {
+        eod.dates.push(row.get::<_, String>(0)?);
+        eod.opens.push(row.get::<_, f64>(1)?);
+        eod.highs.push(row.get::<_, f64>(2)?);
+        eod.lows.push(row.get::<_, f64>(3)?);
+        eod.closes.push(row.get::<_, f64>(4)?);
+        eod.volumes.push(row.get::<_, f64>(5)?);
+    }
+    Ok(eod)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     // One global Rayon pool owns the machine for screening or charting.
@@ -185,15 +243,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?,
     )?;
 
-    use std::collections::HashMap;
     let mut eod_cache = HashMap::new();
 
-    let mut stmt = conn.prepare("
-        SELECT CAST(Date AS VARCHAR), COALESCE(Open, 0.0), COALESCE(High, 0.0), COALESCE(Low, 0.0), COALESCE(Close, 0.0), COALESCE(Volume, 0.0)
-        FROM eod_data 
-        WHERE Symbol = ? AND Exchange = ? 
-        ORDER BY Date ASC
-    ")?;
+    let history_starts = chart_history_starts(&conn)?;
+    let mut stmt = conn.prepare(CHART_EOD_SQL)?;
 
     for task in &tasks {
         let symbol = &task.symbol;
@@ -209,38 +262,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let mut rows = stmt.query([symbol, exchange])?;
-        let mut dates = Vec::new();
-        let mut opens = Vec::new();
-        let mut highs = Vec::new();
-        let mut lows = Vec::new();
-        let mut closes = Vec::new();
-        let mut volumes = Vec::new();
-
-        while let Some(row) = rows.next()? {
-            dates.push(row.get::<_, String>(0)?);
-            opens.push(row.get::<_, f64>(1)?);
-            highs.push(row.get::<_, f64>(2)?);
-            lows.push(row.get::<_, f64>(3)?);
-            closes.push(row.get::<_, f64>(4)?);
-            volumes.push(row.get::<_, f64>(5)?);
-        }
-
-        if dates.is_empty() {
+        let eod = load_chart_eod(&mut stmt, &history_starts, symbol, exchange)?;
+        if eod.dates.is_empty() {
             eprintln!("No EOD data found in DuckDB for {} ({})", symbol, exchange);
         }
-
-        eod_cache.insert(
-            cache_key,
-            chart::EodData {
-                dates,
-                opens,
-                highs,
-                lows,
-                closes,
-                volumes,
-            },
-        );
+        eod_cache.insert(cache_key, eod);
     }
 
     std::mem::drop(stmt);
@@ -348,4 +374,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chart_history_starts, load_chart_eod, CHART_EOD_SQL};
+
+    /// NSE runs 800 days from 2025-01-01; BSE stops 30 days earlier.  The
+    /// chart command keeps each exchange's own last 700 days.
+    #[test]
+    fn chart_command_uses_each_exchange_history_window() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE eod_data AS
+             SELECT CAST(DATE '2025-01-01' + CAST(i AS INTEGER) AS DATE) AS Date,
+                    'ABC' AS Symbol, Exchange,
+                    100.0 AS Open, 101.0 AS High, 99.0 AS Low, 100.0 AS Close, 1.0 AS Volume
+             FROM range(0, 800) AS r(i), (VALUES ('NSE'), ('BSE')) AS x(Exchange)
+             WHERE Exchange = 'NSE' OR i < 770",
+        )
+        .unwrap();
+        let starts = chart_history_starts(&conn).unwrap();
+        assert_eq!(starts["NSE"], "2025-04-10");
+        assert_eq!(starts["BSE"], "2025-03-11");
+
+        let mut stmt = conn.prepare(CHART_EOD_SQL).unwrap();
+        let nse = load_chart_eod(&mut stmt, &starts, "ABC", "NSE").unwrap();
+        assert_eq!(nse.dates.first().map(String::as_str), Some("2025-04-10"));
+        assert_eq!(nse.dates.last().map(String::as_str), Some("2027-03-11"));
+        assert_eq!(nse.dates.len(), 701);
+        let bse = load_chart_eod(&mut stmt, &starts, "ABC", "BSE").unwrap();
+        assert_eq!(bse.dates.first().map(String::as_str), Some("2025-03-11"));
+        assert_eq!(bse.dates.len(), 701);
+        assert!(load_chart_eod(&mut stmt, &starts, "ABC", "MCX")
+            .unwrap()
+            .dates
+            .is_empty());
+    }
 }

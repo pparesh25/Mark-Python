@@ -248,6 +248,33 @@ optimized two-request HTTP flow.  An older local file is used only when
    by latest breakout and exports all CSVs, OpenTrader Pro watchlists and
    charts. Screening data is reused for charting, so DuckDB is not read again.
 
+### Breakout rules (Rust engine 0.4.0 and later)
+
+- **Mark Tight** reports the latest breakout of the current Mark trend that
+  still holds: of the days the close crossed above the prior 60-session high,
+  the most recent one whose level is still below the latest close. A newer
+  breakout the price fell back from does not hide an older one that holds.
+- **Tight Flag** treats every candle of the last 90 as a possible pole peak.
+  The pole starts at the lowest low 4 to 45 candles before the peak, no candle
+  of the pole trades above the peak, and the peak is at least 90% above that
+  low (no >50% opening gap, at most 40% circuit candles). The breakout is the
+  first close above the peak within 15 candles; until then no candle trades
+  above the peak or more than 20% below it, and the latest close is still
+  above the peak. Of the qualifying poles, the one with the latest breakout
+  (then the later peak) is reported.
+- A Mark trend that already began before the first candle with a 52-week
+  value has no breakout on that candle; only a later crossing counts.
+- **Days_Since_Breakout** counts calendar days from the exchange's latest
+  stored session, so a weekend or holiday run ranks like the last trading day.
+  Charts end on the symbol's last candle.
+- Indicators use only the last 700 calendar days before each exchange's latest
+  session, so two machines with the same latest session get the same EMAs
+  even when their stores begin on different days.
+
+These rules are in the precompiled engine, so a machine gets them only after
+installing a `rust-v*` release built from version 0.4.0 or later (see
+`RUST_BINARIES.md`); the run log prints the engine version.
+
 ### Prices, splits, bonuses and demergers
 
 The store keeps every session **as the exchange published it** (`raw_prices`,
@@ -298,8 +325,9 @@ day within 10 days although the symbol traded again later. Before the factors
 are written each must be finite and above 0, or the previous ones stay.
 
 Volume and delivery are adjusted like prices. Two years of raw prices are kept
-(`config.EOD_RETAIN_YEARS`); a thinly traded stock with fewer than 252 sessions
-in that window is skipped by the screener. `compact_price_database.py --apply`
+(`config.EOD_RETAIN_YEARS`); the engine reads the last 700 days of them, and a
+thinly traded stock with fewer than 252 sessions in that window is skipped by
+the screener. `compact_price_database.py --apply`
 copies the store into a fresh file to give back the space deleted rows hold.
 `run_screener.py --skip-sync` screens a store made elsewhere without touching it.
 
