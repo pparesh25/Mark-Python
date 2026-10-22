@@ -326,6 +326,16 @@ def _store_section(database: Path, external: bool = False) -> dict:
             result["exchange_actions"] = dict(conn.execute(
                 "SELECT Exchange, count(*) FROM exchange_actions GROUP BY Exchange ORDER BY Exchange"
             ).fetchall())
+            # Which kind of listing differs, when two stores' table hashes do not match.
+            cols = ["Symbol", "Code", "ISIN", "CAST(Ex_Date AS VARCHAR)", "Purpose", "Kind",
+                    _decimal_sql("Factor", 10**9, "BIGINT", "1e7")]
+            result["exchange_actions_detail"] = {
+                f"{exchange}|{kind or ''}": {"rows": int(rows), "hash": _hex64(total)}
+                for exchange, kind, rows, total in conn.execute(
+                    f"SELECT Exchange, Kind, count(*), sum(CAST({_row_hash_sql(cols)} AS HUGEINT)) "
+                    "FROM exchange_actions GROUP BY Exchange, Kind ORDER BY Exchange, Kind"
+                ).fetchall()
+            }
         else:
             result["exchange_actions"] = None
         # Per-session row counts and hashes: the comparison names the exact
