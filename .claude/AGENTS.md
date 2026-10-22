@@ -115,7 +115,7 @@ python -m run_fingerprint run_fingerprint_A.json run_fingerprint_B.json
   `MARK_SCHEDULER_NOW` (epoch, also the simulated clock for retries) for tests.
 - `run_screener.py` exit codes: 3 = screened data not current (only with
   `MARK_SCHEDULED=1`), 4 = another run holds `<data root>/mark_screener.lock`.
-  The scheduler retries both every 30 minutes until 23:30 IST.  `--verify`
+  The scheduler retries both, and any other failed run (e.g. no internet at wake), every 30 minutes until 23:30 IST.  `--verify`
   (under the same lock) only runs the full verify/repair: 0 equal, 5 repaired,
   6 failed.
 - `Mark_Python.sh` picks `$MARK_PYTHON`, then `.venv/bin/python`, then a conda env

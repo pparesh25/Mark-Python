@@ -15,8 +15,10 @@
 # as-of dates differ) and 4 when another run holds the run lock.  Neither counts
 # as done: the run is retried every RETRY_INTERVAL_MINUTES until RETRY_UNTIL
 # (India time, the slot's day); after that the slot is given up and the next
-# slot runs as usual.  Any other failure is not retried here; the next start
-# (login, next slot) tries again.
+# slot runs as usual.  Any other failure (exit 1: typically no internet yet when
+# the Mac wakes at the slot, 2026-10-22) is retried the same way, because a
+# failed run leaves no success record and one missed evening would otherwise
+# wait for the next login or slot.
 #
 # Why 19:30 and not 18:00 (2026-10): 18:00 IST is the readiness cutoff, and the
 # NSE/BSE files are often published later.  A run at exactly 18:00 then
@@ -154,7 +156,7 @@ wait_until() {
     [ "$delay" -gt 0 ] && sleep "$delay"
 }
 
-# Run until success, a hard failure, or the end of the retry window.
+# Run until success or the end of the retry window.
 run_with_retries() {
     local deadline start exit_code next
     deadline=""
@@ -174,14 +176,13 @@ run_with_retries() {
             echo "✓ [$(stamp "$(clock)")] Mark Screener successfully completed."
             return 0
         fi
-        if [ "$exit_code" -ne "$EXIT_DATA_NOT_CURRENT" ] && [ "$exit_code" -ne "$EXIT_BUSY" ]; then
-            echo "✗ [$(stamp "$(clock)")] Mark Screener failed with exit code $exit_code."
-            return "$exit_code"
-        fi
         if [ "$exit_code" -eq "$EXIT_BUSY" ]; then
             what="another run is in progress"
-        else
+        elif [ "$exit_code" -eq "$EXIT_DATA_NOT_CURRENT" ]; then
             what="the data screened is not current yet"
+        else
+            what="the run failed"
+            echo "✗ [$(stamp "$(clock)")] Mark Screener failed with exit code $exit_code."
         fi
         next=$(( start + RETRY_INTERVAL_MINUTES * 60 ))
         if [ -n "$deadline" ] && [ "$next" -le "$deadline" ]; then

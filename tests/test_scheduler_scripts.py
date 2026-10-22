@@ -171,12 +171,22 @@ def test_retries_stop_at_23_30_and_the_slot_is_given_up(tmp_path):
 
 
 @darwin_only
-def test_a_hard_failure_is_not_retried_and_not_recorded(tmp_path):
-    result, calls = scheduled_run(tmp_path, at(8, 19, 30), [1, 0])
+def test_a_failed_run_is_retried_like_stale_data_and_not_recorded_until_it_succeeds(tmp_path):
+    # 2026-10-22: the Mac woke without internet and the run died with exit 1.
+    result, calls = scheduled_run(tmp_path, at(8, 19, 30), [1, 1, 0])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(calls) == 3
+    assert "failed with exit code 1" in result.stdout
+    assert recorded_start(tmp_path) == int(at(8, 20, 30).timestamp())
+
+
+@darwin_only
+def test_a_run_that_keeps_failing_gives_up_at_23_30_without_a_record(tmp_path):
+    result, calls = scheduled_run(tmp_path, at(8, 19, 30), [1] * 20)
     assert result.returncode == 1
-    assert len(calls) == 1
+    assert len(calls) == 9
     assert not (tmp_path / "last_run").exists()
-    assert decide(tmp_path, at(8, 21), None) == "run"  # the next start tries again
+    assert decide(tmp_path, at(9, 7), None) == "skip"  # given up for that slot
 
 
 @darwin_only
