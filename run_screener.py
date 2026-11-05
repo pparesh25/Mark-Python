@@ -215,6 +215,37 @@ def describe_rust_binary(binary: Path, info: dict | None = None) -> str:
     return f"{info['version']} | sha256 {info['sha256'][:16]} | {info['path']}"
 
 
+def _rename_downloaded_fundamentals(logger, elapsed: float) -> None:
+    """Move the downloader's fixed-name all-company.csv to today's date-based name."""
+    logger.info(color(f"  ✓ download completed in {elapsed:.1f}s", 'GREEN'))
+    temp_file = config.FUNDAMENTAL_DIR / "all-company.csv"
+    if not temp_file.exists():
+        logger.error(color(f"  ✗ Downloaded file not found at {temp_file}", 'RED'))
+        sys.exit(1)
+    try:
+        # Path.replace() atomically overwrites an existing target across
+        # platforms (unlike rename, which can fail on some OSes).
+        temp_file.replace(config.FUNDAMENTAL_FILE)
+        logger.info(color(f"  ✓ Renamed downloaded file to {config.FUNDAMENTAL_FILE.name}", 'GREEN'))
+    except Exception as e:
+        logger.error(color(f"  ✗ Failed to rename downloaded file to date-based name: {e}", 'RED'))
+        sys.exit(1)
+
+
+def fundamentals_taken_before_close(path: Path, session) -> bool:
+    """True when `path` was written before `session`'s close (18:00 IST).
+
+    Screener.in's "Current Price" is the live price, so a file downloaded during
+    the day carries intraday prices that the EOD data (and a file taken after
+    the close) do not (2026-11-05: Windows downloaded at 12:50, the Mac at 19:30).
+    """
+    from screening_readiness import EOD_READY_TIME
+
+    close = datetime.combine(session, EOD_READY_TIME, tzinfo=config.MARKET_TIMEZONE)
+    written = datetime.fromtimestamp(path.stat().st_mtime, config.MARKET_TIMEZONE)
+    return written < close
+
+
 def consistency_warning(logger, warnings: list, message: str) -> None:
     """Log a result-changing data condition prominently; the final summary repeats it.
 
@@ -658,10 +689,21 @@ def run_pipeline(args, logger) -> int:
 
     # --- Step 2: fundamentals download ------------------------------------
     logger.info(color("▶ Step 2/4: Fundamental Data Download (screener.in)", 'BOLD'))
-    if config.FUNDAMENTAL_FILE.exists():
+    refresh_fundamentals = False
+    if config.FUNDAMENTAL_FILE.exists() and not args.allow_stale_fundamentals:
+        try:
+            session = min(readiness.as_of_dates.values())
+            refresh_fundamentals = fundamentals_taken_before_close(config.FUNDAMENTAL_FILE, session)
+        except Exception as error:
+            logger.warning(f"  Could not tell when the fundamentals file was taken ({error}); using it.")
+    if config.FUNDAMENTAL_FILE.exists() and not refresh_fundamentals:
         logger.info(color(f"  ✓ Using local fundamentals file: {config.FUNDAMENTAL_FILE.name}", 'GREEN'))
         logger.info(color("  Skipping HTTP download.", 'CYAN'))
     else:
+        if refresh_fundamentals:
+            logger.info(color(
+                f"  {config.FUNDAMENTAL_FILE.name} was downloaded before the {session:%Y-%m-%d} close, so its "
+                "Current Price is intraday; downloading it again.", 'CYAN'))
         logger.info(color("  Starting optimized direct HTTP download...", 'CYAN'))
         t0 = time.time()
         
@@ -674,30 +716,25 @@ def run_pipeline(args, logger) -> int:
                 output_dir=config.FUNDAMENTAL_DIR
             )
         except Exception as e:
-            logger.error(color(f"  ✗ Failed to execute fundamental download in Python: {e}", 'RED'))
-            sys.exit(1)
-            
+            if refresh_fundamentals:
+                success = False
+                logger.warning(f"  Fundamentals download failed ({e}).")
+            else:
+                logger.error(color(f"  ✗ Failed to execute fundamental download in Python: {e}", 'RED'))
+                sys.exit(1)
+
         elapsed = time.time() - t0
-        if not success:
+        if not success and refresh_fundamentals:
+            # The file taken earlier is still on disk (the download writes to a temporary name).
+            consistency_warning(
+                logger, consistency_warnings,
+                f"{config.FUNDAMENTAL_FILE.name} was taken before the close and could not be refreshed; its "
+                "Current Price is intraday and differs from a machine that has the after-close file.")
+        elif not success:
             logger.error(color(f"  ✗ Fundamental download FAILED after {elapsed:.1f}s", 'RED'))
             sys.exit(1)
-            
-        logger.info(color(f"  ✓ download completed in {elapsed:.1f}s", 'GREEN'))
-
-        # Rename downloaded all-company.csv to date-based format
-        temp_file = config.FUNDAMENTAL_DIR / "all-company.csv"
-        if temp_file.exists():
-            try:
-                # Path.replace() atomically overwrites an existing target across
-                # platforms (unlike rename, which can fail on some OSes).
-                temp_file.replace(config.FUNDAMENTAL_FILE)
-                logger.info(color(f"  ✓ Renamed downloaded file to {config.FUNDAMENTAL_FILE.name}", 'GREEN'))
-            except Exception as e:
-                logger.error(color(f"  ✗ Failed to rename downloaded file to date-based name: {e}", 'RED'))
-                sys.exit(1)
         else:
-            logger.error(color(f"  ✗ Downloaded file not found at {temp_file}", 'RED'))
-            sys.exit(1)
+            _rename_downloaded_fundamentals(logger, elapsed)
 
     validate_fundamentals(logger)
 
