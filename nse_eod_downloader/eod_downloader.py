@@ -37,6 +37,8 @@ try:
 except ImportError:
     NSE_AVAILABLE = False
 
+from nse_session import create_nse
+
 dateRegex = re.compile(r"\b[A-Za-z]+, [A-Za-z]+ \d{2}, \d{4}\b")
 headerText = b"Date,Open,High,Low,Close,Volume,Series,TOTAL_TRADES,QTY_PER_TRADE,DLV_QTY\n"
 indexHeaderText = b"Date,Open,High,Low,Close,Volume,P/E,Series,TOTAL_TRADES,QTY_PER_TRADE,DLV_QTY\n"
@@ -265,7 +267,7 @@ def sync_database(
 
     deps = SyncDependencies(
         nse_available=NSE_AVAILABLE,
-        nse_factory=lambda temp_dir: NSE(temp_dir, server=True),
+        nse_factory=create_nse,
         dates_factory=lambda last_update: Dates(last_update, tz_IN),
         check_special_sessions=_check_special_sessions,
         check_for_holidays=_check_for_holidays,

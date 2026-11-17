@@ -42,10 +42,10 @@ def review_file():
 def open_nse(logger: logging.Logger):
     """An NSE session for the action lists, or None when the nse package or NSE is unavailable."""
     try:
-        from nse import NSE
+        from nse_session import create_nse
         folder = config.DATA_DIR / "temp"
         folder.mkdir(parents=True, exist_ok=True)
-        return NSE(folder, server=True)
+        return create_nse(folder)
     except Exception as error:
         logger.warning(f"NSE session unavailable for the action list ({error}); using the stored list.")
         return None

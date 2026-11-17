@@ -157,9 +157,9 @@ def bse_files(day: date, folder: Path, get) -> tuple[bytes | None, bytes | None,
 
 def _nse_session(nse_factory):
     if nse_factory is None:
-        from nse import NSE
+        from nse_session import create_nse
         (config.DATA_DIR / "temp").mkdir(parents=True, exist_ok=True)
-        nse_factory = lambda: NSE(config.DATA_DIR / "temp", server=True)          # noqa: E731
+        nse_factory = lambda: create_nse(config.DATA_DIR / "temp")          # noqa: E731
     return nse_factory()
 
 
