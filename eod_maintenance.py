@@ -39,6 +39,10 @@ def review_file():
     return config.DATABASE_DIR / "corporate_action_review.csv"
 
 
+def status_file():
+    return config.EOD_METADATA_DIR / "action_list_status.json"
+
+
 def open_nse(logger: logging.Logger):
     """An NSE session for the action lists, or None when the nse package or NSE is unavailable."""
     try:
@@ -81,7 +85,9 @@ def maintain(logger: logging.Logger, nse_factory=open_nse, today: date | None = 
     nse = None
     try:
         nse = nse_factory(logger)
-        summary = price_adjustments.refresh(conn, nse, logger, overrides_file(), review_file(), today)
+        summary = price_adjustments.refresh(conn, nse, logger, overrides_file(), review_file(), today,
+                                            bse_inbox=config.BSE_ACTIONS_INBOX, status_path=status_file(),
+                                            bse_stale_days=config.BSE_LIST_STALE_DAYS)
         conn.execute("CHECKPOINT")
         return {"raw_rows_dropped": dropped, "schema_version": schema_version(conn), **summary}
     finally:

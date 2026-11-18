@@ -1,8 +1,8 @@
 # duckdb, numpy and pandas compute the stored and adjusted prices, so they are
 # pinned exactly: two machines with different versions can produce different
 # results from the same data.  These three match the Mac's environment (2026-10);
-# bump them together, on every machine at once.  The Mac's env has nse 1.2.6
-# installed although nse[server]==3.2.1 is pinned here; nse only downloads.
+# bump them together, on every machine at once.  nse only downloads, but it must
+# be 3.2.1: nse_session.py patches it for NSE's new host, and 1.2.6 cannot reach NSE.
 # numpy 2.2.6 has wheels for Python 3.10-3.13 only, so the setup scripts accept
 # only those versions (3.11 preferred).
 # Cross-platform runtime used by the precompiled Rust pipeline.

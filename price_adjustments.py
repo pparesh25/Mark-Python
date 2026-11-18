@@ -764,18 +764,26 @@ def review_list(events: pd.DataFrame, today: date, securities: pd.DataFrame | No
 
 
 def refresh(conn, nse, logger: logging.Logger, overrides_path: Path | None = None, review_path: Path | None = None,
-            today: date | None = None, list_start: date | None = None) -> dict:
-    """After a sync: fetch the lists around today (or from `list_start`) and, when due, the whole retained
-    history; then decide: on a version 3 store only the symbols whose decisions can have changed (and the
-    weekly full verify), on version 2 everything. `today` is the market's date (IST)."""
+            today: date | None = None, list_start: date | None = None, bse_inbox: Path | None = None,
+            status_path: Path | None = None, bse_stale_days: int = 7) -> dict:
+    """After a sync: fetch the lists around today (or from `list_start`), import the BSE list files saved
+    by hand in `bse_inbox`, and, when due, fetch the whole retained history; then decide: on a version 3
+    store only the symbols whose decisions can have changed (and the weekly full verify), on version 2
+    everything. `today` is the market's date (IST). With `status_path` a BSE list neither fetched nor
+    imported for `bse_stale_days` days is warned about."""
     import adjustment_ledger                     # it builds on this module's rules
 
     today = today or market_today()
     start, end = action_lists.window(today)
-    lists = action_lists.refresh(conn, nse, list_start or start, end, logger)
+    lists = action_lists.refresh(conn, nse, list_start or start, end, logger, status_path=status_path, today=today)
+    imported = action_lists.import_bse_files(conn, bse_inbox, today, logger)
+    if imported["files"]:
+        action_lists.record_ok(status_path, "BSE", today, "imported file")
     history = action_lists.refresh_history_if_due(conn, nse, today, end, logger)
+    if status_path is not None:
+        action_lists.warn_if_stale(status_path, bse_inbox, today, bse_stale_days, logger)
     summary = adjustment_ledger.maintain(conn, overrides_path, review_path, today, logger)
     logger.info(f"Corporate-action factors decided ({summary.get('mode')}): {summary}")
     if summary["review_rows"]:
         logger.warning(f"{summary['review_rows']} recent price gaps need a look: {review_path}")
-    return {"lists": lists, "history": history, **summary}
+    return {"lists": lists, "bse_import": imported, "history": history, **summary}

@@ -612,6 +612,6 @@ def test_dates_default_to_the_market_day_in_india_not_the_machines(tmp_path, mon
     monkeypatch.setattr(config, "DUCKDB_FILE", tmp_path / "prices.duckdb")
     got = {}
     monkeypatch.setattr(eod_maintenance.price_adjustments, "refresh",
-                        lambda conn, nse, logger, o, r, today: got.setdefault("today", today) and {})
+                        lambda conn, nse, logger, o, r, today, **paths: got.setdefault("today", today) and {})
     eod_maintenance.maintain(logging.getLogger("t"), nse_factory=lambda logger: None)
     assert got["today"] == date(2026, 10, 16)

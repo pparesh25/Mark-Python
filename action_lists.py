@@ -28,15 +28,19 @@ still seen. A rebuild asks for it at once.
          only in mf). `isin` is a real ISIN for equities, a number for SME (kept as null).
     BSE  api.bseindia.com/BseIndiaAPI/api/CorpactCSVDownload/w, equity (category E): Security
          Code (the scrip code, which survives renames), Security Name (TODAY's short name),
-         Ex Date, Purpose. BSE's server answers 403 to an address for a while after many
-         requests; a failed fetch is logged and the stored list is used until the next run.
+         Ex Date, Purpose. Since 2026-10-29 BSE's bot protection answers every scripted request
+         with 403; a failed fetch is logged and the stored list is used. The same CSV saved by
+         hand from BSE's website is imported on every run (import_bse_files, at the end of this
+         file), and a run warns when BSE's list has been neither fetched nor imported for a week.
 """
 
 from __future__ import annotations
 
 import io
+import json
 import re
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -239,10 +243,12 @@ def _fetchers(nse, start: date, end: date, get):
     return {"NSE": lambda: fetch_nse_parts(nse, start, end), "BSE": lambda: fetch_bse_parts(start, end, get)}
 
 
-def refresh(conn, nse, start: date, end: date, logger, get=requests.get, exchanges=EXCHANGES) -> dict:
+def refresh(conn, nse, start: date, end: date, logger, get=requests.get, exchanges=EXCHANGES,
+            status_path: Path | None = None, today: date | None = None) -> dict:
     """Fetch the exchanges' lists for [start, end] and store them; a failure is logged, not raised.
 
-    Returns {exchange: text}; the text starts with "failed" or "skipped" when nothing was stored.
+    Returns {exchange: text}; the text starts with "failed" or "skipped" when nothing was stored. An
+    exchange that answered is noted in `status_path` (see record_ok).
     """
     result = {}
     fetchers = _fetchers(nse, start, end, get)
@@ -255,9 +261,10 @@ def refresh(conn, nse, start: date, end: date, logger, get=requests.get, exchang
             rows = _joined(parts)
             if rows.empty:
                 result[exchange] = "0 listed: nothing stored or replaced"
-                continue
-            new, removed = store(conn, rows, [(e, s, a, b) for e, s, a, b, _ in parts])
-            result[exchange] = f"{len(rows)} listed, {new} new, {removed} no longer listed (replaced)"
+            else:
+                new, removed = store(conn, rows, [(e, s, a, b) for e, s, a, b, _ in parts])
+                result[exchange] = f"{len(rows)} listed, {new} new, {removed} no longer listed (replaced)"
+            record_ok(status_path, exchange, today or date.today(), "fetched")
         except Exception as error:                  # an exchange that refuses today is asked again tomorrow
             result[exchange] = f"failed: {error}"
             logger.warning(f"{exchange} corporate-action list unavailable ({error}); using the stored list.")
@@ -315,3 +322,114 @@ def refresh_history_if_due(conn, nse, today: date, end: date, logger, get=reques
     except Exception as error:
         logger.warning(f"Corporate-action history refresh failed ({error}); the stored lists are used.")
         return {"failed": str(error)}
+
+
+# --- BSE's list by hand --------------------------------------------------------------------------------
+# Since 2026-10-29 BSE's bot protection answers every scripted request to api.bseindia.com with HTTP 403,
+# while its website still serves the same CSV to a browser. A CSV saved from
+# https://www.bseindia.com/corporates/corporate_act (Segment Equity, Ex Date, a From/To range, Download)
+# into config.BSE_ACTIONS_INBOX is imported on the next run exactly like a fetched answer: the stored
+# rows of the securities it lists, inside its ex-date range, are replaced (store()). An imported file is
+# moved to imported/, a file that is not BSE's list to rejected/.
+
+STATUS_FILE_NAME = "action_list_status.json"
+
+
+def read_status(path: Path | None) -> dict:
+    """{exchange: {"last_ok": "YYYY-MM-DD", "source": text}} from the status file ({} when absent or unreadable)."""
+    if path is None or not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def record_ok(path: Path | None, exchange: str, today: date, source: str) -> None:
+    """Note that `exchange`'s list was refreshed today (a fetch BSE/NSE answered, or an imported file)."""
+    if path is None:
+        return
+    status = read_status(path)
+    status[exchange] = {"last_ok": today.isoformat(), "source": source}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(status, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.replace(path)
+    except OSError:                                    # only the stale warning depends on it
+        pass
+
+
+def _read_text(path: Path) -> str:
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")
+
+
+def _move(path: Path, folder: Path, today: date) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"{today:%Y%m%d}_{path.name}"
+    counter = 1
+    while target.exists():
+        target = folder / f"{today:%Y%m%d}_{counter}_{path.name}"
+        counter += 1
+    path.replace(target)
+    return target
+
+
+def import_bse_files(conn, inbox: Path | None, today: date, logger) -> dict:
+    """Import every BSE action-list CSV waiting in `inbox`; returns {"files": n, "listed": n, "new": n, ...}.
+
+    Never raises for a bad file: it is moved to rejected/ with a warning. Files are imported oldest first,
+    so a newer download of the same range wins.
+    """
+    result = {"files": 0, "listed": 0, "new": 0, "replaced": 0, "rejected": 0}
+    if inbox is None or not inbox.is_dir():
+        return result
+    files = sorted((p for p in inbox.iterdir() if p.is_file() and p.suffix.lower() == ".csv"),
+                   key=lambda p: (p.stat().st_mtime, p.name))
+    for path in files:
+        try:
+            rows = bse_rows(_read_text(path))
+            dated = rows["Ex_Date"].dropna()
+            if rows.empty or dated.empty:
+                raise ValueError("no dated rows")
+            first, last = min(dated), max(dated)
+            new, removed = store(conn, rows, [("BSE", "E", first, last)])
+        except Exception as error:                    # a wrong file must not stop the run
+            result["rejected"] += 1
+            moved = _move(path, inbox / "rejected", today)
+            logger.warning(f"BSE action file {path.name} not imported ({error}); moved to {moved}")
+            continue
+        result["files"] += 1
+        result["listed"] += len(rows)
+        result["new"] += new
+        result["replaced"] += removed
+        moved = _move(path, inbox / "imported", today)
+        logger.info(f"BSE action file {path.name}: {len(rows)} listed {first} -> {last}, {new} new, "
+                    f"{removed} no longer listed (replaced); moved to {moved}")
+    return result
+
+
+def warn_if_stale(status_path: Path | None, inbox: Path | None, today: date, stale_days: int, logger) -> bool:
+    """Warn (and return True) when BSE's stored list was last refreshed `stale_days` or more days ago."""
+    last = read_status(status_path).get("BSE", {}).get("last_ok")
+    try:
+        age = None if last is None else (today - date.fromisoformat(last)).days
+    except ValueError:
+        age = None
+    if age is not None and age < stale_days:
+        return False
+    since = "never recorded" if age is None else f"last {last}, {age} days ago"
+    start, end = window(today)
+    logger.warning(
+        f"BSE CORPORATE-ACTION LIST IS STALE ({since}): BSE refuses the scripted download, so new BSE splits "
+        f"and bonuses are not applied. Download the list in a browser: https://www.bseindia.com/corporates/"
+        f"corporate_act -> Segment Equity, Ex Date, From {start:%d/%m/%Y} To {end:%d/%m/%Y} -> Download (CSV), "
+        f"and save it in: {inbox}  (the next run imports it).")
+    return True

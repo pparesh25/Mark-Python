@@ -36,6 +36,7 @@ from datetime import datetime
 from pathlib import Path
 
 import config
+import output_retention
 import run_fingerprint
 from screening_readiness import (
     LocalDataError,
@@ -820,6 +821,11 @@ def run_pipeline(args, logger) -> int:
         except Exception as error:  # noqa: BLE001
             logger.warning(f"  Run fingerprint outputs unavailable: {error}")
         write_run_fingerprint(logger, fingerprint)
+
+    try:
+        output_retention.prune(logger, datetime.now(config.MARKET_TIMEZONE).date())
+    except Exception as error:  # noqa: BLE001 - housekeeping never stops the run
+        logger.warning(f"  Old outputs not pruned: {error}")
 
     # --- Summary ----------------------------------------------------------
     total = time.time() - workflow_start

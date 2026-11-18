@@ -59,6 +59,8 @@ OpenTrader Pro watchlists.
 | `stock_analysis/src/pipeline.rs` | Fundamentals join, ranking, CSV/watchlist/chart output |
 | `stock_analysis/src/chart.rs` | PNG charts (plotters, embedded DejaVu fonts) |
 | `install_rust_binary.py` | Installs the prebuilt engine from a `rust-v*` release |
+| `nse_session.py` | Builds the NSE client (new nseindia.in host) |
+| `output_retention.py` | Deletes run CSVs and logs older than 60 days |
 | `run_fingerprint.py` | Per-run input/output fingerprint JSON and the two-run comparison CLI |
 | `run_scheduled.sh`, `schedule_setup.sh`, `Mark_Python.sh` | macOS launchd schedule and interpreter selection |
 
@@ -167,8 +169,8 @@ needs at least 252 candles in that window.
 ### Mark Tight
 The latest breakout that still holds inside the active Mark run.  A breakout
 is a candle whose close crossed above the prior 60-session Donchian high
-(close above it while the previous close was not, or the run's first candle
-when it is already above); each pullback below the level followed by a new
+(close[t] > donchian[t] while close[t-1] <= donchian[t-1], each candle against
+its own level; or the run's first candle when it is already above); each pullback below the level followed by a new
 cross starts a new breakout.  The reported breakout is the most recent one
 whose level is still below the latest close, so a newer breakout the price
 has fallen back from does not hide an older one that holds.  With none
@@ -238,18 +240,18 @@ only after installing a `rust-v*` release built from it.
    until repaired or rebuilt (`rebuild_eod_database.py --fill-missing` adds
    missing sessions in place).
 
-6. **Special sessions**: meta.json learns special sessions only from NSE
+7. **Special sessions**: meta.json learns special sessions only from NSE
    circulars and keeps the current year's holiday list; sessions from before
    that are in `screening_readiness.KNOWN_SPECIAL_SESSIONS` (add new budget or
    Muhurat sessions there when a rebuild must know them). A Muhurat day is in
    NSE's holiday list as "Laxmi Pujan" and is still a session on both exchanges.
 
-7. **Corporate-action overrides**: `Database/metadata/corporate_action_overrides.csv`
+8. **Corporate-action overrides**: `Database/metadata/corporate_action_overrides.csv`
    rows need Date as `YYYY-MM-DD` and Factor as a plain number in [0.001, 1000]; bad or unmatched rows
    are skipped with a warning, and a non-finite or non-positive factor is
    refused before anything is written.
 
-8. **Stored adjustments (store v3)**: `eod_prices` is a table, not a view.
+9. **Stored adjustments (store v3)**: `eod_prices` is a table, not a view.
    Anything that writes `raw_prices` should keep it in step: `upsert_daily_prices`
    writes the day's adjusted rows itself, renames move every derived table
    (`eod_store.DERIVED_TABLES`), a reused ticker drops them, `apply_retention`
@@ -266,11 +268,23 @@ only after installing a `rust-v*` release built from it.
    of the store plus ~1.5x its size (v3 is ~80% larger than v2); a failed one is
    retried at most once a day (`<stem>.migration-failed.json`).
 
-9. **Rollout of store v3**: code before v3 breaks on a v3 file (CatalogException:
+10. **Rollout of store v3**: code before v3 breaks on a v3 file (CatalogException:
    eod_prices is a table; its upserts write raw only and eod_data goes stale).
    Merge into `main` (the scheduler's checkout) before the new code runs on the
    default data root, and update all machines sharing it together. Roll back
    with `python -m eod_store --downgrade-to-v2 [PATH]` before starting old code.
+
+11. **BSE action list by hand**: since 2026-10-29 BSE answers the scripted
+   list download with 403 (bot protection). Do not try to get around it. CSVs
+   saved from bseindia.com into `config.BSE_ACTIONS_INBOX`
+   (`Database/BSE corporate actions/`) are imported each run
+   (`action_lists.import_bse_files`, moved to `imported/` or `rejected/`); a
+   run warns when BSE's list is `BSE_LIST_STALE_DAYS` (7) days old
+   (`Database/metadata/action_list_status.json`). NSE needs `nse[server]==3.2.1`
+   (`nse_session.py` points it at nseindia.in); 1.2.6 cannot reach NSE.
+
+12. **Output retention**: `output_retention.prune` deletes qualified CSVs and
+   run logs/fingerprints older than `OUTPUT_RETAIN_DAYS` (60) after each run.
 
 ## Git Workflow
 

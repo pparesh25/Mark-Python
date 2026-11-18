@@ -7,6 +7,42 @@ all local screening, enrichment, ranking, CSV/watchlist output and charting.
 Windows, Linux, and Apple Silicon Macs do not need Rust, Cargo, CMake, or a
 C/C++ compiler.
 
+## Daily use in one minute
+
+| What | Command / place |
+|------|-----------------|
+| Run everything now (Mac) | `./Mark_Python.sh` (the scheduler runs it Mon-Fri 19:30 IST) |
+| Run on Windows / Linux | `run_windows.cmd` / `./run_linux.sh` |
+| Check the price store against a full rebuild | `./Mark_Python.sh --verify` (0 equal, 5 repaired, 6 failed) |
+| Today's lists | `~/Mark EMA and HTF/qualified_stocks/<NSE|BSE>/<mark_tight|Tight Flag>/` |
+| Charts | `~/Mark EMA and HTF/chart_images/<NSE|BSE>/...` |
+| Log of a run | `~/Mark EMA and HTF/logs/screening_log_<timestamp>.txt` |
+| BSE corporate actions (weekly, by hand) | save BSE's CSV in `~/Mark EMA and HTF/Database/BSE corporate actions/` -- see below |
+| Gaps to look at | `~/Mark EMA and HTF/Database/corporate_action_review.csv` |
+| Compare two machines | `python -m run_fingerprint A.json B.json` |
+
+A run keeps qualified CSVs and run logs for 60 days (`MARK_OUTPUT_RETAIN_DAYS`,
+0 keeps everything); charts are replaced on every run.
+
+### BSE corporate actions by hand
+
+Since 29 October 2026 BSE's bot protection refuses the scripted download of
+its corporate-action list (HTTP 403), while its website still serves the same
+CSV. NSE's list still arrives on its own and covers every company listed on
+both exchanges; BSE's own list matters for BSE-only scrips. Once a week (and
+whenever the log says `BSE CORPORATE-ACTION LIST IS STALE`):
+
+1. open <https://www.bseindia.com/corporates/corporate_act>;
+2. Segment **Equity**, Select Date **Ex Date**, From = 60 days ago, To = 45
+   days ahead (the warning prints both dates), Submit, then **Download** (CSV);
+3. save the file in `~/Mark EMA and HTF/Database/BSE corporate actions/`.
+
+The next run imports it exactly like a downloaded list (rows of the scrips it
+lists inside its ex-date range are replaced, so a revised date or ratio is not
+applied twice), decides the factors again, and moves the file to `imported/`
+(a file that is not BSE's list goes to `rejected/`). The automatic download is
+still tried on every run and is used again as soon as BSE allows it.
+
 ## Supported runtime
 
 - Windows x64 with 64-bit Python 3.10-3.13 (Python 3.11 recommended)
@@ -167,7 +203,8 @@ run_windows.cmd
 ./run_macos.sh
 ```
 
-Both launchers pass extra arguments to `run_screener.py`:
+`./Mark_Python.sh` (macOS, used by the scheduler) picks the Python itself
+(`$MARK_PYTHON`, `.venv`, or the conda env `mark_screener`). All launchers pass extra arguments to `run_screener.py`:
 
 ```text
 --include-sme

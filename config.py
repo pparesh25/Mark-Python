@@ -148,6 +148,14 @@ BSE_DAILY_BHAVCOPY_DIR = DATA_ROOT / "Daily Bhavcopy BSE"
 # EOD downloader metadata (meta.json and isin.csv) goes here.
 EOD_METADATA_DIR = DATABASE_DIR / "metadata"
 
+# BSE's corporate-action CSVs downloaded by hand from bseindia.com are dropped here; every run imports
+# them (action_lists.import_bse_files) when BSE refuses the scripted download.
+BSE_ACTIONS_INBOX = DATABASE_DIR / "BSE corporate actions"
+# Qualified CSVs and run logs/fingerprints older than this many days are deleted after a run (0 keeps all).
+OUTPUT_RETAIN_DAYS = int(os.environ.get("MARK_OUTPUT_RETAIN_DAYS", "60"))
+# A run warns when the stored BSE list was last refreshed (fetched or imported) this many days ago or more.
+BSE_LIST_STALE_DAYS = 7
+
 
 def get_output_dirs(exchange: str):
     """Get the output and chart directories for a specific exchange (NSE or BSE)."""
@@ -232,7 +240,7 @@ def configure_data_root(root: Path) -> None:
     global DATA_ROOT, DATABASE_DIR, DATA_DIR, BSE_DATA_DIR, DUCKDB_FILE
     global FUNDAMENTAL_DIR, FUNDAMENTAL_FILE, OUT_DIR, CHART_DIR, LOG_DIR
     global DAILY_BHAVCOPY_DIR, BSE_DAILY_BHAVCOPY_DIR, EOD_METADATA_DIR, LOG_FILE
-    global SCREENER_CREDS, RUN_LOCK_FILE
+    global SCREENER_CREDS, RUN_LOCK_FILE, BSE_ACTIONS_INBOX
 
     DATA_ROOT = Path(root).expanduser()
     os.environ["MARK_DATA_ROOT"] = str(DATA_ROOT)
@@ -248,6 +256,7 @@ def configure_data_root(root: Path) -> None:
     DAILY_BHAVCOPY_DIR = DATA_ROOT / "Daily Bhavcopy NSE"
     BSE_DAILY_BHAVCOPY_DIR = DATA_ROOT / "Daily Bhavcopy BSE"
     EOD_METADATA_DIR = DATABASE_DIR / "metadata"
+    BSE_ACTIONS_INBOX = DATABASE_DIR / "BSE corporate actions"
     SCREENER_CREDS = get_screener_credentials_path(DATA_ROOT)
     LOG_FILE = LOG_DIR / f"screening_log_{CURRENT_TIMESTAMP}.txt"
     RUN_LOCK_FILE = DATA_ROOT / "mark_screener.lock"
@@ -263,7 +272,7 @@ def ensure_dirs(include_watchlists: bool | None = None):
     for d in (
         DATA_ROOT, DATABASE_DIR, DATA_DIR, BSE_DATA_DIR, FUNDAMENTAL_DIR,
         OUT_DIR, CHART_DIR, LOG_DIR, DAILY_BHAVCOPY_DIR,
-        BSE_DAILY_BHAVCOPY_DIR, EOD_METADATA_DIR, SCREENER_CREDS.parent,
+        BSE_DAILY_BHAVCOPY_DIR, EOD_METADATA_DIR, BSE_ACTIONS_INBOX, SCREENER_CREDS.parent,
     ):
         d.mkdir(parents=True, exist_ok=True)
 
