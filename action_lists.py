@@ -261,9 +261,9 @@ def refresh(conn, nse, start: date, end: date, logger, get=requests.get, exchang
             rows = _joined(parts)
             if rows.empty:
                 result[exchange] = "0 listed: nothing stored or replaced"
-            else:
-                new, removed = store(conn, rows, [(e, s, a, b) for e, s, a, b, _ in parts])
-                result[exchange] = f"{len(rows)} listed, {new} new, {removed} no longer listed (replaced)"
+                continue                            # an empty answer is not trusted (deletes nothing)
+            new, removed = store(conn, rows, [(e, s, a, b) for e, s, a, b, _ in parts])
+            result[exchange] = f"{len(rows)} listed, {new} new, {removed} no longer listed (replaced)"
             record_ok(status_path, exchange, today or date.today(), "fetched")
         except Exception as error:                  # an exchange that refuses today is asked again tomorrow
             result[exchange] = f"failed: {error}"
@@ -385,42 +385,79 @@ def _move(path: Path, folder: Path, today: date) -> Path:
 def import_bse_files(conn, inbox: Path | None, today: date, logger) -> dict:
     """Import every BSE action-list CSV waiting in `inbox`; returns {"files": n, "listed": n, "new": n, ...}.
 
-    Never raises for a bad file: it is moved to rejected/ with a warning. Files are imported oldest first,
-    so a newer download of the same range wins.
+    Never raises. A file that is not BSE's list moves to rejected/; a file that cannot be read or moved
+    (open in Excel on Windows, say) or that the store refuses stays where it is and is tried again on the
+    next run. Files are imported oldest first, so a newer download of the same range wins.
+
+    The scope a file replaces is the span of its own ex-dates (BSE's CSV does not say what was asked). A
+    file whose rows are all of one kind looks filtered (Purpose = Bonus, say): its rows are only added,
+    never used to delete, so a filtered download cannot remove another kind's rows.
     """
-    result = {"files": 0, "listed": 0, "new": 0, "replaced": 0, "rejected": 0}
-    if inbox is None or not inbox.is_dir():
+    result = {"files": 0, "listed": 0, "new": 0, "replaced": 0, "rejected": 0, "kept": 0}
+    try:
+        if inbox is None or not inbox.is_dir():
+            return result
+        files = []
+        for path in inbox.iterdir():
+            try:
+                if path.is_file() and path.suffix.lower() == ".csv":
+                    files.append((path.stat().st_mtime, path.name, path))
+            except OSError as error:
+                logger.warning(f"BSE action file {path.name} skipped ({error}).")
+    except OSError as error:
+        logger.warning(f"BSE action folder {inbox} unreadable ({error}).")
         return result
-    files = sorted((p for p in inbox.iterdir() if p.is_file() and p.suffix.lower() == ".csv"),
-                   key=lambda p: (p.stat().st_mtime, p.name))
-    for path in files:
+    for _, _, path in sorted(files):
         try:
-            rows = bse_rows(_read_text(path))
+            text = _read_text(path)
+        except OSError as error:
+            result["kept"] += 1
+            logger.warning(f"BSE action file {path.name} not readable ({error}); tried again next run.")
+            continue
+        try:
+            rows = bse_rows(text)
             dated = rows["Ex_Date"].dropna()
             if rows.empty or dated.empty:
                 raise ValueError("no dated rows")
-            first, last = min(dated), max(dated)
-            new, removed = store(conn, rows, [("BSE", "E", first, last)])
-        except Exception as error:                    # a wrong file must not stop the run
+        except Exception as error:                    # not BSE's list
             result["rejected"] += 1
-            moved = _move(path, inbox / "rejected", today)
-            logger.warning(f"BSE action file {path.name} not imported ({error}); moved to {moved}")
+            _move_or_keep(path, inbox / "rejected", today, logger,
+                          f"BSE action file {path.name} is not BSE's list ({error})")
+            continue
+        first, last = min(dated), max(dated)
+        filtered = rows["Kind"].fillna("none").nunique() == 1 and len(rows) > 1
+        try:
+            new, removed = store(conn, rows, [] if filtered else [("BSE", "E", first, last)])
+        except Exception as error:                    # the store, not the file: try again next run
+            result["kept"] += 1
+            logger.warning(f"BSE action file {path.name} not stored ({error}); tried again next run.")
             continue
         result["files"] += 1
         result["listed"] += len(rows)
         result["new"] += new
         result["replaced"] += removed
-        moved = _move(path, inbox / "imported", today)
-        logger.info(f"BSE action file {path.name}: {len(rows)} listed {first} -> {last}, {new} new, "
-                    f"{removed} no longer listed (replaced); moved to {moved}")
+        note = " (one kind only: looks filtered, rows added without replacing)" if filtered else ""
+        _move_or_keep(path, inbox / "imported", today, logger,
+                      f"BSE action file {path.name}: {len(rows)} listed {first:%Y-%m-%d} -> {last:%Y-%m-%d}, "
+                      f"{new} new, {removed} no longer listed (replaced){note}", info=True)
     return result
+
+
+def _move_or_keep(path: Path, folder: Path, today: date, logger, message: str, info: bool = False) -> None:
+    try:
+        moved = _move(path, folder, today)
+    except OSError as error:
+        logger.warning(f"{message}; could not move it ({error}), it stays in the folder.")
+        return
+    (logger.info if info else logger.warning)(f"{message}; moved to {moved}")
 
 
 def warn_if_stale(status_path: Path | None, inbox: Path | None, today: date, stale_days: int, logger) -> bool:
     """Warn (and return True) when BSE's stored list was last refreshed `stale_days` or more days ago."""
-    last = read_status(status_path).get("BSE", {}).get("last_ok")
+    entry = read_status(status_path).get("BSE")
+    last = entry.get("last_ok") if isinstance(entry, dict) else None
     try:
-        age = None if last is None else (today - date.fromisoformat(last)).days
+        age = (today - date.fromisoformat(last)).days if isinstance(last, str) else None
     except ValueError:
         age = None
     if age is not None and age < stale_days:
@@ -430,6 +467,6 @@ def warn_if_stale(status_path: Path | None, inbox: Path | None, today: date, sta
     logger.warning(
         f"BSE CORPORATE-ACTION LIST IS STALE ({since}): BSE refuses the scripted download, so new BSE splits "
         f"and bonuses are not applied. Download the list in a browser: https://www.bseindia.com/corporates/"
-        f"corporate_act -> Segment Equity, Ex Date, From {start:%d/%m/%Y} To {end:%d/%m/%Y} -> Download (CSV), "
-        f"and save it in: {inbox}  (the next run imports it).")
+        f"corporate_act -> Segment Equity, Select Date Ex Date, From {start:%d/%m/%Y} To {end:%d/%m/%Y}, every "
+        f"other filter left at All -> Submit -> Download (CSV), and save it in: {inbox}  (the next run imports it).")
     return True

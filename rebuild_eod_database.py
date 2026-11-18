@@ -244,6 +244,8 @@ def rebuild(logger: logging.Logger, years: float = config.EOD_RETAIN_YEARS, now:
             report["action_lists"] = action_lists.refresh_history(
                 conn, nse, start - timedelta(days=action_lists.HISTORY_LEAD_DAYS),
                 end + timedelta(days=action_lists.LOOK_AHEAD_DAYS), now.date(), logger, get)
+            if str(report["action_lists"].get("BSE", "")).startswith(("failed", "0 listed")):
+                report["bse_actions_kept"] = keep_bse_actions(conn, live, logger)
             # Retention first: the full rebuild then decides exactly the rows that stay.
             report["raw_rows_dropped"] = apply_retention(conn, years)
             report["prices"] = price_adjustments.rebuild(conn, metadata / "corporate_action_overrides.csv",
@@ -267,6 +269,36 @@ def rebuild(logger: logging.Logger, years: float = config.EOD_RETAIN_YEARS, now:
     swap_in(side, live, end, scratch_meta, metadata, logger)
     report["swapped"] = True
     return report
+
+
+def keep_bse_actions(conn, live: Path, logger: logging.Logger) -> int:
+    """Copy the live store's BSE action rows into the rebuilt one when BSE refused its list.
+
+    Since 2026-10-29 BSE refuses the scripted download, so its rows come from files saved by hand
+    (action_lists.import_bse_files); a rebuild must not drop them. Returns the rows copied.
+    """
+    if not live.exists():
+        return 0
+    try:
+        conn.execute(f"ATTACH '{str(live).replace(chr(39), chr(39) * 2)}' AS live_store (READ_ONLY)")
+    except Exception as error:                     # the live store is held by another process
+        logger.warning(f"BSE action rows not copied from the live store ({error}).")
+        return 0
+    try:
+        has_table = conn.execute("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'live_store' "
+                                 "AND table_name = 'exchange_actions'").fetchone()[0]
+        if not has_table:                          # an old store without the lists
+            return 0
+        before = conn.execute("SELECT count(*) FROM exchange_actions").fetchone()[0]
+        conn.execute("INSERT INTO exchange_actions SELECT l.* FROM live_store.exchange_actions l "
+                     "WHERE l.Exchange = 'BSE' AND NOT EXISTS (SELECT 1 FROM exchange_actions a WHERE "
+                     "a.Exchange = l.Exchange AND a.Code IS NOT DISTINCT FROM l.Code "
+                     "AND a.Ex_Date IS NOT DISTINCT FROM l.Ex_Date AND a.Purpose IS NOT DISTINCT FROM l.Purpose)")
+        copied = conn.execute("SELECT count(*) FROM exchange_actions").fetchone()[0] - before
+    finally:
+        conn.execute("DETACH live_store")
+    logger.warning(f"BSE refused its action list: kept the live store's {copied} BSE action rows.")
+    return int(copied)
 
 
 def _remove_tree(path: Path, inside: Path) -> None:

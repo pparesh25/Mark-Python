@@ -34,14 +34,20 @@ whenever the log says `BSE CORPORATE-ACTION LIST IS STALE`):
 
 1. open <https://www.bseindia.com/corporates/corporate_act>;
 2. Segment **Equity**, Select Date **Ex Date**, From = 60 days ago, To = 45
-   days ahead (the warning prints both dates), Submit, then **Download** (CSV);
-3. save the file in `~/Mark EMA and HTF/Database/BSE corporate actions/`.
+   days ahead (the warning prints both dates), **every other filter left at
+   All** (Purpose, industry, security), Submit, then **Download** (CSV);
+3. save the file, unopened, in `~/Mark EMA and HTF/Database/BSE corporate actions/`
+   (a file re-saved by Excel changes its dates and is rejected). Each machine
+   that runs the screener needs the file in its own folder.
 
 The next run imports it exactly like a downloaded list (rows of the scrips it
 lists inside its ex-date range are replaced, so a revised date or ratio is not
 applied twice), decides the factors again, and moves the file to `imported/`
 (a file that is not BSE's list goes to `rejected/`). The automatic download is
-still tried on every run and is used again as soon as BSE allows it.
+still tried on every run and is used again as soon as BSE allows it. A file
+whose rows are all one kind (a Purpose filter was set) is only added, never
+used to replace rows; a file that is open elsewhere stays and is tried again.
+A full rebuild keeps the stored BSE rows when BSE refuses its list.
 
 ## Supported runtime
 

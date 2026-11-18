@@ -42,7 +42,7 @@ def test_a_saved_file_is_imported_and_moved_to_imported(conn, tmp_path):
     (inbox / "Corporate_Actions.csv").write_text("﻿" + csv((590001, "ONLYBSE", DAYS[20], "Bonus issue 2:1")),
                                                  encoding="utf-8")
     result = action_lists.import_bse_files(conn, inbox, date(2025, 5, 1), LOG)
-    assert result == {"files": 1, "listed": 1, "new": 1, "replaced": 0, "rejected": 0}
+    assert result == {"files": 1, "listed": 1, "new": 1, "replaced": 0, "rejected": 0, "kept": 0}
     assert stored_bse(conn) == [("590001", "ONLYBSE", f"{DAYS[20]:%Y-%m-%d}", "Bonus issue 2:1")]
     assert not (inbox / "Corporate_Actions.csv").exists()
     assert [p.name for p in (inbox / "imported").iterdir()] == ["20250501_Corporate_Actions.csv"]
@@ -107,8 +107,9 @@ def test_the_stale_warning_names_the_page_the_range_and_the_folder(tmp_path, cap
     action_lists.record_ok(status, "BSE", date(2026, 11, 12), "imported file")
     assert not action_lists.warn_if_stale(status, inbox, today, 7, LOG)            # 6 days old
     assert action_lists.warn_if_stale(status, inbox, date(2026, 11, 19), 7, LOG)   # 7 days old
-    status.write_text("not json")
-    assert action_lists.warn_if_stale(status, inbox, today, 7, LOG)
+    for text in ("not json", '{"BSE": "x"}', '{"BSE": {"last_ok": 5}}', '{"BSE": {"last_ok": "bad"}}'):
+        status.write_text(text)
+        assert action_lists.warn_if_stale(status, inbox, today, 7, LOG)
 
 
 def test_a_fetch_bse_answers_is_recorded_a_refused_one_is_not(conn, tmp_path):
@@ -126,7 +127,14 @@ def test_a_fetch_bse_answers_is_recorded_a_refused_one_is_not(conn, tmp_path):
     assert action_lists.read_status(status) == {}
     action_lists.refresh(conn, None, *window, LOG, get=lambda *a, **k: Empty(), exchanges=("BSE",),
                          status_path=status, today=date(2025, 5, 2))
-    assert action_lists.read_status(status) == {"BSE": {"last_ok": "2025-05-02", "source": "fetched"}}
+    assert action_lists.read_status(status) == {}                 # an empty answer is not trusted
+
+    class Listed:
+        status_code, text = 200, csv((590001, "ONLYBSE", DAYS[20], "Bonus issue 2:1"))
+
+    action_lists.refresh(conn, None, *window, LOG, get=lambda *a, **k: Listed(), exchanges=("BSE",),
+                         status_path=status, today=date(2025, 5, 3))
+    assert action_lists.read_status(status) == {"BSE": {"last_ok": "2025-05-03", "source": "fetched"}}
 
 
 def test_an_imported_bonus_is_applied_to_bse_only_prices_by_the_next_refresh(conn, tmp_path, monkeypatch):
@@ -150,3 +158,64 @@ def test_an_imported_bonus_is_applied_to_bse_only_prices_by_the_next_refresh(con
     first = conn.execute("SELECT Close FROM eod_prices WHERE Symbol = 'ONLYBSE' AND Exchange = 'BSE' "
                          "ORDER BY Date LIMIT 1").fetchone()[0]
     assert first == pytest.approx(100.0)
+
+
+def test_a_file_that_cannot_be_moved_stays_and_the_run_goes_on(conn, tmp_path, monkeypatch, caplog):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "open_in_excel.csv").write_text(csv((590001, "ONLYBSE", DAYS[20], "Bonus issue 2:1")))
+    (inbox / "wrong.csv").write_text("<HTML>Access Denied</HTML>")
+
+    def locked(self, target):
+        raise PermissionError("[WinError 32] used by another process")
+
+    monkeypatch.setattr(type(inbox), "replace", locked)
+    with caplog.at_level(logging.WARNING):
+        result = action_lists.import_bse_files(conn, inbox, date(2025, 5, 1), LOG)
+    assert (result["files"], result["rejected"]) == (1, 1)
+    assert len(stored_bse(conn)) == 1
+    assert (inbox / "open_in_excel.csv").exists() and (inbox / "wrong.csv").exists()
+    assert "stays in the folder" in caplog.text
+
+
+def test_a_store_failure_keeps_the_file_for_the_next_run(conn, tmp_path, monkeypatch):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "good.csv").write_text(csv((590001, "ONLYBSE", DAYS[20], "Bonus issue 2:1")))
+
+    def full_disk(*args, **kwargs):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(action_lists, "store", full_disk)
+    result = action_lists.import_bse_files(conn, inbox, date(2025, 5, 1), LOG)
+    assert (result["files"], result["rejected"], result["kept"]) == (0, 0, 1)
+    assert (inbox / "good.csv").exists() and not (inbox / "rejected").exists()
+
+
+def test_a_file_of_one_kind_looks_filtered_and_deletes_nothing(conn, tmp_path):
+    action_lists.store(conn, action_lists.bse_rows(csv((590001, "ONLYBSE", DAYS[15], "Stock  Split From Rs.10/- to Rs.1/-"),
+                                                       (590001, "ONLYBSE", DAYS[8], "Dividend - Rs. - 1.0000"))))
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "dividends_only.csv").write_text(csv((590001, "ONLYBSE", DAYS[8], "Dividend - Rs. - 1.0000"),
+                                                  (590002, "OTHER", DAYS[22], "Dividend - Rs. - 2.0000")))
+    result = action_lists.import_bse_files(conn, inbox, date(2025, 5, 1), LOG)
+    assert (result["new"], result["replaced"]) == (1, 0)
+    assert len(stored_bse(conn)) == 3                                # the split is kept
+
+
+def test_a_rebuild_keeps_the_live_stores_bse_rows_when_bse_refuses(tmp_path):
+    import rebuild_eod_database as rebuild
+
+    live = tmp_path / "live.duckdb"
+    old = duckdb.connect(str(live))
+    create_schema(old)
+    action_lists.store(old, action_lists.bse_rows(csv((590001, "ONLYBSE", DAYS[20], "Bonus issue 2:1"))))
+    old.close()
+    side = duckdb.connect(str(tmp_path / "side.duckdb"))
+    create_schema(side)
+    assert rebuild.keep_bse_actions(side, live, LOG) == 1
+    assert rebuild.keep_bse_actions(side, live, LOG) == 0            # no duplicates
+    assert stored_bse(side) == [("590001", "ONLYBSE", f"{DAYS[20]:%Y-%m-%d}", "Bonus issue 2:1")]
+    assert rebuild.keep_bse_actions(side, tmp_path / "absent.duckdb", LOG) == 0
+    side.close()

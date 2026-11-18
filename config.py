@@ -152,7 +152,14 @@ EOD_METADATA_DIR = DATABASE_DIR / "metadata"
 # them (action_lists.import_bse_files) when BSE refuses the scripted download.
 BSE_ACTIONS_INBOX = DATABASE_DIR / "BSE corporate actions"
 # Qualified CSVs and run logs/fingerprints older than this many days are deleted after a run (0 keeps all).
-OUTPUT_RETAIN_DAYS = int(os.environ.get("MARK_OUTPUT_RETAIN_DAYS", "60"))
+def _retain_days(text: str | None, default: int = 60) -> int:
+    try:
+        return max(0, int(str(text).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+OUTPUT_RETAIN_DAYS = _retain_days(os.environ.get("MARK_OUTPUT_RETAIN_DAYS"))
 # A run warns when the stored BSE list was last refreshed (fetched or imported) this many days ago or more.
 BSE_LIST_STALE_DAYS = 7
 

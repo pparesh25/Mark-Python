@@ -776,7 +776,11 @@ def refresh(conn, nse, logger: logging.Logger, overrides_path: Path | None = Non
     today = today or market_today()
     start, end = action_lists.window(today)
     lists = action_lists.refresh(conn, nse, list_start or start, end, logger, status_path=status_path, today=today)
-    imported = action_lists.import_bse_files(conn, bse_inbox, today, logger)
+    try:
+        imported = action_lists.import_bse_files(conn, bse_inbox, today, logger)
+    except Exception as error:                   # the decisions below must run whatever the import did
+        logger.warning(f"BSE action files not imported ({error}); tried again next run.")
+        imported = {"files": 0, "error": str(error)}
     if imported["files"]:
         action_lists.record_ok(status_path, "BSE", today, "imported file")
     history = action_lists.refresh_history_if_due(conn, nse, today, end, logger)
