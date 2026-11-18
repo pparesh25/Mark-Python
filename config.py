@@ -101,8 +101,9 @@ EMA_PERIOD = 200
 # fewer sessions in two years is skipped by the screener. Older raw rows are
 # dropped after every sync; factors and actions are kept.
 EOD_RETAIN_YEARS = 2
-# Number of most-recent daily candles searched for a Flag pole.  This value is
-# passed to the Rust engine on every run so both implementations use it.
+# Number of the exchange's most recent sessions searched for a Flag pole
+# (engine 0.5.0; before, the symbol's own last candles).  Passed to the Rust
+# engine on every run.
 FLAG_LOOKBACK_DAYS = 90
 # A symbol is screened only when its latest candle is within this many
 # sessions of its exchange's latest session.  Suspended or delisted series are

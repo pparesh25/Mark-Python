@@ -32,11 +32,14 @@ stock_analysis/bin/darwin-aarch64/stock_analysis
 
 The screening rules live in this executable, so a rule change reaches a
 machine only when a new `rust-v*` release is tagged and installed. Version
-0.4.0 changes the rules (latest holding Mark Tight breakout, a Tight Flag
+0.5.0 changes the rules again: Mark Tight keeps the first template + Donchian
+signal until a close below EMA 50, and Tight Flag needs at least 3 flag
+candles inside the exchange's last 90 sessions (see README). Version
+0.4.0 changed the rules (latest holding Mark Tight breakout, a Tight Flag
 pole of 4-45 candles reported by its latest breakout, a 20% flag-depth limit,
 Days_Since_Breakout from the latest session, a fixed 700-day history window;
 see README). It takes the same command-line arguments
-as 0.3.0, so the Python launcher works with either version.
+as 0.3.0, so the Python launcher works with any of these versions.
 
 `config.py` discovers that path automatically. `MARK_RUST_BINARY` can still be
 used to select a different executable explicitly.

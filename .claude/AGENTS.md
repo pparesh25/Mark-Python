@@ -157,7 +157,6 @@ skipped.  SME tickers (`_SME`) are excluded unless `--include-sme`/`--only-sme`.
 ### Mark setup (internal)
 Conditions: close > EMA 50 > EMA 150 > EMA 200 AND close >= 80% of 52w high
 AND close >= 150% of 52w low.  EMAs are SMA-seeded and rounded to 2 decimals.
-Walk back from the latest candle to find the start of the active setup.
 
 ### History anchor
 All indicators, rules and charts use only candles dated on or after the
@@ -167,24 +166,18 @@ start on different days still seed the EMAs on the same candle.  A series
 needs at least 252 candles in that window.
 
 ### Mark Tight
-The latest breakout that still holds inside the active Mark run.  A breakout
-is a candle whose close crossed above the prior 60-session Donchian high
-(close[t] > donchian[t] while close[t-1] <= donchian[t-1], each candle against
-its own level; or the run's first candle when it is already above); each pullback below the level followed by a new
-cross starts a new breakout.  The reported breakout is the most recent one
-whose level is still below the latest close, so a newer breakout the price
-has fallen back from does not hide an older one that holds.  With none
-holding the symbol does not qualify.  That candle's date = `Mark_Tight_Date`.
-The run's first candle counts as a crossing only when the run really starts
-there (the candle before it had all indicators and failed Mark); when the
-walk-back stops at the indicator warm-up (index 251, the first 52-week value),
-that candle must pass the normal test against the candle before it.
-Every symbol the first-breakout rule (0.3.0) qualified still qualifies, with
-the same or a later date, apart from differences the history anchor makes.
+A signal is a candle on which the Mark setup holds and the close is above the
+prior 60-session Donchian high (close[t] > donchian[t]).  The reported signal
+is the first one after the latest close below EMA 50 (`Mark_Tight_Date`); the
+symbol stays listed with that date until a close below EMA 50, whatever the
+Donchian level or a later new high.  The latest candle need not pass the
+other setup conditions.  A trend running through the indicator warm-up is
+signalled on the first candle from index 251 (the first 52-week value) that
+passes the setup and the breakout.
 
 ### Tight Flag
 Gates on the latest candle: close >= 5, >= EMA 200 and within 45% of the 52w
-high.  Inside the last `FLAG_LOOKBACK_DAYS` candles every candle j is a
+high.  Inside the exchange's last `FLAG_LOOKBACK_DAYS` sessions every candle j is a
 candidate peak:
 - start i = the lowest low (low > 0) among candles j-45 ..= j-4 inside the
   window (ties: the later candle), so a pole is 4 to 45 candles long;
@@ -194,6 +187,7 @@ candidate peak:
   i ..= j;
 - breakout k = the first candle in j+1 ..= j+15 with close > high[j]; no
   high in j+1 ..= k-1 above high[j] (a higher candle is its own candidate);
+- at least `MIN_FLAG_CANDLES` (3) candles in j+1 ..= k-1;
 - flag depth: every low in j+1 ..= k-1 >= (1 - `MAX_FLAG_DEPTH`) * high[j]
   (20%; the peak and breakout candles' lows do not count);
 - latest close > high[j].
@@ -210,7 +204,7 @@ symbol.  Charts end on the symbol's last candle.  CSV and watchlist file names
 still use the run timestamp.  CSVs add `Last_Date` and all Screener.in
 columns; `EOD_Down_From_52w_High` is computed from EOD data.
 
-These rules live in the Rust engine (0.4.0 and later); a machine gets them
+These rules live in the Rust engine (0.5.0 and later); a machine gets them
 only after installing a `rust-v*` release built from it.
 
 ## Known Issues & Gotchas

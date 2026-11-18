@@ -291,22 +291,25 @@ optimized two-request HTTP flow.  An older local file is used only when
    by latest breakout and exports all CSVs, OpenTrader Pro watchlists and
    charts. Screening data is reused for charting, so DuckDB is not read again.
 
-### Breakout rules (Rust engine 0.4.0 and later)
+### Breakout rules (Rust engine 0.5.0 and later)
 
-- **Mark Tight** reports the latest breakout of the current Mark trend that
-  still holds: of the days the close crossed above the prior 60-session high,
-  the most recent one whose level is still below the latest close. A newer
-  breakout the price fell back from does not hide an older one that holds.
-- **Tight Flag** treats every candle of the last 90 as a possible pole peak.
+- **Mark Tight** signals on the first candle on which the Mark template holds
+  and the close is above the prior 60-session high (Donchian). The symbol then
+  stays listed, with that date, until a close below EMA 50 ends the trend; a
+  pullback under the 60-session high or a new high does not remove it or move
+  the date. After a close below EMA 50 it needs a new signal. A trend already
+  running when the 52-week values begin is signalled on the first candle from
+  there that passes the template and the breakout.
+- **Tight Flag** treats every candle of the exchange's last 90 sessions as a
+  possible pole peak (a thinly traded symbol does not reach back months).
   The pole starts at the lowest low 4 to 45 candles before the peak, no candle
   of the pole trades above the peak, and the peak is at least 90% above that
   low (no >50% opening gap, at most 40% circuit candles). The breakout is the
-  first close above the peak within 15 candles; until then no candle trades
-  above the peak or more than 20% below it, and the latest close is still
-  above the peak. Of the qualifying poles, the one with the latest breakout
-  (then the later peak) is reported.
-- A Mark trend that already began before the first candle with a 52-week
-  value has no breakout on that candle; only a later crossing counts.
+  first close above the peak within 15 candles, with at least 3 flag candles
+  before it (a close above the peak sooner continues the pole); until then no
+  candle trades above the peak or more than 20% below it, and the latest close
+  is still above the peak. Of the qualifying poles, the one with the latest
+  breakout (then the later peak) is reported.
 - **Days_Since_Breakout** counts calendar days from the exchange's latest
   stored session, so a weekend or holiday run ranks like the last trading day.
   Charts end on the symbol's last candle.
@@ -315,7 +318,7 @@ optimized two-request HTTP flow.  An older local file is used only when
   even when their stores begin on different days.
 
 These rules are in the precompiled engine, so a machine gets them only after
-installing a `rust-v*` release built from version 0.4.0 or later (see
+installing a `rust-v*` release built from version 0.5.0 or later (see
 `RUST_BINARIES.md`); the run log prints the engine version.
 
 ### Prices, splits, bonuses and demergers
