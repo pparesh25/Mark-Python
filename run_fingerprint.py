@@ -42,6 +42,7 @@ import hashlib
 import json
 import logging
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -82,6 +83,7 @@ INFORMATIONAL_KEYS = (
     "packages.python",
     "packages.nse",
     "packages.httpx",
+    "installed_packages.",
     "store.path",
     "store.size_bytes",
     "store.hash_seconds",
@@ -159,6 +161,31 @@ def _package_versions() -> dict:
         except metadata.PackageNotFoundError:
             versions[name] = None
     return versions
+
+
+def _normalize_package(name: str) -> str:
+    """PEP 503 name: case and runs of '-', '_', '.' do not matter (PyYAML == pyyaml)."""
+    return re.sub(r"[-_.]+", "-", name.strip()).lower()
+
+
+def _installed_packages() -> dict:
+    """Every distribution installed for this interpreter: {normalized name: version}.
+
+    Two different versions of one package (a stray dist-info) are kept as
+    "v1 | v2", so a broken environment shows up in the comparison instead of
+    being hidden.  One unreadable dist-info is skipped, never the whole list.
+    """
+    found: dict[str, set] = {}
+    for dist in metadata.distributions():
+        try:
+            name = (dist.metadata or {}).get("Name")
+            if not name:
+                continue
+            version = dist.version or "?"
+        except Exception:  # noqa: BLE001 - one broken dist-info must not lose the list
+            continue
+        found.setdefault(_normalize_package(name), set()).add(str(version))
+    return {name: " | ".join(sorted(versions)) for name, versions in sorted(found.items())}
 
 
 def _settings(include_sme: bool, only_sme: bool) -> dict:
@@ -423,6 +450,7 @@ def collect(
         "fingerprint_version": FINGERPRINT_VERSION,
         "run": timed("run", _run_section, timestamp),
         "packages": timed("packages", _package_versions),
+        "installed_packages": timed("installed_packages", _installed_packages),
         "engine": engine if engine is not None else timed("engine", engine_info, config.RUST_BINARY),
         "settings": _section("settings", _settings, include_sme, only_sme),
         "data_as_of": _section("as-of", _as_of_section, readiness, local_fallback, sync_stopped, warnings),
@@ -496,7 +524,11 @@ def summary_lines(fingerprint: dict) -> list[str]:
         f"{run.get('machine_tz_name') or run.get('machine_tz', '')} | {run.get('platform', '?')}"
     )
     packages = fingerprint.get("packages") or {}
-    lines.append(" | ".join(f"{name} {packages.get(name, '?')}" for name in ("python", "pandas", "numpy", "duckdb")))
+    package_line = " | ".join(f"{name} {packages.get(name, '?')}" for name in ("python", "pandas", "numpy", "duckdb"))
+    installed = fingerprint.get("installed_packages")
+    if _package_list(installed) is not None:
+        package_line += f" | {len(installed)} package{'' if len(installed) == 1 else 's'} installed"
+    lines.append(package_line)
     lines.append(f"engine {get('engine', 'version')} | sha256 {get('engine', 'sha256')}")
     store = fingerprint.get("store") or {}
     if "error" in store:
@@ -564,9 +596,49 @@ def _short(values, limit: int = 12) -> str:
     return shown + (f" (+{len(values) - limit} more)" if len(values) > limit else "")
 
 
+def _package_list(value) -> dict | None:
+    """The recorded package list, or None when absent (older code) or its section failed."""
+    if not isinstance(value, dict) or "error" in value:
+        return None
+    return value
+
+
+def _package_list_problem(fingerprint: dict) -> str | None:
+    """Why a fingerprint has no package list to compare, or None when it has one."""
+    value = fingerprint.get("installed_packages")
+    if _package_list(value) is not None:
+        return None
+    if isinstance(value, dict):
+        return f"its section failed ({value['error']})"
+    return "written before the full list was recorded"
+
+
+def compare_packages(a: dict, b: dict) -> list[str] | None:
+    """Lines naming every installed package whose version differs or is on one side only.
+
+    None when either fingerprint has no list (older code, or its section failed).
+    """
+    left, right = _package_list(a.get("installed_packages")), _package_list(b.get("installed_packages"))
+    if left is None or right is None:
+        return None
+    lines = []
+    for name in sorted(set(left) | set(right)):
+        if name not in right:
+            lines.append(f"{name}: A={left[name]}  B=<not installed>")
+        elif name not in left:
+            lines.append(f"{name}: A=<not installed>  B={right[name]}")
+        elif left[name] != right[name]:
+            lines.append(f"{name}: A={left[name]}  B={right[name]}")
+    return lines
+
+
 def compare(a: dict, b: dict) -> tuple[list[str], list[str]]:
     """Return (result-relevant differences, informational differences) as printable lines."""
     a, b = dict(a), dict(b)
+    # The full package list is compared by compare_packages; the pinned
+    # packages that compute prices stay under "packages" below.
+    a.pop("installed_packages", None)
+    b.pop("installed_packages", None)
     relevant: list[str] = []
     informational: list[str] = []
 
@@ -636,7 +708,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cannot read fingerprint: {error}", file=sys.stderr)
         return 2
     relevant, informational = compare(a, b)
+    package_lines = compare_packages(a, b)
     print(f"A: {args.a}\nB: {args.b}")
+    python_a = (a.get("packages") or {}).get("python", "?")
+    python_b = (b.get("packages") or {}).get("python", "?")
+    print(f"\nPython {python_a} vs {python_b}; ", end="")
+    if package_lines is None:
+        reasons = [f"{side} {problem}" for side, fp in (("A", a), ("B", b))
+                   if (problem := _package_list_problem(fp))]
+        print(f"installed packages not compared: {'; '.join(reasons)}.")
+    elif package_lines:
+        print(f"{len(package_lines)} installed package difference(s):")
+        for line in package_lines:
+            print(f"  {line}")
+    else:
+        print("installed packages: identical.")
     if relevant:
         print(f"\n{len(relevant)} difference(s) that can change results:")
         for line in relevant:

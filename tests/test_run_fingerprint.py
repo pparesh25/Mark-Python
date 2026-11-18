@@ -232,6 +232,12 @@ def test_full_fingerprint_and_outputs(tmp_path):
     assert loaded["run"]["timestamp_ist"] == "2026-10-14T23:40:04+05:30"
     for package in ("python", "pandas", "numpy", "duckdb", "nse", "httpx"):
         assert package in loaded["packages"]
+    installed = loaded["installed_packages"]
+    assert loaded["packages"]["duckdb"] in installed["duckdb"]
+    assert installed["pytest"]  # every distribution, not only the pinned ones
+    assert list(installed) == sorted(installed)
+    assert any(line.endswith(f"| {len(installed)} packages installed")
+               for line in run_fingerprint.summary_lines(loaded))
     assert loaded["outputs"]["NSE/mark_tight"]["entries"] == ["AAA|2026-10-14", "CCC|2026-10-01"]
     assert loaded["outputs"]["NSE/Tight Flag"]["breakout_column"] == "breakout_date"
     assert loaded["overrides"]["present"] in (True, False)
@@ -289,6 +295,74 @@ def test_compare_names_the_fields_sessions_and_symbols(tmp_path, capsys):
     assert "difference(s) that can change results" in capsys.readouterr().out
     assert run_fingerprint.main([str(tmp_path / "a.json"), str(tmp_path / "c.json")]) == 0
     assert "No differences" in capsys.readouterr().out
+
+
+def test_package_names_are_normalized():
+    assert run_fingerprint._normalize_package("PyYAML") == "pyyaml"
+    assert run_fingerprint._normalize_package("python_dateutil") == "python-dateutil"
+    assert run_fingerprint._normalize_package("zope.interface") == "zope-interface"
+    assert run_fingerprint._normalize_package(" Foo-_.Bar__baz ") == "foo-bar-baz"
+
+
+def test_installed_packages_keep_both_copies_of_a_duplicate(monkeypatch):
+    class Dist:
+        def __init__(self, name, version):
+            self.metadata = {"Name": name}
+            self.version = version
+
+    class Broken:
+        @property
+        def metadata(self):
+            raise KeyError("Name")
+
+    dists = [Dist("Requests", "2.32.3"), Dist("requests", "2.31.0"), Dist("numpy", "2.2.6"),
+             Dist("numpy", "2.2.6"), Dist(None, "1"), Dist("nover", None), Broken()]
+    monkeypatch.setattr(run_fingerprint.metadata, "distributions", lambda: dists)
+    assert run_fingerprint._installed_packages() == {
+        "nover": "?", "numpy": "2.2.6", "requests": "2.31.0 | 2.32.3",
+    }
+
+
+def test_compare_lists_every_installed_package_difference(tmp_path, capsys):
+    a = _fingerprint()
+    b = _fingerprint(packages__python="3.11.15")
+    a["installed_packages"] = {"certifi": "2025.1.1", "numpy": "2.2.6", "tzdata": "2025.2"}
+    b["installed_packages"] = {"certifi": "2026.1.1", "colorama": "0.4.6", "numpy": "2.2.6"}
+    assert run_fingerprint.compare_packages(a, b) == [
+        "certifi: A=2025.1.1  B=2026.1.1",
+        "colorama: A=<not installed>  B=0.4.6",
+        "tzdata: A=2025.2  B=<not installed>",
+    ]
+    # The full list never turns into result-relevant fields of its own.
+    relevant, informational = run_fingerprint.compare(a, b)
+    assert not relevant
+    assert not any("installed_packages" in line for line in informational)
+
+    (tmp_path / "a.json").write_text(json.dumps(a))
+    (tmp_path / "b.json").write_text(json.dumps(b))
+    assert run_fingerprint.main([str(tmp_path / "a.json"), str(tmp_path / "b.json")]) == 0
+    out = capsys.readouterr().out
+    assert "Python 3.10.20 vs 3.11.15; 3 installed package difference(s)" in out
+    assert "colorama: A=<not installed>  B=0.4.6" in out
+
+    b["installed_packages"] = dict(a["installed_packages"])
+    assert run_fingerprint.compare_packages(a, b) == []
+    del b["installed_packages"]
+    assert run_fingerprint.compare_packages(a, b) is None
+    (tmp_path / "b.json").write_text(json.dumps(b))
+    assert run_fingerprint.main([str(tmp_path / "a.json"), str(tmp_path / "b.json")]) == 0
+    assert "installed packages not compared: B written before the full list" in capsys.readouterr().out
+
+    # A section that failed is reported as such, never read as a package named "error".
+    a["installed_packages"] = {"error": "TypeError: x"}
+    b["installed_packages"] = None
+    assert run_fingerprint.compare_packages(a, b) is None
+    (tmp_path / "a.json").write_text(json.dumps(a))
+    (tmp_path / "b.json").write_text(json.dumps(b))
+    assert run_fingerprint.main([str(tmp_path / "a.json"), str(tmp_path / "b.json")]) == 0
+    out = capsys.readouterr().out
+    assert "A its section failed (TypeError: x); B written before the full list was recorded." in out
+    assert not any("packages installed" in line for line in run_fingerprint.summary_lines(a))
 
 
 def test_consistency_warning_is_logged_once_and_kept(caplog):

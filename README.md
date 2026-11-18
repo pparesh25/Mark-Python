@@ -463,12 +463,17 @@ python -m run_fingerprint run_fingerprint_A.json run_fingerprint_B.json        #
 
 It prints only the fields that differ, names the sessions two stores disagree
 on and the symbols only one machine qualified, and exits 1 when anything that
-can change results differs.  The fields:
+can change results differs.  It first prints both Python versions and every
+installed package whose version differs or that only one machine has
+(older fingerprints do not record that list, so both machines need the
+current code; the run log's `Run fingerprint` block shows how many packages it
+recorded).  The fields:
 
 | Field | Meaning |
 |-------|---------|
 | `run` | run timestamp (IST), the machine's local time and zone, `platform.platform()`, the Python executable -- expected to differ |
 | `packages` | pandas, numpy and duckdb versions (pinned in `requirements.txt`); python, nse and httpx versions are recorded but informational |
+| `installed_packages` | every distribution installed for the run's Python (`{name: version}`, names lower-case with `-`; two different versions of one package show as `v1 \| v2`) -- the comparison prints all of them that differ first, informational |
 | `engine` | Rust engine version, full sha256 and path |
 | `settings` | `FLAG_LOOKBACK_DAYS`, `MAX_STALE_SESSIONS`, SME options, the 18:00 EOD cutoff |
 | `data_as_of` | NSE/BSE latest local session, the eligible target, `as_of_mismatch`, `local_fallback` (screened older data than the target), `sync_stopped`, and the warnings |
