@@ -348,10 +348,10 @@ fn pole_start(lows: &[f64], j_peak: usize) -> Option<usize> {
 /// when the pole has no >50% gap, <= 40% circuit candles, a close above
 /// high[j] within 20 candles with no flag candle trading above high[j] or
 /// more than MAX_FLAG_DEPTH below it (a breakout on the candle after the peak
-/// has no flag candles and qualifies), and the latest close above high[j].  The window is the exchange's last
-/// `flag_lookback` sessions (`window_start`, its first date), so a thinly
-/// traded symbol does not reach back months; without it, the last
-/// `flag_lookback` candles.
+/// has no flag candles and qualifies), and the latest close above high[j].
+/// The window is the exchange's last `flag_lookback` sessions
+/// (`window_start`, its first date), so a thinly traded symbol does not
+/// reach back months; without it, the last `flag_lookback` candles.
 /// The qualifying pole with the latest breakout (then the later peak)
 /// supplies the `tight_*` dates and `breakout_date`.
 fn process_flag_screener(

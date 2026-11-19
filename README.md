@@ -306,8 +306,8 @@ optimized two-request HTTP flow.  An older local file is used only when
   of the pole trades above the peak, and the peak is at least 90% above that
   low (no >50% opening gap, at most 40% circuit candles). The breakout is the
   first close above the peak within 20 candles (it may be the very next
-  candle); until then no candle trades above the peak or more than 20% below it, and the latest close
-  is still above the peak. Of the qualifying poles, the one with the latest
+  candle); until then no candle trades above the peak or more than 20% below
+  it, and the latest close is still above the peak. Of the qualifying poles, the one with the latest
   breakout (then the later peak) is reported.
 - **Days_Since_Breakout** counts calendar days from the exchange's latest
   stored session, so a weekend or holiday run ranks like the last trading day.

@@ -34,7 +34,7 @@ The screening rules live in this executable, so a rule change reaches a
 machine only when a new `rust-v*` release is tagged and installed. Version
 0.6.0 lets a Tight Flag break out on the candle after its peak (no minimum of
 flag candles) and up to 20 candles after it (was 15). Version
-0.5.0 changes the rules again: Mark Tight keeps the first template + Donchian
+0.5.0 changed the rules: Mark Tight keeps the first template + Donchian
 signal until a close below EMA 50, and Tight Flag needs at least 3 flag
 candles inside the exchange's last 90 sessions (see README). Version
 0.4.0 changed the rules (latest holding Mark Tight breakout, a Tight Flag
