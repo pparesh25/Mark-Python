@@ -324,10 +324,7 @@ pub fn history_start(latest_session: &str) -> Option<String> {
 const POLE_MIN_CANDLES: usize = 4;
 const POLE_MAX_CANDLES: usize = 45;
 /// The breakout close comes at most this many candles after the peak.
-const MAX_FLAG_CANDLES: usize = 15;
-/// At least this many candles between the peak and the breakout (the flag);
-/// a close above the peak sooner is a continuation of the pole, not a flag.
-pub const MIN_FLAG_CANDLES: usize = 3;
+const MAX_FLAG_CANDLES: usize = 20;
 
 /// Pole start for a peak at `j_peak`: the lowest positive low among the
 /// candles 45..=4 before it (inside the window); ties go to the later candle.
@@ -349,9 +346,9 @@ fn pole_start(lows: &[f64], j_peak: usize) -> Option<usize> {
 /// the pole may trade above high[j].  `flag_*` describe the first candidate
 /// pole with a 90% run-up (the internal stage-1 gate).  A candidate qualifies
 /// when the pole has no >50% gap, <= 40% circuit candles, a close above
-/// high[j] within 15 candles with no flag candle trading above high[j] or
-/// more than MAX_FLAG_DEPTH below it, at least MIN_FLAG_CANDLES flag candles,
-/// and the latest close above high[j].  The window is the exchange's last
+/// high[j] within 20 candles with no flag candle trading above high[j] or
+/// more than MAX_FLAG_DEPTH below it (a breakout on the candle after the peak
+/// has no flag candles and qualifies), and the latest close above high[j].  The window is the exchange's last
 /// `flag_lookback` sessions (`window_start`, its first date), so a thinly
 /// traded symbol does not reach back months; without it, the last
 /// `flag_lookback` candles.
@@ -467,15 +464,12 @@ fn process_flag_screener(
         if (circuit_count as f64) / (pole_candles as f64) * 100.0 > 40.0 {
             continue;
         }
-        // Breakout: the first close above the peak within 15 candles.  A flag
+        // Breakout: the first close above the peak within 20 candles.  A flag
         // candle trading above the peak is a later candidate peak instead.
         let last_k = std::cmp::min(n - 1, j_peak + MAX_FLAG_CANDLES);
         let Some(k_idx) = (j_peak + 1..=last_k).find(|&k| closes[k] > peak_high) else {
             continue;
         };
-        if k_idx - j_peak - 1 < MIN_FLAG_CANDLES {
-            continue;
-        }
         let flag = j_peak + 1..k_idx;
         if highs[flag.clone()].iter().any(|&high| high > peak_high) {
             continue;
@@ -1222,26 +1216,27 @@ mod tests {
     }
 
     #[test]
-    fn breakout_may_come_15_but_not_16_candles_after_the_peak() {
-        let result = screen(two_pole_layout(90.0, 180.0, 125)).unwrap();
-        assert_eq!(pole_dates(&result), local_pole(100, 110, 125));
+    fn breakout_may_come_20_but_not_21_candles_after_the_peak() {
+        let result = screen(two_pole_layout(90.0, 180.0, 130)).unwrap();
+        assert_eq!(pole_dates(&result), local_pole(100, 110, 130));
 
         // B breaks out one candle too late; only pole A remains.
-        let result = screen(two_pole_layout(90.0, 180.0, 126)).unwrap();
+        let result = screen(two_pole_layout(90.0, 180.0, 131)).unwrap();
         assert_eq!(pole_dates(&result), local_pole(20, 30, 38));
     }
 
     #[test]
-    fn a_flag_needs_at_least_three_candles() {
-        assert_eq!(super::MIN_FLAG_CANDLES, 3);
+    fn a_fast_breakout_needs_no_flag_candles() {
         // B: flag 111-113 (3 candles), breakout 114.
         let result = screen(two_pole_layout(90.0, 180.0, 114)).unwrap();
         assert_eq!(pole_dates(&result), local_pole(100, 110, 114));
 
-        // B closes above its peak after 2 flag candles: a continuation of
-        // the pole, not a flag, so only pole A remains.
+        // B closes above its peak after 2 flag candles, or on the very next
+        // candle: still B's breakout.
         let result = screen(two_pole_layout(90.0, 180.0, 113)).unwrap();
-        assert_eq!(pole_dates(&result), local_pole(20, 30, 38));
+        assert_eq!(pole_dates(&result), local_pole(100, 110, 113));
+        let result = screen(two_pole_layout(90.0, 180.0, 111)).unwrap();
+        assert_eq!(pole_dates(&result), local_pole(100, 110, 111));
     }
 
     /// The window starts on the exchange's session date given, however many

@@ -185,9 +185,9 @@ candidate peak:
 - run-up (high[j] - low[i]) / low[i] >= 90%;
 - no open gap > 50% in i+1 ..= j, circuit candles (high == low) <= 40% of
   i ..= j;
-- breakout k = the first candle in j+1 ..= j+15 with close > high[j]; no
+- breakout k = the first candle in j+1 ..= j+20 with close > high[j]; no
   high in j+1 ..= k-1 above high[j] (a higher candle is its own candidate);
-- at least `MIN_FLAG_CANDLES` (3) candles in j+1 ..= k-1;
+- k may be j+1 (no flag candles: a fast flag still counts);
 - flag depth: every low in j+1 ..= k-1 >= (1 - `MAX_FLAG_DEPTH`) * high[j]
   (20%; the peak and breakout candles' lows do not count);
 - latest close > high[j].
@@ -204,7 +204,7 @@ symbol.  Charts end on the symbol's last candle.  CSV and watchlist file names
 still use the run timestamp.  CSVs add `Last_Date` and all Screener.in
 columns; `EOD_Down_From_52w_High` is computed from EOD data.
 
-These rules live in the Rust engine (0.5.0 and later); a machine gets them
+These rules live in the Rust engine (0.6.0 and later); a machine gets them
 only after installing a `rust-v*` release built from it.
 
 ## Known Issues & Gotchas
